@@ -1,1 +1,15 @@
 extras/tests/can_test
+# Built host binaries
+extras/tools/can_gen/can_gen
+tests/pc_based/can_test_units
+
+# Build outputs
+*.pio.h
+build/
+*.o
+*.elf
+*.uf2
+*.bin
+*.hex
+*.map
+.pio/

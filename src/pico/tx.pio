@@ -1,0 +1,20 @@
+; SPDX-License-Identifier: GPL-3.0-only
+;
+; CAN TX PIO program.
+;
+; Clock: PIO clock = 33.03125 * bitrate.  Each loop iteration is 32 PIO cycles
+; (out pins,1 [30] = 31 cycles, jmp x-- = 2 cycles); the not-taken jump on the
+; last bit makes a word 1057 cycles, i.e. 33.03125 cycles/bit on average.
+;
+; Software bit-stuffs the frame (SOF..CRC), appends the unstuffed tail and
+; pads the last word with recessive (1) bits.  Words are shifted out MSB
+; first, so the software packs each word big-endian.
+
+.program can_tx
+.wrap_target
+    pull block          ; one 32-bit word of pre-stuffed frame
+    set x, 31
+bitloop:
+    out pins, 1 [30]
+    jmp x-- bitloop
+.wrap

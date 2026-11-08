@@ -1,101 +1,130 @@
 # CAN2040-Lite Design Document
 
+**License:** GPL-3.0-only. CAN2040-Lite is derived from
+[can2040](https://github.com/KevinOConnor/can2040), Copyright (C) 2021
+Kevin O'Connor. See [`LICENSE`](../LICENSE) for the full license text.
+
 ## SM Reduction from can2040
 
 ### can2040 Original SM Allocation
 
-| SM | Name  | Purpose | Instructions |
-|----|-------|---------|--------------|
-| 0  | sync  | Bit timing recovery, SOF/EOF detection, idle detection | 13 instructions |
-| 1  | rx    | Read CAN-RX, fill FIFO | 3 instructions |
-| 2  | match | CRC match detection, ACK signaling | 8 instructions |
-| 3  | tx    | Bit-stuffed transmission, arbitration | 14 instructions |
+can2040 uses 4 SMs, and all four programs **share a single 32-word PIO
+instruction memory** — the complete program memory of one PIO block:
 
-**Total: 4 SMs, 38 PIO instructions**
+| SM | Name  | Purpose | Program words |
+|----|-------|---------|---------------|
+| 0  | sync  | Bit timing recovery, SOF/EOF detection, idle detection | 13 |
+| 1  | rx    | Read CAN-RX, fill FIFO | 2 |
+| 2  | match | CRC match detection, ACK signaling | 10 |
+| 3  | tx    | Bit-stuffed transmission, arbitration | 7 |
+
+**Total: 4 SMs sharing one 32-word program (13 + 2 + 10 + 7 = 32).**
 
 ### Full rp2040 SM Allocation (suspended-spheres project)
 
-The rp2040 has **2 PIO blocks** (PIO0 and PIO1), each with 4 SMs.
+The rp2040 has **2 PIO blocks** (PIO0 and PIO1) with 4 SMs each, i.e. **8 SMs
+total**. RP2350 has 3 blocks and 12 SMs.
 
 #### PIO0 — CAN2040-Lite
 
-| SM | Name  | Purpose | Instructions | Notes |
-|----|-------|---------|--------------|-------|
-| 0  | rx    | **Relaxed sampling** — SOF detection, periodic sampling, frame-end, readback monitoring | ~10 | Simple, no phase tracking |
-| 1  | tx    | **Bus idle wait** — wait for 11+ recessive bits, then bit-stuffed transmit | ~8 | No arbitration |
-| 2  | —     | **UNUSED** | — | Free for custom PIO |
+| SM | Name  | Purpose | Program words | Notes |
+|----|-------|---------|---------------|-------|
+| 0  | rx    | **32× oversampled capture** — SOF poll, one word per bit, DMA | 7 | Software majority + edge re-sync |
+| 1  | tx    | **32-bit word shifter** — MSB-first bit-stuffed stream | 4 | Idle wait/compare in software (TODO) |
+| 2  | FreeRTOS | 2-instruction cycle counter | 2 | Reserved |
 | 3  | —     | **UNUSED** | — | Free for custom PIO |
+
+**PIO0 instruction memory: rx + tx ≤ 29 words, FreeRTOS 2 words → ≤ 31 of 32
+used.** The 29-word CAN budget is a hard constraint, verified with `pioasm`.
 
 #### PIO1 — FastAccelStepper
 
-| SM | Name  | Purpose | Instructions | Notes |
-|----|-------|---------|--------------|-------|
-| 0  | os    | **2-word OS state machine** for stepper motor step generation | 2 instructions | FastAccelStepper |
-| 1-3 | —    | **UNUSED** | — | Free for custom PIO |
+| SM | Name  | Purpose | Program words | Notes |
+|----|-------|---------|---------------|-------|
+| 0-3 | axes | One SM per stepper; all SMs on the block share the FAS program | up to 32 (whole block) | FastAccelStepper claims the block's program memory |
 
-**CAN2040-Lite: 2 SMs on PIO0, ~18 PIO instructions**  
-**FastAccelStepper: 1 SM on PIO1, 2 instructions**  
-**Free: 2 SMs on PIO0 + 3 SMs on PIO1 = 5 SMs total**
+With a single axis, FAS uses 1 SM but still claims the block's program memory;
+the other 3 SMs on PIO1 remain unclaimed.
+
+**CAN2040-Lite: 2 SMs on PIO0, 11 PIO program words (hard limit 29)**  
+**FreeRTOS counter: 1 SM on PIO0, 2 program words**  
+**FastAccelStepper (4 axes): 4 SMs on PIO1, whole 32-word program**  
+**Free in suspended-spheres: 1 SM on PIO0; 0 on PIO1**  
+**With a single FAS axis: 4 of 8 SMs free across the chip**
 
 ### Design Rationale
 
 #### Why 2 SMs on PIO0?
 
 CAN2040-Lite uses 2 SMs on **PIO0**:
-- **SM0 (rx)**: Relaxed sampling — no phase tracking, just periodic sampling
-- **SM1 (tx)**: Bus idle wait + bit-stuffed transmit
+- **SM0 (rx)**: fixed-rate sampling with hard edge re-sync
+- **SM1 (tx)**: bus idle wait + bit-stuffed transmit + per-bit readback
 
-FastAccelStepper uses 1 SM on **PIO1** (separate PIO block, no conflict).
+Receive and transmit cannot be folded into one SM: the TX program must run
+continuously while shifting out bits, and the RX program must sample the bus at
+the same time. Interleaving both directions in one SM would require the SM to
+serve two independent bit clocks and would stall one direction while the other
+runs.
 
-#### Why relaxed sampling in RX (SM0)?
+#### Why edge-resynced sampling in RX (SM0)?
 
-The key insight is that **synchronization can be relaxed** for reception:
+The key insight is that a separate sync SM can be avoided by folding
+re-synchronization into the RX program:
 
-- CAN bus nodes are required to have clock accuracy within ±0.5%
-- Sampling at the nominal rate introduces at most 2.5% timing error per bit
-- No phase tracking or resynchronization needed
-- Just sample at fixed intervals determined by PIO clock division
-
-This eliminates the need for a separate sync SM entirely.
+- The RX SM samples at a fixed rate derived from the PIO clock (32 × bitrate).
+- On every observed bus edge it **hard re-syncs the bit phase**.
+- There is no phase-locked loop or programmable time-quanta phase segment.
+- Clock error cannot accumulate across the frame; it is bounded by the longest
+  edge-free interval.
 
 #### Why no match SM?
 
 - CRC match detection triggers ACK injection in can2040
 - CAN2040-Lite does NOT inject ACKs — it only observes them via readback
-- CRC matching deferred to software post-processing
-- Saves 8 instructions
+- CRC matching is deferred to software post-processing
+- Saves the match SM entirely
 
 #### Why TX path (SM1)?
 
-- CAN2040-Lite transmits frames and verifies via readback
+- CAN2040-Lite transmits frames and verifies them via readback
 - Bus idle wait before transmission (CAN protocol requirement)
-- Readback path monitors CAN-RX for ACK/ERR from transmitted frames
+- Readback compares every transmitted bit against CAN-RX
+- A recessive-sent/dominant-read mismatch aborts the transmission (lost
+  arbitration) without injecting an error flag
 - Application handles retries (no automatic retransmission)
 
 #### Why no arbitration in TX?
 
-- A compliant CAN node on the bus handles arbitration
+- A compliant CAN node on the bus handles bus arbitration
 - CAN2040-Lite nodes simply wait for bus idle before transmitting
-- No line arbitration participation
+- If a collision occurs anyway, the per-bit compare aborts the loser, which is
+  the same mechanism real controllers use
 
 #### Why separate PIO blocks?
 
 - CAN2040-Lite uses **PIO0** (SM0 + SM1)
-- FastAccelStepper uses **PIO1** (SM0)
+- FastAccelStepper uses **PIO1**
 - No resource conflicts between CAN and stepper control
-- FreeRTOS cycle counter uses timer, no PIO needed
+- FreeRTOS cycle counter uses 1 SM and a 2-instruction program on PIO0
 
 ### PIO Instruction Budget
 
 | Component | can2040 | CAN2040-Lite |
 |-----------|---------|-------------|
-| SM0 (sync) | 13 | 0 (integrated into rx) |
-| SM0 (rx) | 3 | 10 (relaxed sampling) |
-| SM2 (match) | 8 | 0 (merged/deferred) |
-| SM3 (tx) | 14 | 8 (simplified, no arbitration) |
-| **Total** | **38** | **18** |
-| **SMs used** | **4** | **1** |
-| **SMs free** | **0** | **3** |
+| sync SM | 13 | 0 (integrated into rx) |
+| rx SM | 2 | 7 (oversampled capture) |
+| match SM | 10 | 0 (deferred to software) |
+| tx SM | 7 | 4 (word shifter; readback/abort still TODO) |
+| **Total CAN program words** | **32** | **11 (hard limit 29)** |
+| **SMs used (CAN)** | **4** | **2** |
+| **SMs free (CAN only)** | **4** | **6** |
+| **SMs free (CAN + FreeRTOS counter)** | — | **5** |
+| **SMs free (CAN + FreeRTOS + 4-axis FAS)** | — | **1** |
+
+can2040's four programs exactly fill one block's 32-word instruction memory.
+CAN2040-Lite's two CAN programs must fit in ≤ 29 words so that the 2-word
+FreeRTOS cycle-counter program can coexist on PIO0, leaving at most 1 spare
+word.
 
 ## Frame Processing Pipeline
 
@@ -103,10 +132,11 @@ This eliminates the need for a separate sync SM entirely.
 CAN Bus (NRZ signal)
     |
     V
-SM0 (Rx — Relaxed Sampling):
-    - SOF detection (11 dominant bits)
-    - Periodic sampling at bit centers (no phase tracking)
-    - Frame-end detection (10+ recessive bits)
+SM0 (Rx — Edge-Resynced Sampling):
+    - Idle detection (11 recessive bits)
+    - SOF detection (first dominant bit)
+    - Fixed-rate sampling with hard re-sync on edges
+    - Frame-end detection (EOF 7 recessive + IFS 3 recessive)
     - Readback monitoring (for transmitted frames)
     |
     V
@@ -128,19 +158,24 @@ Application Callback (valid frames only)
 Application → Queue Frame → Bit-Stuff (software)
     |
     V
-Bus Idle Wait (11+ recessive bits)
+Bus Idle Wait (11 recessive bits)
     |
     V
 Transmit on CAN-TX (bit-stuffed)
     |
     V
-Readback on CAN-RX:
-    - Monitor for ACK slot (dominant bit)
-    - Monitor for Error frames (6 dominant bits)
+Readback on CAN-RX (per bit):
+    - Sent recessive, read dominant → lost arbitration, abort
+    - ACK slot position known from transmit stream → ACK/NACK
+    - 6+ consecutive dominant bits → error flag from another node
     |
     V
 Report: SUCCESS / ERROR / NACK
 ```
+
+The signal path is **through the bus**: TX drives the transceiver, the
+transceiver drives the bus, and RX reflects the resulting bus level (including
+dominant bits from other nodes). It is not an internal transceiver loopback.
 
 ## Error Handling Strategy
 
@@ -150,44 +185,56 @@ Report: SUCCESS / ERROR / NACK
 | ACK missing (TX readback) | Retransmit | Report NACK to app |
 | Error frame (TX readback) | Error flag | Report error to app |
 | Stuff error | Error flag | Discard frame, report |
+| Lost arbitration (TX) | Automatic arbitration | Abort TX on recessive/dominant mismatch |
 | Bus-off | Automatic state machine | N/A (no state machine) |
 
-**Key principle:** CRC errors are reported to the application layer but the frame is discarded. The application can use this for diagnostics (noise monitoring, node health).
+**Key principle:** CRC errors are reported to the application layer but the
+frame is discarded. The application can use this for diagnostics (noise
+monitoring, node health).
 
-## Relaxed Sampling Analysis
+An error flag is **6 or more consecutive dominant bits**; the length is 6–12
+bits depending on how many error-active nodes signal at the same time.
 
-### Why relaxed sampling works
+## Sampling Analysis
 
-CAN bus specification requires nodes to have clock accuracy within ±0.5%:
+### Why edge-resynced fixed-rate sampling works
 
-- At 1 Mbit/s: actual bitrate is 995-1005 kbit/s
-- Sampling at nominal rate: max 2.5% timing error per bit
-- Over 100-160 bits: accumulated error is bounded
-- Dominant bit (logic 0) is the strongest signal — easy to detect
+CAN oscillator tolerances are tighter than the often-quoted “±0.5%” at high
+bit rates:
+
+- **≤ 0.5%** permitted up to 125 kbit/s
+- **≤ 0.15%** permitted above 125 kbit/s
+
+A pure open-loop sampler would accumulate error over the ~50–160 bit times of a
+frame. Edge re-sync removes that accumulation: at every bus edge the receiver
+re-aligns its bit phase, so the worst-case sampling error is bounded by the
+error accumulated since the last edge. Inside the stuffed region CAN guarantees
+an edge at least every 5 bits, so drift stays well below half a bit even at the
+0.15% tolerance. Outside the stuffed region (EOF/IFS) the bus is all recessive
+and a small mis-sample is harmless.
 
 ### Sampling Strategy
 
 - PIO clock = 32 × bitrate (same as can2040)
 - Example: 500 kbit/s → PIO clock = 16 MHz
 - Example: 1 Mbit/s → PIO clock = 32 MHz
-- Sample at bit center (approximate)
-- No phase-locked behavior
-- SOF provides known starting point (dominant bit)
+- Sample at nominal bit center, re-aligning phase on each edge
+- Idle = 11 recessive bits; SOF = first dominant bit
 
 ### Trade-offs
 
-| Aspect | can2040 (precise) | CAN2040-Lite (relaxed) |
-|--------|-------------------|------------------------|
-| Clock drift tolerance | Excellent (resyncs every bit) | Good (±0.5% spec compliance) |
-| Implementation complexity | High (2 SMs, phase tracking) | Low (1 SM, fixed sampling) |
-| Frame loss in extreme drift | None | Possible (but within spec) |
-| Resource usage | 4 SMs | 1 SM |
+| Aspect | can2040 (precise) | CAN2040-Lite (edge-resynced) |
+|--------|-------------------|------------------------------|
+| Clock drift tolerance | Excellent (dedicated sync SM) | Good, bounded by edge interval |
+| Implementation complexity | High (4 SMs, full program memory) | Lower (2 SMs, ~18 words) |
+| Frame loss in extreme drift | None | Possible only if edges are absent |
+| Resource usage | 4 SMs + whole 32-word block | 2 SMs, 11 words |
 
 ## DMA Integration
 
 ### Buffer Size
-- Maximum frame: ~160 bits (including stuffing)
-- Storage: 5 × uint32_t (160 bits)
+- Maximum frame: ~164 bits (extended, DLC 8, worst-case stuffing)
+- Storage: 5 × uint32_t (160 bits) plus a small margin
 - DMA transfer on frame-complete signal
 
 ### DMA Configuration
@@ -195,6 +242,10 @@ CAN bus specification requires nodes to have clock accuracy within ±0.5%:
 - Destination: Application buffer (circular buffer)
 - Trigger: Frame-complete IRQ (from SM0)
 - No ARM core intervention during capture
+
+### Throughput
+At 1 Mbit/s the ceiling is roughly 6,000–8,000 frames/s depending on frame
+length and stuffing. Raw bit capture is on the order of 100–170 kByte/s.
 
 ## API Design (Proposed)
 
@@ -262,8 +313,9 @@ struct can2040_lite_stats {
 3. ⬜ Destuffing unit tests
 4. ⬜ CRC verification unit tests
 5. ⬜ Frame parsing unit tests
-6. ⬜ PIO rx state machine (relaxed sampling)
-7. ⬜ TX path (bus idle wait + bit-stuffed transmit)
-8. ⬜ Readback path (ACK/ERR monitoring)
-9. ⬜ DMA integration
-10. ⬜ Full integration test on rp2040
+6. ⬜ Firmware skeleton and public API
+7. ⬜ PIO rx state machine (edge-resynced sampling)
+8. ⬜ PIO tx state machine (bus idle wait + bit-stuffed transmit)
+9. ⬜ Readback path (ACK/NACK/error monitoring)
+10. ⬜ DMA integration
+11. ⬜ Full integration test on rp2040

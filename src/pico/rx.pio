@@ -1,0 +1,28 @@
+; SPDX-License-Identifier: GPL-3.0-only
+;
+; CAN RX PIO program — oversampled raw capture.
+;
+; Clock: PIO clock = 98 * bitrate.  One block is 98 PIO cycles: 31 samples
+; spaced 3 cycles apart, the 32nd sample, then push and loop setup.  The block
+; therefore lasts exactly one bit time and each 32-bit word holds 32 samples
+; of one bit (with a 5-cycle gap between words).
+;
+; The poll loop (outside the wrap) waits for SOF (dominant).  `jmp pin` uses
+; the jmp-pin selected in software, so the GPIO stays configurable.  The poll
+; sample is pushed as a marker word (software skips word 0), which also resets
+; the input shift counter before the first 32-sample block.
+; After that the SM free-runs; software takes the majority of each word as the
+; bit value.  Software resets the SM to the poll loop before the next capture.
+
+.program can_rx
+poll:
+    in pins, 1
+    jmp pin, poll       ; stay here while recessive
+    push                ; marker word; also resets the input shift counter
+.wrap_target
+    set x, 31
+sample:
+    in pins, 1
+    jmp x-- sample
+    push
+.wrap

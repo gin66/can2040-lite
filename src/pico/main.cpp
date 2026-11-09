@@ -216,6 +216,97 @@ static bool loopback_case(const char *name, int ack) {
     return ok;
 }
 
+
+static void copy_bits(const uint8_t *src, uint32_t start, uint8_t *dst,
+                      uint32_t nbits) {
+    uint32_t i;
+    bits_clear(dst, nbits);
+    for (i = 0; i < nbits; i++)
+        bits_put(dst, i, bits_get(src, start + i));
+}
+
+static void loopback_back_to_back() {
+    static const uint8_t data2[8] = {0xf0, 0xde, 0xbc, 0x9a,
+                                     0x78, 0x56, 0x34, 0x12};
+    can_frame_t f1;
+    can_frame_t f2;
+    can_build_info_t i1;
+    can_build_info_t i2;
+    can_parsed_t p1;
+    can_parsed_t p2;
+    uint8_t b1[CAN2040_LITE_MAX_FRAME_BYTES];
+    uint8_t b2[CAN2040_LITE_MAX_FRAME_BYTES];
+    uint8_t rx[CAN2040_LITE_MAX_FRAME_BYTES];
+    uint8_t tmp[CAN2040_LITE_MAX_FRAME_BYTES];
+    uint32_t n1;
+    uint32_t n2;
+    uint32_t rxn;
+    uint32_t off;
+    frame_validity_t g1;
+    frame_validity_t g2;
+    bool ok = true;
+
+    memset(&f1, 0, sizeof(f1));
+    f1.id = 0x123;
+    f1.dlc = 8;
+    memcpy(f1.data, loop_data, 8);
+    memset(&f2, 0, sizeof(f2));
+    f2.id = 0x456;
+    f2.dlc = 8;
+    memcpy(f2.data, data2, 8);
+
+    n1 = can_frame_build(&f1, VALID_FRAME, 1, b1,
+                         CAN2040_LITE_MAX_FRAME_BITS, &i1);
+    n2 = can_frame_build(&f2, VALID_FRAME, 0, b2,
+                         CAN2040_LITE_MAX_FRAME_BITS, &i2);
+    ok = ok && n1 && n2;
+
+    can2040_lite_pico_rx_arm();
+    can2040_lite_pico_tx_frame(b1, n1);
+    can2040_lite_pico_tx_frame(b2, n2);
+    ok = ok && can2040_lite_pico_rx_wait(200);
+
+    memset(rx, 0, sizeof(rx));
+    rxn = can2040_lite_pico_rx_bits(rx, CAN2040_LITE_MAX_FRAME_BITS);
+    g1 = can_frame_decode(rx, rxn, &p1);
+    ok = ok && (g1 == VALID_FRAME);
+    ok = ok && (p1.id == 0x123) && (p1.ack == 1);
+    ok = ok && (memcmp(p1.data, loop_data, 8) == 0);
+
+    off = p1.total_bits;
+    while (off < rxn && bits_get(rx, off) == 1)
+        off++;
+    if (off < rxn) {
+        uint32_t left = rxn - off;
+        if (left > CAN2040_LITE_MAX_FRAME_BITS)
+            left = CAN2040_LITE_MAX_FRAME_BITS;
+        copy_bits(rx, off, tmp, left);
+        g2 = can_frame_decode(tmp, left, &p2);
+        ok = ok && (g2 == VALID_FRAME);
+        ok = ok && (p2.id == 0x456) && (p2.ack == 0);
+        ok = ok && (memcmp(p2.data, data2, 8) == 0);
+    } else {
+        g2 = INVALID_BIT;
+        ok = false;
+    }
+
+    Serial.printf("  %-18s expected %-13s got %-13s %s\n",
+                  "PIO back-to-back", "2 frames", validity_name(g2),
+                  ok ? "PASS" : "FAIL");
+    Serial.flush();
+    if (!ok) {
+        Serial.printf("    first: %s id=0x%X total=%u\n",
+                      validity_name(g1), (unsigned)p1.id,
+                      (unsigned)p1.total_bits);
+        Serial.printf("    second start=%u got=%s id=0x%X\n",
+                      (unsigned)off, validity_name(g2), (unsigned)p2.id);
+    }
+    if (ok)
+        passed++;
+    else
+        failed++;
+}
+
 static void run_loopback() {
     if (can2040_lite_pico_rx_init(LOOP_GPIO, CAN2040_LITE_BITRATE) < 0 ||
         can2040_lite_pico_tx_init(LOOP_GPIO, CAN2040_LITE_BITRATE) < 0) {
@@ -225,6 +316,7 @@ static void run_loopback() {
     }
     loopback_case("PIO loopback ACK", 1);
     loopback_case("PIO loopback NACK", 0);
+    loopback_back_to_back();
 }
 #endif // CAN2040_LITE_ENABLE_PIO_LOOPBACK
 
@@ -309,6 +401,7 @@ void loop() {
     // Keep transmitting for Saleae/TX-timing captures.
     if (g_tx_total && (millis() - g_last_tx) > 200) {
         g_last_tx = millis();
+        can2040_lite_pico_tx_frame(g_tx_bits, g_tx_total);
         can2040_lite_pico_tx_frame(g_tx_bits, g_tx_total);
     }
 #endif

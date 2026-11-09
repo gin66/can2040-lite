@@ -262,7 +262,8 @@ Steps:
 - [x] 5.3 Saleae TX capture (D0 = GP2) decodes ID 0x123, DLC 8, data
       12..F0, CRC 0x1738; both ACK and NACK slots observed at 125k, 500k
       and 1M
-- [ ] 5.4 Verify back-to-back frames and interframe spacing (≥3 bits)
+- [x] 5.4 Verify back-to-back frames and interframe spacing: two frames
+      decode in the harness; Saleae shows an **18-bit** gap at 500k (≥3 bits)
 
 > 🛑 **Commit checkpoint C6 — `pio: TX state machine with arbitration abort`**
 > Gate: Saleae TX capture matches generated frame bit-for-bit; lost-arbitration

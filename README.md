@@ -183,14 +183,17 @@ Options:
 - [x] Host unit tests (stuffing, CRC-15, frame layout, decode)
 
 - [x] Firmware skeleton and public API
-- [x] On-target RP2350 harness (7/7 vectors pass)
+- [x] On-target RP2350 harness (vectors + API + loopback)
+- [x] PIO RX (32x oversampled capture) and TX (word shifter): 7 + 4 = 11
+      instructions, inside the 29-word budget
+- [x] TX/RX loopback with ACK and NACK readback
+- [x] Saleae verification at 125k, 500k and 1M; back-to-back frames (18-bit gap)
 
 ### Planned
-- [ ] PIO rx state machine (fixed-rate sampling with edge resync)
-- [ ] PIO tx state machine (bus idle wait + bit-stuffed transmit)
-- [ ] Readback path (ACK/NACK and error-frame monitoring)
-- [ ] DMA integration
-- [ ] Full integration test on rp2040
+- [ ] Lost-arbitration abort (needs a dominant driver on the bus)
+- [ ] Error-frame injection and detection
+- [ ] Real-bus integration with a compliant peer/transceiver
+- [ ] Soak test and release
 
 ## License
 

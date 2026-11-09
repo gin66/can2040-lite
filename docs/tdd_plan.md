@@ -1,6 +1,8 @@
 # CAN2040-Lite — TDD Implementation Plan
 
-**Status:** Draft 0.3 — Phases 0–3 implemented 2026-11-08 (RP2350 target harness passing)
+**Status:** Draft 0.4 — Phases 0–3 complete; PIO loopback/Saleae verified at
+125k/500k/1M (2026-11-08). Arbitration abort, error injection, and real-bus
+integration remain.
 **Scope:** Audit corrections, test-generator rewrite, host unit tests, PIO
 validation, integration testing.
 **License:** GPL-3.0-only (derived from can2040). See `LICENSE`.

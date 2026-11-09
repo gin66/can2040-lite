@@ -239,8 +239,9 @@ Steps:
       frame-complete IRQ/driver integration still pending (harness waits on DMA)
 - [x] 4.3 Loop host-generated vectors through a stimulus source; compare
       captured bitstreams (TX→RX on GP2: VALID/ACK and VALID/NACK pass)
-- [~] 4.4 Saleae/sigrok capture of RX pin under realistic bitrates: 500k
-      verified (TX loopback pin); 125k and 1M still pending
+- [x] 4.4 Saleae/sigrok capture of RX pin under realistic bitrates:
+      **125k, 500k and 1M all verified** (loopback + Saleae decode of the
+      same pin; frame boundaries correct)
 - [ ] 4.5 Robustness: idle suppression, overflow reporting, malformed frames
 
 > 🛑 **Commit checkpoint C5 — `pio: RX state machine with edge-resynced sampling and DMA capture`**
@@ -259,7 +260,8 @@ Steps:
 - [ ] 5.2 Abort on conflict: sent recessive but read dominant (lost
       arbitration), stuff/bit error cases; no error-flag injection
 - [x] 5.3 Saleae TX capture (D0 = GP2) decodes ID 0x123, DLC 8, data
-      12..F0, CRC 0x1738; both ACK and NACK slots observed at 500k
+      12..F0, CRC 0x1738; both ACK and NACK slots observed at 125k, 500k
+      and 1M
 - [ ] 5.4 Verify back-to-back frames and interframe spacing (≥3 bits)
 
 > 🛑 **Commit checkpoint C6 — `pio: TX state machine with arbitration abort`**

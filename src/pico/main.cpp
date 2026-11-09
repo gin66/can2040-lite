@@ -136,6 +136,10 @@ static void run_api_smoke() {
 #define CAN2040_LITE_ENABLE_PIO_LOOPBACK 0
 #endif
 
+#ifndef CAN2040_LITE_BITRATE
+#define CAN2040_LITE_BITRATE 500000u
+#endif
+
 #if CAN2040_LITE_ENABLE_PIO_LOOPBACK
 #define LOOP_GPIO 2
 static bool loopback_done;
@@ -213,8 +217,8 @@ static bool loopback_case(const char *name, int ack) {
 }
 
 static void run_loopback() {
-    if (can2040_lite_pico_rx_init(LOOP_GPIO, 500000) < 0 ||
-        can2040_lite_pico_tx_init(LOOP_GPIO, 500000) < 0) {
+    if (can2040_lite_pico_rx_init(LOOP_GPIO, CAN2040_LITE_BITRATE) < 0 ||
+        can2040_lite_pico_tx_init(LOOP_GPIO, CAN2040_LITE_BITRATE) < 0) {
         Serial.println("  PIO loopback       PIO init FAILED");
         failed += 2;
         return;

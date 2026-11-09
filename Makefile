@@ -10,8 +10,8 @@ tool:
 	$(MAKE) -C extras/tools/can_gen
 
 test:
-	$(MAKE) -C tests/pc_based test
+	$(MAKE) -C extras/tests/pc_based test
 
 clean:
 	$(MAKE) -C extras/tools/can_gen clean
-	$(MAKE) -C tests/pc_based clean
+	$(MAKE) -C extras/tests/pc_based clean

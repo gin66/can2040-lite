@@ -73,7 +73,7 @@ runs on-target.
 make
 
 # Or individually
-make test      # tests/pc_based/can_test_units
+make test      # extras/tests/pc_based/can_test_units
 make tool      # extras/tools/can_gen/can_gen
 make clean
 ```
@@ -92,17 +92,17 @@ Direct host builds (equivalent to what the Makefiles do):
 ```bash
 # PC-based host tests (production src/ + host-only frame builder)
 cc -O2 -std=c11 -Wall -Wextra -Werror \
-   -Isrc -Itests/common \
-   -o tests/pc_based/can_test_units \
-   tests/pc_based/can_test_units.c \
-   src/*.c tests/common/*.c
+   -Isrc -Iextras/tests/common \
+   -o extras/tests/pc_based/can_test_units \
+   extras/tests/pc_based/can_test_units.c \
+   src/*.c extras/tests/common/*.c
 
 # Frame generator CLI
 cc -O2 -std=c11 -Wall -Wextra -Werror \
-   -Isrc -Itests/common \
+   -Isrc -Iextras/tests/common \
    -o extras/tools/can_gen/can_gen \
    extras/tools/can_gen/can_gen.c \
-   src/*.c tests/common/*.c
+   src/*.c extras/tests/common/*.c
 ```
 
 Example frame generation:
@@ -128,17 +128,21 @@ can2040-lite/
 ├── src/
 │   ├── can2040_lite_proto.c/.h  # Shared protocol core (host + target)
 │   ├── can2040_lite.c/.h        # Public API skeleton
-│   └── pico/main.cpp            # On-target vector + API harness
-├── tests/
-│   ├── common/
-│   │   └── can_frame_build.c/.h # Host-only frame builder + defect injector
-│   └── pc_based/
-│       ├── can_test_units.c     # PC-based unit tests
-│       └── Makefile
+│   └── pico/
+│       ├── can2040_lite_pico.cpp/.h  # PIO/DMA backend
+│       └── rx.pio, tx.pio            # PIO programs (7 + 4 words)
 └── extras/
+    ├── tests/
+    │   ├── common/
+    │   │   └── can_frame_build.c/.h # Host-only frame builder
+    │   ├── pc_based/
+    │   │   ├── can_test_units.c     # PC-based unit tests
+    │   │   └── Makefile
+    │   └── on_target/
+    │       └── main.cpp             # RP2350 vector/loopback harness
     └── tools/
         └── can_gen/
-            ├── can_gen.c        # Raw/C frame-vector generator CLI
+            ├── can_gen.c            # Raw/C frame-vector generator CLI
             └── Makefile
 ```
 

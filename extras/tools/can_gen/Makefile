@@ -7,7 +7,7 @@ CFLAGS     ?= -O2 -std=c11 -Wall -Wextra -Werror
 CPPFLAGS   ?=
 LDFLAGS    ?=
 SRC_DIR    ?= ../../../src
-COMMON_DIR ?= ../../../tests/common
+COMMON_DIR ?= ../../tests/common
 
 CPPFLAGS += -I$(SRC_DIR) -I$(COMMON_DIR)
 

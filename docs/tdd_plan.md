@@ -25,7 +25,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked
 
 | Layer | What | Tools |
 |-------|------|-------|
-| Host unit tests | Frame generator, stuffing, CRC-15, decode pipeline (destuff → CRC → parse) | `cc`/`gcc`, plain C, `tests/pc_based/can_test_units` |
+| Host unit tests | Frame generator, stuffing, CRC-15, decode pipeline (destuff → CRC → parse) | `cc`/`gcc`, plain C, `extras/tests/pc_based/can_test_units` |
 | On-target C++ tests | Public API (`can2040_lite_*`) over USB serial, driven from host | RP2350 Pico 2 (`/dev/cu.usbmodem4101`), PlatformIO + Arduino-Pico |
 | PIO TX verification | Bit timing + content on the wire, TX only | Saleae Logic (fx2lafw, 8ch) + `sigrok-cli` |
 | Loopback | TX and RX mapped to the same pin; verify readback, ACK/NACK evaluation | Saleae + Pico |
@@ -153,7 +153,7 @@ Steps:
 - [x] 1.1 Redesign the API into the new layout:
       `src/can2040_lite_proto.h` (bits, `crc_can15_bits`, `bit_stuff`,
       `bit_unstuff`, `can_frame_decode`) and
-      `tests/common/can_frame_build.h` (`can_frame_t`, `can_build_info_t`,
+      `extras/tests/common/can_frame_build.h` (`can_frame_t`, `can_build_info_t`,
       `can_frame_build`)
 - [x] 1.2 Implement `bits_get` / `bits_put` / `bits_clear` (MSB-first packing)
 - [x] 1.3 Implement bit-level CRC-15; verified equal to can2040's
@@ -174,8 +174,8 @@ Steps:
       (summary / `--raw` / `--c`; stuffed length, total length, CRC, decode
       echo; DLC 0–8; optional `--ack`)
 - [x] 1.9 Remove the duplicate-`main` problem by splitting the CLI from the
-      library (`extras/tools/can_gen` vs `tests/pc_based`); builds documented
-      in the root, `tests/pc_based`, and `extras/tools/can_gen` Makefiles
+      library (`extras/tools/can_gen` vs `extras/tests/pc_based`); builds documented
+      in the root, `extras/tests/pc_based`, and `extras/tools/can_gen` Makefiles
 
 > 🛑 **Commit checkpoint C2 — `tests: rewrite CAN frame generator with correct CRC-15 and stuffing`**
 > Gate: `make tool` builds `can_gen` with `-Wall -Wextra -Werror`; it emits
@@ -198,7 +198,7 @@ Steps:
       (CRC delimiter 1 + ACK 1 + ACK delimiter 1 + EOF 7 + IFS 3); no run >5
       in the stuffed region; tail is recessive
 - [x] 2.5 Invalid-frame tests: decoder reports CRC mismatch / stuff error
-- [x] 2.6 Makefiles added (root, `tests/pc_based`, `extras/tools/can_gen`);
+- [x] 2.6 Makefiles added (root, `extras/tests/pc_based`, `extras/tools/can_gen`);
       tests compile production `src/` and are green
 - [x] 2.7 Update README build section with the verified commands
 
@@ -213,7 +213,7 @@ Steps:
 
 - [x] 3.1 Create `src/` layout and build system: portable core in
       `src/can2040_lite_proto.*`, public API in `src/can2040_lite.*`, target
-      harness in `src/pico/main.cpp`, PlatformIO (`platformio.ini`) using the
+      harness in `extras/tests/on_target/main.cpp`, PlatformIO (`platformio.ini`) using the
       Arduino-Pico core on `rpipico2`
 - [x] 3.2 Define public API (`can2040_lite_setup`, `_start`, `_transmit`,
       `_check_transmit`, `_get_statistics`, `_stop`, callback config); portable
@@ -324,7 +324,7 @@ Steps:
 
 > The original `extras/tests/can_test.c` and `can_test_units.c` paths below
 > have been replaced: protocol core → `src/can2040_lite_proto.*`, frame builder
-> → `tests/common/can_frame_build.*`, tests → `tests/pc_based/`,
+> → `extras/tests/common/can_frame_build.*`, tests → `extras/tests/pc_based/`,
 > CLI → `extras/tools/can_gen/`. The findings are retained as history.
 
 - README:26–38 (FastAccelStepper “2 instructions”, wrong repo, SM arithmetic)

@@ -4,6 +4,25 @@
 [can2040](https://github.com/KevinOConnor/can2040), Copyright (C) 2021
 Kevin O'Connor. See [`LICENSE`](../LICENSE) for the full license text.
 
+## Restrictions
+
+CAN2040-Lite is **not a full CAN node**; it is a classic CAN 2.0B data-frame
+transceiver. It deliberately does not implement:
+
+- ACK generation — it only observes the ACK slot via readback
+- error-flag generation — it only observes 6+ dominant bits
+- TEC/REC, Error Active/Passive, or bus-off
+- automatic retransmission (the application retries)
+- full arbitration participation (TX aborts on conflict)
+- **RTR (remote frame) support**
+- CAN FD
+- programmable bit timing (no SJW/TSEG; fixed 32× oversampling)
+- hardware acceptance filters (software filtering only)
+- an on-chip transceiver (an external CAN transceiver is required)
+
+A compliant node must be present on the bus to provide ACK and error
+confinement.
+
 ## SM Reduction from can2040
 
 ### can2040 Original SM Allocation

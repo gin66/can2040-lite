@@ -4,10 +4,10 @@ A minimal CAN transceiver architecture for RP2040 and RP2350 microcontrollers us
 
 ## Overview
 
-CAN2040-Lite is a full transmit/receive CAN implementation that uses **two PIO
-state machines (SMs) on PIO0** — one for receive and one for transmit. That is
-half of one PIO block, not a single SM: receive and transmit cannot share one
-SM without stalling one direction while the other runs.
+CAN2040-Lite is a classic CAN 2.0B data-frame transmit/receive implementation
+that uses **two PIO state machines (SMs) on PIO0** — one for receive and one for
+transmit. That is half of one PIO block, not a single SM: receive and transmit
+cannot share one SM without stalling one direction while the other runs.
 
 ### Key Design Principles
 
@@ -28,6 +28,37 @@ SM without stalling one direction while the other runs.
 - Raspberry Pi Pico (rp2040) or Pico 2 (rp2350)
 - Standard CAN transceiver (e.g., SN65HVD230, TJA1050)
 - At least one other fully CAN-compliant node on the bus (for arbitration, ACK, error handling)
+
+## Restrictions
+
+CAN2040-Lite is **not a full CAN node**. It is a lightweight data-frame
+transceiver and deliberately omits the protocol mechanisms that require
+real-time error participation:
+
+- **No ACK generation** — it only observes the ACK slot via readback. A
+  compliant node on the bus must ACK.
+- **No error-flag generation** — it only observes 6+ dominant bits and reports
+  the error; it never injects an error flag.
+- **No error counters / fault confinement** — no TEC/REC, Error Active /
+  Error Passive, or bus-off state.
+- **No automatic retransmission** — the application decides whether to retry.
+- **No full arbitration participation** — TX aborts on a recessive-sent /
+  dominant-read mismatch, but the node does not compete to win arbitration.
+- **No RTR support** — remote transmission request frames are not transmitted
+  or acted upon. (The test generator can still emit RTR vectors for negative
+  tests.)
+- **No CAN FD** — classic CAN 2.0B only.
+- **No programmable bit timing** — fixed 32× oversampling; no SJW or
+  TSEG1/TSEG2 configuration.
+- **No hardware acceptance filters** — filtering is done in software.
+- **No on-chip transceiver** — an external CAN transceiver is required.
+
+A CAN2040-Lite network must contain **at least one compliant CAN node** to
+provide ACK and error confinement.
+
+Current implementation notes (not protocol requirements): the target backend
+captures one frame per arm (no background RX queue/IRQ yet), statistics
+counters are defined but not yet populated, and frames are not timestamped.
 
 ## Project: suspended-spheres
 
@@ -153,7 +184,7 @@ The test generator creates valid and invalid CAN frames with proper bit stuffing
 ### Features
 
 - Standard (11-bit) and extended (29-bit) frames
-- Remote Transmission Request (RTR) frames
+- RTR vectors for negative tests (the node itself does not support RTR)
 - Configurable payload (0-8 bytes)
 - Valid frames with correct CRC-15 and stuffing
 - Invalid frames: CRC errors, stuff violations, bit errors
@@ -168,7 +199,7 @@ The test generator creates valid and invalid CAN frames with proper bit stuffing
 Options:
   --std          Standard frame (11-bit ID) [default]
   --ext          Extended frame (29-bit ID)
-  --rtr          Remote transmission request
+  --rtr          Generate an RTR vector (node does not support RTR)
   --id <num>     CAN ID (decimal, default 0x123)
   --data <hex>   Payload hex string (e.g., 1234567890ABCDEF)
   --dlc <n>      Data length code (0-8, default 8)

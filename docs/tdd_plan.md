@@ -19,6 +19,15 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked
   **Measured now:** rx = 7, tx = 4, total = **11** words; TX→RX loopback
   (ACK + NACK) passes on RP2350.
 
+**Protocol restrictions (also in README / white paper / design):**
+- Not a full CAN node: no ACK generation, no error-flag generation, no TEC/REC,
+  no Error Active/Passive, no bus-off.
+- **No RTR support** — the node neither transmits nor acts on remote frames.
+  The test generator may still emit RTR vectors for negative tests.
+- No CAN FD, no programmable bit timing (SJW/TSEG), no hardware acceptance
+  filters, and no on-chip transceiver (external transceiver required).
+- No automatic retransmission; the application retries.
+
 ---
 
 ## Test Strategy
@@ -188,8 +197,9 @@ Steps:
 
 - [x] 2.1 Bit helper tests (get/put roundtrip across byte boundaries)
 - [x] 2.2 Stuffing tests: explicit patterns (runs of 0/1, alternating),
-      roundtrip stuff→unstuff for std/ext/RTR frames, 6-run detection,
-      overflow handling
+      roundtrip stuff→unstuff for std/ext/RTR codec vectors, 6-run detection,
+      overflow handling (RTR is a codec/negative vector only; the node does
+      not support RTR)
 - [x] 2.3 CRC tests: byte-wise reference (can2040 table) equality on
       byte-aligned streams; frozen golden CRC values for one std and one ext
       frame (std 0x123/DLC8 = 0x1738; ext 0x18FEBB11/DLC8 = 0x4E1A)
@@ -293,7 +303,8 @@ Steps:
 ## Phase 7 — Bus integration (C++ tests over real CAN)
 
 - [ ] 7.1 Two-node setup: CAN2040-Lite + compliant controller (master)
-- [ ] 7.2 Master→Lite reception tests (std/ext, DLC sweep, RTR)
+- [ ] 7.2 Master→Lite reception tests (std/ext, DLC sweep); RTR is not
+      supported and is only used as a rejection/negative vector
 - [ ] 7.3 Lite→Master transmission tests (ACKed, NACKed, arbitration loss)
 - [ ] 7.4 Error injection: CRC error, stuff error, missing ACK
 - [ ] 7.5 Statistics API verification

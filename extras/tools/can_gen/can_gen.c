@@ -32,7 +32,7 @@ static void print_usage(void) {
     printf("Options:\n");
     printf("  --std          Standard frame (11-bit ID) [default]\n");
     printf("  --ext          Extended frame (29-bit ID)\n");
-    printf("  --rtr          Remote transmission request\n");
+    printf("  --rtr          Generate an RTR vector (node does not support RTR)\n");
     printf("  --id <num>     CAN ID (decimal or 0xhex, default 0x123)\n");
     printf("  --data <hex>   Payload hex string (e.g., 1234567890ABCDEF)\n");
     printf("  --dlc <n>      Data length code (0-8, default from payload)\n");
@@ -44,7 +44,7 @@ static void print_usage(void) {
     printf("\nExamples:\n");
     printf("  can_gen --std --id 0x123 --data 12345678\n");
     printf("  can_gen --ext --id 0x18FEBB11 --data DEADBEEF --invalid crc\n");
-    printf("  can_gen --std --rtr --id 0x456\n");
+    printf("  can_gen --std --rtr --id 0x456  # negative/codec vector only\n");
     printf("  can_gen --std --id 0x123 --data 11223344 --ack\n");
 }
 

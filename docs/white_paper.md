@@ -14,7 +14,7 @@ A Minimal CAN Transceiver Architecture for RP2040 and RP2350 Using PIO
 
 ## Abstract
 
-CAN2040-Lite is a lightweight CAN transceiver architecture for RP2040 and RP2350 microcontrollers that achieves full CAN frame transmission and reception using only **two PIO state machines (SMs) on one PIO block**.
+CAN2040-Lite is a lightweight classic CAN 2.0B data-frame transceiver architecture for RP2040 and RP2350 microcontrollers that achieves transmit and receive capability using only **two PIO state machines (SMs) on one PIO block**.
 
 The key insight is that synchronization logic can be integrated directly into the receive state machine, eliminating the need for a separate sync SM. Combined with a readback path that compares transmitted bits against the bus, the architecture provides full transmit/receive capability while using only 2 of the 4 SMs in **PIO0**, with the two programs fitting in **29 of the block's 32 instruction words** so 2 words remain for the FreeRTOS cycle counter. **PIO1 is left entirely free** for FastAccelStepper.
 
@@ -111,15 +111,20 @@ The bus remains unaffected by the receiver (no error flags, no arbitration parti
 - ✅ ACK evaluation (from readback)
 - ✅ Error frame evaluation (from readback)
 
-### Not Implemented
+### Not Implemented (restrictions)
 
-- ❌ ACK injection (transmitted by compliant master node)
-- ❌ Error frame generation (handled by compliant master node)
-- ❌ Arbitration participation (handled by compliant master node)
-- ❌ Retransmission (application handles retries)
-- ❌ Error counters (TEC/REC)
-- ❌ Error Active / Error Passive states
-- ❌ Bus Off state
+CAN2040-Lite is **not a full CAN node**; it is a data-frame transceiver.
+
+- ❌ ACK generation/injection (the compliant master node ACKs)
+- ❌ Error-flag generation (the compliant master node signals errors)
+- ❌ Arbitration participation beyond abort-on-conflict
+- ❌ Automatic retransmission (the application handles retries)
+- ❌ Error counters (TEC/REC), Error Active/Passive, Bus Off
+- ❌ **RTR (remote transmission request) support** — no RTR transmit or action
+- ❌ **CAN FD** (classic CAN 2.0B only)
+- ❌ Programmable bit timing (no SJW/TSEG1/TSEG2; fixed 32× oversampling)
+- ❌ Hardware acceptance filters (software filtering only)
+- ❌ On-chip CAN transceiver (external transceiver required)
 
 ---
 
@@ -466,18 +471,25 @@ passive observer.
 
 ## 10. Limitations
 
-The proposal is intentionally not fully CAN compliant.
+The proposal is intentionally **not a full CAN node** and not fully CAN
+compliant. It is a classic CAN 2.0B *data-frame* transceiver.
 
 Limitations include:
 
-- No ACK injection (handled by compliant master node)
-- No error frame generation (handled by compliant master node)
-- No arbitration participation (handled by compliant master node)
-- No fault confinement (handled by compliant master node)
-- No automatic retransmission (application handles retries)
-- No error state machine (TEC/REC, bus-off)
+- **No ACK generation** — only ACK-slot observation via readback
+- **No error-flag generation** — only error observation (6+ dominant bits)
+- **No fault confinement** — no TEC/REC, Error Active/Passive, or bus-off
+- **No automatic retransmission** — the application retries
+- **No full arbitration participation** — TX aborts on conflict instead of
+  competing to win
+- **No RTR support** — remote frames are neither transmitted nor acted upon
+- **No CAN FD** — classic CAN 2.0B only
+- **No programmable bit timing** — fixed 32× oversampling, no SJW/TSEG
+- **No hardware acceptance filters** — software filtering only
+- **No on-chip transceiver** — an external CAN transceiver is required
 
-**At least one standards-compliant CAN controller must be present on the network.**
+**At least one standards-compliant CAN controller must be present on the
+network** to provide ACK and error confinement.
 
 ---
 

@@ -167,7 +167,8 @@ static bool loopback_case(const char *name, int ack) {
                             CAN2040_LITE_MAX_FRAME_BITS, &info);
     ok = ok && (total != 0);
 
-    if (ack) {
+    if (!ack) {
+        // Keep the NACK frame for the periodic Saleae capture.
         memcpy(g_tx_bits, tx_bits, sizeof(g_tx_bits));
         g_tx_total = total;
         g_last_tx = millis();
@@ -223,6 +224,35 @@ static void run_loopback() {
 }
 #endif // CAN2040_LITE_ENABLE_PIO_LOOPBACK
 
+
+#ifndef CAN2040_LITE_SALEAE_SELFTEST
+#define CAN2040_LITE_SALEAE_SELFTEST 0
+#endif
+
+#if CAN2040_LITE_SALEAE_SELFTEST
+// Mirrors FastAccelStepper's SR_00 wiring self-test: analyzer channel i is
+// wired to GPIO 2+i and toggles with high time 50*(i+1) ms in a 1 s period.
+static void saleae_selftest() {
+    static const uint8_t pins[8] = {2, 3, 4, 5, 6, 7, 8, 9};
+    uint32_t start;
+    uint32_t i;
+
+    for (i = 0; i < 8; i++) {
+        pinMode(pins[i], OUTPUT);
+        digitalWrite(pins[i], LOW);
+    }
+    start = millis();
+    while (millis() - start < 4000u) {
+        uint32_t phase = (millis() - start) % 1000u;
+        for (i = 0; i < 8; i++)
+            digitalWrite(pins[i], (phase < 50u * (i + 1u)) ? HIGH : LOW);
+        delay(1);
+    }
+    for (i = 0; i < 8; i++)
+        digitalWrite(pins[i], LOW);
+}
+#endif
+
 static void run_suite() {
     passed = 0;
     failed = 0;
@@ -248,6 +278,9 @@ static void run_suite() {
 void setup() {
     Serial.begin(115200);
     delay(1500);
+#if CAN2040_LITE_SALEAE_SELFTEST
+    saleae_selftest();
+#endif
     run_suite();
 }
 

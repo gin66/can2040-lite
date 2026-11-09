@@ -239,8 +239,8 @@ Steps:
       frame-complete IRQ/driver integration still pending (harness waits on DMA)
 - [x] 4.3 Loop host-generated vectors through a stimulus source; compare
       captured bitstreams (TX→RX on GP2: VALID/ACK and VALID/NACK pass)
-- [ ] 4.4 Saleae/sigrok capture of RX pin under realistic bitrates (125k/500k/
-      1M), verify sampling positions and frame boundaries
+- [~] 4.4 Saleae/sigrok capture of RX pin under realistic bitrates: 500k
+      verified (TX loopback pin); 125k and 1M still pending
 - [ ] 4.5 Robustness: idle suppression, overflow reporting, malformed frames
 
 > 🛑 **Commit checkpoint C5 — `pio: RX state machine with edge-resynced sampling and DMA capture`**
@@ -258,8 +258,8 @@ Steps:
       **11 words**, leaving 21 of the 29-word CAN budget unused.
 - [ ] 5.2 Abort on conflict: sent recessive but read dominant (lost
       arbitration), stuff/bit error cases; no error-flag injection
-- [ ] 5.3 Saleae TX capture (TX only, FastAccelStepper approach); compare
-      against generator vectors (content and bit timing)
+- [x] 5.3 Saleae TX capture (D0 = GP2) decodes ID 0x123, DLC 8, data
+      12..F0, CRC 0x1738; both ACK and NACK slots observed at 500k
 - [ ] 5.4 Verify back-to-back frames and interframe spacing (≥3 bits)
 
 > 🛑 **Commit checkpoint C6 — `pio: TX state machine with arbitration abort`**
@@ -271,8 +271,8 @@ Steps:
 
 ## Phase 6 — Loopback + ACK/NACK readback
 
-- [~] 6.1 Map TX and RX to the same pin (GP2) — verified by the on-target
-      loopback; independent Saleae capture still pending
+- [x] 6.1 Map TX and RX to the same pin (GP2); Saleae capture confirms the
+      on-wire frame and the ACK/NACK slot
 - [x] 6.2 RX confirms own transmission (decoded id/DLC/data match)
 - [x] 6.3 ACK slot evaluation: dominant ACK and recessive NACK both decode
       correctly (loopback harness)

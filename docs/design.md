@@ -126,6 +126,11 @@ CAN2040-Lite's two CAN programs must fit in ≤ 29 words so that the 2-word
 FreeRTOS cycle-counter program can coexist on PIO0, leaving at most 1 spare
 word.
 
+Measured on RP2350: `rx.pio` = 7 words, `tx.pio` = 4 words, total **11**.
+The RX block (66 PIO cycles) and TX word (1026 PIO cycles for 32 bits) are
+calibrated to one bit time; a taken PIO branch costs 1 cycle on this part, so
+re-check the clock multipliers when porting to a different PIO version.
+
 ## Frame Processing Pipeline
 
 ```

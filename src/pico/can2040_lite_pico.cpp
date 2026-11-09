@@ -22,10 +22,12 @@
 #include "rx.pio.h"
 #include "tx.pio.h"
 
-// TX: 1057 PIO cycles per 32-bit word = 33.03125 cycles/bit on average.
-static const float tx_clk_mult = 33.03125f;
-// RX: one 32-sample block (98 cycles) = one bit.
-static const float rx_clk_mult = 98.0f;
+// Measured on RP2350: a taken PIO branch costs 1 cycle here, so
+//   TX word = pull(1) + set(1) + 32*out(31) + 31*jmp(1) + jmp(1) = 1026
+//   RX block = set(1) + 32*in(1) + 31*jmp(1) + jmp(1) + push(1) = 66
+// Re-check these constants if the PIO branch timing differs on another part.
+static const float tx_clk_mult = 32.0625f;
+static const float rx_clk_mult = 66.0f;
 
 static_assert(can_rx_program.length + can_tx_program.length <= 29,
               "rx + tx PIO programs must fit in 29 words");
@@ -46,10 +48,23 @@ static float clkdiv_for(uint32_t bitrate, float mult) {
     return (float)clock_get_hz(clk_sys) / (mult * (float)bitrate);
 }
 
-extern "C" void can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
+extern "C" int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
+    int sm;
+    int off;
+
     rx_pio = pio0;
-    rx_sm = (uint)pio_claim_unused_sm(rx_pio, true);
-    rx_offset = pio_add_program(rx_pio, &can_rx_program);
+    sm = pio_claim_unused_sm(rx_pio, false);
+    if (sm < 0) {
+        Serial.println("rx init: no free SM");
+        return -1;
+    }
+    rx_sm = (uint)sm;
+    off = pio_add_program(rx_pio, &can_rx_program);
+    if (off < 0) {
+        Serial.println("rx init: no program space");
+        return -1;
+    }
+    rx_offset = (uint)off;
 
     rx_cfg = can_rx_program_get_default_config(rx_offset);
     sm_config_set_in_pins(&rx_cfg, gpio);
@@ -62,12 +77,26 @@ extern "C" void can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
 
     pio_sm_init(rx_pio, rx_sm, rx_offset, &rx_cfg);
     pio_sm_set_enabled(rx_pio, rx_sm, false);
+    return 0;
 }
 
-extern "C" void can2040_lite_pico_tx_init(uint32_t gpio, uint32_t bitrate) {
+extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t bitrate) {
+    int sm;
+    int off;
+
     tx_pio = pio0;
-    tx_sm = (uint)pio_claim_unused_sm(tx_pio, true);
-    tx_offset = pio_add_program(tx_pio, &can_tx_program);
+    sm = pio_claim_unused_sm(tx_pio, false);
+    if (sm < 0) {
+        Serial.println("tx init: no free SM");
+        return -1;
+    }
+    tx_sm = (uint)sm;
+    off = pio_add_program(tx_pio, &can_tx_program);
+    if (off < 0) {
+        Serial.println("tx init: no program space");
+        return -1;
+    }
+    tx_offset = (uint)off;
 
     tx_cfg = can_tx_program_get_default_config(tx_offset);
     sm_config_set_out_pins(&tx_cfg, gpio, 1);
@@ -82,6 +111,7 @@ extern "C" void can2040_lite_pico_tx_init(uint32_t gpio, uint32_t bitrate) {
     pio_sm_init(tx_pio, tx_sm, tx_offset, &tx_cfg);
     pio_sm_set_pins_with_mask(tx_pio, tx_sm, 1u << gpio, 1u << gpio);
     pio_sm_set_enabled(tx_pio, tx_sm, true);
+    return 0;
 }
 
 extern "C" void can2040_lite_pico_rx_arm(void) {
@@ -113,7 +143,7 @@ extern "C" int can2040_lite_pico_rx_wait(uint32_t timeout_ms) {
             pio_sm_set_enabled(rx_pio, rx_sm, false);
             return 0;
         }
-        tight_loop_contents();
+        delay(1);
     }
     pio_sm_set_enabled(rx_pio, rx_sm, false);
     return 1;
@@ -122,6 +152,7 @@ extern "C" int can2040_lite_pico_rx_wait(uint32_t timeout_ms) {
 extern "C" uint32_t can2040_lite_pico_rx_bits(uint8_t *bits,
                                               uint32_t max_bits) {
     uint32_t n = 0;
+
     // Word 0 is the poll marker; word 1 is the SOF bit.
     for (uint32_t w = 1; w < CAN2040_LITE_PICO_RX_WORDS && n < max_bits; w++) {
         uint32_t ones = (uint32_t)__builtin_popcount(rx_words[w]);
@@ -140,6 +171,16 @@ extern "C" void can2040_lite_pico_tx_frame(const uint8_t *bits,
             uint8_t bit = (pos < nbits) ? bits_get(bits, pos) : 1;
             word = (word << 1) | bit;
         }
-        pio_sm_put_blocking(tx_pio, tx_sm, word);
+        uint32_t spin;
+        for (spin = 0; spin < 1000000u; spin++) {
+            if (!pio_sm_is_tx_fifo_full(tx_pio, tx_sm)) {
+                pio_sm_put(tx_pio, tx_sm, word);
+                break;
+            }
+        }
+        if (spin == 1000000u) {
+            Serial.println("tx frame: FIFO stuck");
+            return;
+        }
     }
 }

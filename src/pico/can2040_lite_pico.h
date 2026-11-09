@@ -19,8 +19,8 @@ extern "C" {
 // one marker word).  Enough for the longest classic CAN frame with margin.
 #define CAN2040_LITE_PICO_RX_WORDS 400u
 
-void can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate);
-void can2040_lite_pico_tx_init(uint32_t gpio, uint32_t bitrate);
+int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate);
+int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t bitrate);
 
 // Re-arm the RX SM at the SOF poll loop and start a DMA capture.
 void can2040_lite_pico_rx_arm(void);

@@ -14,6 +14,8 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked
   words of instruction memory; 2 words are reserved for the FreeRTOS
   cycle-counter SM (a 2-instruction program), leaving at most 1 spare word.
   This budget is verified with `pioasm` before C5/C6 can pass.
+  **Measured now:** rx = 7, tx = 4, total = **11** words; TX→RX loopback
+  (ACK + NACK) passes on RP2350.
 
 ---
 
@@ -233,10 +235,10 @@ Steps:
       bit), SOF poll via `jmp pin`, continuous capture after SOF.  Software
       takes the majority of each word and slices/de-stuffs/decodes.
       **7 PIO instructions** (`pioasm`); see `src/pico/rx.pio`.
-- [~] 4.2 DMA from RX FIFO into a raw word buffer (implemented); frame-complete
-      IRQ/driver integration still pending (harness currently waits on DMA)
-- [~] 4.3 Loop host-generated vectors through a stimulus source; compare
-      captured bitstreams (PIO loopback path added, hardware run pending)
+- [~] 4.2 DMA from RX FIFO into a raw word buffer (working, 400 words);
+      frame-complete IRQ/driver integration still pending (harness waits on DMA)
+- [x] 4.3 Loop host-generated vectors through a stimulus source; compare
+      captured bitstreams (TX→RX on GP2: VALID/ACK and VALID/NACK pass)
 - [ ] 4.4 Saleae/sigrok capture of RX pin under realistic bitrates (125k/500k/
       1M), verify sampling positions and frame boundaries
 - [ ] 4.5 Robustness: idle suppression, overflow reporting, malformed frames
@@ -250,7 +252,7 @@ Steps:
 
 ## Phase 5 — PIO TX state machine + Saleae verification
 
-- [x] 5.1 Write `tx.pio`: 32-bit word shifter, MSB-first, one bit per 33.03125
+- [x] 5.1 Write `tx.pio`: 32-bit word shifter, MSB-first, one bit per 32.0625
       PIO cycles on average. **4 PIO instructions**. Bus-idle wait and
       per-bit RX compare are still TODO (software/backend). Combined rx+tx =
       **11 words**, leaving 21 of the 29-word CAN budget unused.
@@ -269,10 +271,11 @@ Steps:
 
 ## Phase 6 — Loopback + ACK/NACK readback
 
-- [ ] 6.1 Map TX and RX to the same pin; capture with Saleae
-- [ ] 6.2 RX confirms own transmission (compare against transmitted stream)
-- [ ] 6.3 ACK slot evaluation (dominant = ACKed; recessive = NACK); report
-      NACK to application
+- [~] 6.1 Map TX and RX to the same pin (GP2) — verified by the on-target
+      loopback; independent Saleae capture still pending
+- [x] 6.2 RX confirms own transmission (decoded id/DLC/data match)
+- [x] 6.3 ACK slot evaluation: dominant ACK and recessive NACK both decode
+      correctly (loopback harness)
 - [ ] 6.4 Error-frame detection (6+ dominant bits) during TX window
 
 > 🛑 **Commit checkpoint C7 — `pio: TX/RX loopback with ACK/NACK readback`**

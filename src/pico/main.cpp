@@ -138,27 +138,40 @@ static void run_api_smoke() {
 
 #if CAN2040_LITE_ENABLE_PIO_LOOPBACK
 #define LOOP_GPIO 2
+static bool loopback_done;
+static uint8_t g_tx_bits[CAN2040_LITE_MAX_FRAME_BYTES];
+static uint32_t g_tx_total;
+static uint32_t g_last_tx;
 
-static void run_loopback() {
+static const uint8_t loop_data[8] = {0x12, 0x34, 0x56, 0x78,
+                                     0x9a, 0xbc, 0xde, 0xf0};
+
+static bool loopback_case(const char *name, int ack) {
     can_frame_t f;
     can_build_info_t info;
     can_parsed_t p;
     uint8_t tx_bits[CAN2040_LITE_MAX_FRAME_BYTES];
     uint8_t rx_bits[CAN2040_LITE_MAX_FRAME_BYTES];
+    uint32_t total;
     uint32_t rx_n;
+    frame_validity_t got;
     bool ok = true;
 
-    static const uint8_t data[8] = {0x12, 0x34, 0x56, 0x78,
-                                     0x9a, 0xbc, 0xde, 0xf0};
     memset(&f, 0, sizeof(f));
     f.id = 0x123;
     f.dlc = 8;
-    memcpy(f.data, data, 8);
+    memcpy(f.data, loop_data, 8);
 
     memset(tx_bits, 0, sizeof(tx_bits));
-    uint32_t total = can_frame_build(&f, VALID_FRAME, 1, tx_bits,
-                                     CAN2040_LITE_MAX_FRAME_BITS, &info);
+    total = can_frame_build(&f, VALID_FRAME, ack, tx_bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
     ok = ok && (total != 0);
+
+    if (ack) {
+        memcpy(g_tx_bits, tx_bits, sizeof(g_tx_bits));
+        g_tx_total = total;
+        g_last_tx = millis();
+    }
 
     can2040_lite_pico_rx_arm();
     can2040_lite_pico_tx_frame(tx_bits, total);
@@ -166,26 +179,27 @@ static void run_loopback() {
 
     memset(rx_bits, 0, sizeof(rx_bits));
     rx_n = can2040_lite_pico_rx_bits(rx_bits, CAN2040_LITE_MAX_FRAME_BITS);
-    frame_validity_t got = can_frame_decode(rx_bits, rx_n, &p);
+    got = can_frame_decode(rx_bits, rx_n, &p);
 
     ok = ok && (got == VALID_FRAME);
     if (got == VALID_FRAME) {
-        ok = ok && (p.id == f.id) && (p.dlc == 8) && (p.ack == 1);
-        ok = ok && (memcmp(p.data, data, 8) == 0);
+        ok = ok && (p.id == f.id) && (p.dlc == 8) && (p.ack == ack);
+        ok = ok && (memcmp(p.data, loop_data, 8) == 0);
     }
 
     Serial.printf("  %-18s expected %-13s got %-13s %s\n",
-                  "PIO loopback", "VALID/ACK", validity_name(got),
-                  ok ? "PASS" : "FAIL");
+                  name, ack ? "VALID/ACK" : "VALID/NACK",
+                  validity_name(got), ok ? "PASS" : "FAIL");
+    Serial.flush();
     if (!ok) {
-        Serial.printf("    rx words: %u, decoded id=0x%X dlc=%u ack=%u\n",
+        Serial.printf("    rx bits: %u, decoded id=0x%X dlc=%u ack=%u\n",
                       (unsigned)rx_n, (unsigned)p.id, (unsigned)p.dlc,
                       (unsigned)p.ack);
-        Serial.printf("    first tx word bits:");
+        Serial.printf("    first tx bits:");
         for (uint32_t i = 0; i < 40; i++)
             Serial.printf("%u", bits_get(tx_bits, i));
         Serial.println();
-        Serial.printf("    first rx bits:     ");
+        Serial.printf("    first rx bits:");
         for (uint32_t i = 0; i < 40; i++)
             Serial.printf("%u", bits_get(rx_bits, i));
         Serial.println();
@@ -194,8 +208,19 @@ static void run_loopback() {
         passed++;
     else
         failed++;
+    return ok;
 }
 
+static void run_loopback() {
+    if (can2040_lite_pico_rx_init(LOOP_GPIO, 500000) < 0 ||
+        can2040_lite_pico_tx_init(LOOP_GPIO, 500000) < 0) {
+        Serial.println("  PIO loopback       PIO init FAILED");
+        failed += 2;
+        return;
+    }
+    loopback_case("PIO loopback ACK", 1);
+    loopback_case("PIO loopback NACK", 0);
+}
 #endif // CAN2040_LITE_ENABLE_PIO_LOOPBACK
 
 static void run_suite() {
@@ -213,14 +238,12 @@ static void run_suite() {
     for (size_t i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++)
         run_vector(&vectors[i]);
     run_api_smoke();
-#if CAN2040_LITE_ENABLE_PIO_LOOPBACK
-    run_loopback();
-#endif
 
     Serial.println("========================================");
     Serial.printf("TOTAL: %d passed, %d failed\n", passed, failed);
     Serial.println(failed ? "RESULT: FAIL" : "RESULT: PASS");
 }
+
 
 void setup() {
     Serial.begin(115200);
@@ -229,11 +252,28 @@ void setup() {
 }
 
 void loop() {
+#if CAN2040_LITE_ENABLE_PIO_LOOPBACK
+    if (!loopback_done) {
+        loopback_done = true;
+        delay(500);
+        Serial.println();
+        Serial.println("=== PIO loopback ===");
+        Serial.flush();
+        run_loopback();
+    }
+#endif
     // Send any character over USB serial to re-run the vector suite.
     if (Serial.available()) {
         while (Serial.available())
             (void)Serial.read();
         run_suite();
     }
+#if CAN2040_LITE_ENABLE_PIO_LOOPBACK
+    // Keep transmitting for Saleae/TX-timing captures.
+    if (g_tx_total && (millis() - g_last_tx) > 200) {
+        g_last_tx = millis();
+        can2040_lite_pico_tx_frame(g_tx_bits, g_tx_total);
+    }
+#endif
     delay(20);
 }

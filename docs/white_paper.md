@@ -249,16 +249,17 @@ The TX SM (SM1) handles transmission with bus idle wait:
    transceiver, the transceiver drives the bus, and the same transceiver's RX
    pin reflects the resulting bus level (including other nodes' dominant bits).
 
-4. **Lost-Arbitration Abort:** If the transmitter sends a recessive bit but
-   reads back a dominant bit, it has lost arbitration (or another node is
-   driving the bus). The TX SM aborts immediately without injecting an error
-   flag, so the winning frame is not disturbed.
+4. **Readback abort:** A conflict exists only when this node sends recessive
+   and the bus is dominant (lost arbitration, or another node driving the
+   bit). The pin is already recessive, so the SM parks without driving it
+   again and does not inject an error flag. A dominant bit is not a conflict:
+   wired-AND means this node's own dominant bit hides everyone else.
 
-5. **ACK Evaluation:** The position of the ACK slot is known from the
-   transmit stream itself (it follows the 15-bit CRC and CRC delimiter), so no
-   separate frame parse is needed. A dominant bit in the ACK slot is an ACK; a
-   recessive bit is a NACK. The following ACK delimiter (recessive) is checked
-   for consistency.
+5. **ACK and EOF:** The shifted message ends with the recessive bit after the
+   CRC. That bit is driven and not sampled, and the SM parks. The pin stays
+   recessive, so the ACK slot, the end of frame and the interframe space are
+   that parked level. A receiver's dominant ACK does not abort the frame.
+   ACK versus NACK is reported from the RX capture, not from the TX IRQ.
 
 6. **Error Evaluation:** An error flag is **6 or more consecutive dominant
    bits** (6–12 depending on how many error-active nodes are signalling). If
@@ -276,7 +277,7 @@ PIO performs only real-time functions.
 
 - Idle detection (11 consecutive recessive bits)
 - SOF detection (first dominant bit after idle)
-- Fixed-rate sampling (PIO clock = 32 × bitrate) with hard re-sync on edges
+- Fixed-rate sampling (RX PIO clock = 66 × bitrate, 32 samples/bit) with hard re-sync on edges
 - Frame-end detection (EOF 7 recessive + IFS 3 recessive)
 - Reads CAN-RX pin, fills FIFO
 - Disables sampling during idle (reduces CPU overhead)
@@ -407,9 +408,9 @@ A received frame is either:
 
 A transmitted frame is either:
 
-- **ACK received (readback)** → Success
-- **Error detected (readback)** → Report error to application
-- **No ACK (readback)** → Report NACK to application
+- **Tail finished, ACK dominant on RX** → Success
+- **Tail finished, ACK recessive on RX** → Report NACK to application
+- **Readback mismatch** → Report error to application
 
 Nothing more.
 

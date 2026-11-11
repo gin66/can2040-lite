@@ -6,8 +6,8 @@
 //
 // can2040_lite_pico.cpp — RP2040/RP2350 PIO backend.
 //
-// Two CAN SMs on PIO0 (SM0 rx, SM1 tx).  The rx + tx programs are 7 + 4 = 11
-// instructions, well inside the 29-word budget that leaves 2 words for the
+// Two CAN SMs on PIO0 (SM0 rx, SM1 tx).  The rx + tx programs are 7 + 14 =
+// 21 instructions, inside the 29-word budget that leaves 2 words for the
 // FreeRTOS cycle counter SM.
 
 #include <Arduino.h>
@@ -22,12 +22,22 @@
 #include "rx.pio.h"
 #include "tx.pio.h"
 
-// Measured on RP2350: a taken PIO branch costs 1 cycle here, so
-//   TX word = pull(1) + set(1) + 32*out(31) + 31*jmp(1) + jmp(1) = 1026
-//   RX block = set(1) + 32*in(1) + 31*jmp(1) + jmp(1) + push(1) = 66
-// Re-check these constants if the PIO branch timing differs on another part.
-static const float tx_clk_mult = 32.0625f;
+// TX is exactly 32 PIO cycles per bit; autopull refills the OSR for free so
+// there is no word-boundary jitter.  RX captures 32 samples per bit and its
+// block is 66 cycles, so both clocks are integer multiples of the bitrate.
+// Re-check the RX constant if the PIO branch timing differs on another part.
+static const float tx_clk_mult = 32.0f;
 static const float rx_clk_mult = 66.0f;
+
+// TX is one-shot per CAN message.  The program raises one of these IRQs and
+// parks; software must re-prepare the SM for the next message.
+static const uint CAN_TX_DONE_IRQ = 6;
+static const uint CAN_TX_ERR_IRQ = 7;
+
+// Joined TX FIFO depth.  One entry is the bit count, and one recessive word
+// is reserved so the OUT that empties the OSR can autopull instead of stalling.
+// A worst-case classic message is 6 words, so count + message + pad fit.
+static const uint CAN_TX_FIFO_WORDS = 8;
 
 static_assert(can_rx_program.length + can_tx_program.length <= 29,
               "rx + tx PIO programs must fit in 29 words");
@@ -38,6 +48,7 @@ static uint rx_sm;
 static uint tx_sm;
 static uint rx_offset;
 static uint tx_offset;
+static uint tx_gpio;
 static pio_sm_config rx_cfg;
 static pio_sm_config tx_cfg;
 static int rx_dma_chan = -1;
@@ -80,7 +91,8 @@ extern "C" int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
     return 0;
 }
 
-extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t bitrate) {
+extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
+                                         uint32_t bitrate) {
     int sm;
     int off;
 
@@ -97,20 +109,28 @@ extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t bitrate) {
         return -1;
     }
     tx_offset = (uint)off;
+    tx_gpio = gpio;
+    pio_interrupt_clear(tx_pio, CAN_TX_DONE_IRQ);
+    pio_interrupt_clear(tx_pio, CAN_TX_ERR_IRQ);
 
     tx_cfg = can_tx_program_get_default_config(tx_offset);
     sm_config_set_out_pins(&tx_cfg, gpio, 1);
-    sm_config_set_out_shift(&tx_cfg, false, false, 32); // shift left, no autopull
+    sm_config_set_set_pins(&tx_cfg, gpio, 1);
+    sm_config_set_jmp_pin(&tx_cfg, gpio_rx);
+    sm_config_set_out_shift(&tx_cfg, false, true, 32); // shift left, autopull
+    sm_config_set_fifo_join(&tx_cfg, PIO_FIFO_JOIN_TX); // 8-deep TX FIFO
     sm_config_set_clkdiv(&tx_cfg, clkdiv_for(bitrate, tx_clk_mult));
 
     pio_gpio_init(tx_pio, gpio);
+    if (gpio_rx != gpio)
+        pio_gpio_init(tx_pio, gpio_rx);
     gpio_set_dir(gpio, GPIO_OUT);
     gpio_put(gpio, 1);
     pio_sm_set_consecutive_pindirs(tx_pio, tx_sm, gpio, 1, true);
 
     pio_sm_init(tx_pio, tx_sm, tx_offset, &tx_cfg);
     pio_sm_set_pins_with_mask(tx_pio, tx_sm, 1u << gpio, 1u << gpio);
-    pio_sm_set_enabled(tx_pio, tx_sm, true);
+    pio_sm_set_enabled(tx_pio, tx_sm, false); // one-shot: started by tx_frame()
     return 0;
 }
 
@@ -161,9 +181,52 @@ extern "C" uint32_t can2040_lite_pico_rx_bits(uint8_t *bits,
     return n;
 }
 
+extern "C" void can2040_lite_pico_tx_set_readback_gpio(uint32_t gpio) {
+    pio_gpio_init(tx_pio, gpio);
+    pio_sm_set_jmp_pin(tx_pio, tx_sm, gpio);
+    sm_config_set_jmp_pin(&tx_cfg, gpio);
+}
+
+extern "C" int can2040_lite_pico_tx_done_pending(void) {
+    return pio_interrupt_get(tx_pio, CAN_TX_DONE_IRQ) ? 1 : 0;
+}
+
+extern "C" int can2040_lite_pico_tx_error_pending(void) {
+    return pio_interrupt_get(tx_pio, CAN_TX_ERR_IRQ) ? 1 : 0;
+}
+
+extern "C" void can2040_lite_pico_tx_clear_status(void) {
+    pio_interrupt_clear(tx_pio, CAN_TX_DONE_IRQ);
+    pio_interrupt_clear(tx_pio, CAN_TX_ERR_IRQ);
+}
+
+// Prepare and start one message.  `nbits` covers SOF through the recessive
+// bit after the CRC.  That bit is driven and the SM parks.  Y is the bit
+// count, the OSR is preloaded with the first word, and the rest of the
+// joined FIFO holds the remaining words.  The caller must not call this
+// while a message is running.
 extern "C" void can2040_lite_pico_tx_frame(const uint8_t *bits,
                                            uint32_t nbits) {
     uint32_t words = (nbits + 31u) / 32u;
+
+    // Count word plus the autopull pad occupy two FIFO entries.
+    if (!bits || nbits == 0 || words + 2u > CAN_TX_FIFO_WORDS)
+        return;
+
+    // Halt the SM, clear the FIFOs/shift counters and point it at `reload`.
+    // Restart leaves the OSR shift count at 32 (empty), so the pull below
+    // is not the autopull no-op that a full OSR would be.  X is set by the
+    // first instruction after enable; restart does not clear it.
+    // `can_tx_wrap` is the `set x, 22` that arms the idle count. Enabling the
+    // SM runs it once, then the program wraps to the recessive poll.
+    pio_sm_init(tx_pio, tx_sm, tx_offset + can_tx_wrap, &tx_cfg);
+    pio_sm_set_pins_with_mask(tx_pio, tx_sm, 1u << tx_gpio, 1u << tx_gpio);
+
+    // jmp y-- falls through on the bit where Y was already 0, so the count
+    // loaded here is one less than the number of bits to shift.
+    pio_sm_put_blocking(tx_pio, tx_sm, nbits - 1u);
+
+    // Raw on-wire bits, MSB-first. Bits past nbits are never shifted.
     for (uint32_t w = 0; w < words; w++) {
         uint32_t word = 0;
         for (uint32_t i = 0; i < 32u; i++) {
@@ -171,16 +234,18 @@ extern "C" void can2040_lite_pico_tx_frame(const uint8_t *bits,
             uint8_t bit = (pos < nbits) ? bits_get(bits, pos) : 1;
             word = (word << 1) | bit;
         }
-        uint32_t spin;
-        for (spin = 0; spin < 1000000u; spin++) {
-            if (!pio_sm_is_tx_fifo_full(tx_pio, tx_sm)) {
-                pio_sm_put(tx_pio, tx_sm, word);
-                break;
-            }
-        }
-        if (spin == 1000000u) {
-            Serial.println("tx frame: FIFO stuck");
-            return;
-        }
+        pio_sm_put_blocking(tx_pio, tx_sm, word);
     }
+    // The OUT that empties the OSR autopulls. Without a spare word that
+    // OUT stalls when nbits is a multiple of 32, and DONE never runs.
+    pio_sm_put_blocking(tx_pio, tx_sm, 0xffffffffu);
+
+    // Move the count into Y and autopull the first message word, so the SOF
+    // bit has no stall and every bit stays exactly 32 cycles.
+    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_pull(false, true));
+    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_mov(pio_y, pio_osr));
+    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_out(pio_null, 32));
+
+    can2040_lite_pico_tx_clear_status();
+    pio_sm_set_enabled(tx_pio, tx_sm, true);
 }

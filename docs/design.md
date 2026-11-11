@@ -90,7 +90,7 @@ runs.
 The key insight is that a separate sync SM can be avoided by folding
 re-synchronization into the RX program:
 
-- The RX SM samples at a fixed rate derived from the PIO clock (32 × bitrate).
+- The RX SM samples 32 times per bit; its block is 66 PIO cycles (PIO clock = 66 × bitrate).
 - On every observed bus edge it **hard re-syncs the bit phase**.
 - There is no phase-locked loop or programmable time-quanta phase segment.
 - Clock error cannot accumulate across the frame; it is bounded by the longest
@@ -107,9 +107,13 @@ re-synchronization into the RX program:
 
 - CAN2040-Lite transmits frames and verifies them via readback
 - Bus idle wait before transmission (CAN protocol requirement)
-- Readback compares every transmitted bit against CAN-RX
-- A recessive-sent/dominant-read mismatch aborts the transmission (lost
-  arbitration) without injecting an error flag
+- The shifted message is SOF through the recessive bit after the CRC. That
+  bit is driven and not compared, and the SM parks with the pin left there.
+  ACK, end of frame and interframe space are that recessive level
+- The only conflict is recessive-sent/dominant-read (lost arbitration, or
+  another node driving the bit). The pin is already recessive, so the SM
+  parks without driving it again and without an error flag. A dominant bit
+  is not compared: wired-AND hides every other transmitter
 - Application handles retries (no automatic retransmission)
 
 #### Why no arbitration in TX?
@@ -133,8 +137,8 @@ re-synchronization into the RX program:
 | sync SM | 13 | 0 (integrated into rx) |
 | rx SM | 2 | 7 (oversampled capture) |
 | match SM | 10 | 0 (deferred to software) |
-| tx SM | 7 | 4 (word shifter; readback/abort still TODO) |
-| **Total CAN program words** | **32** | **11 (hard limit 29)** |
+| tx SM | 7 | 14 (one-shot message TX) |
+| **Total CAN program words** | **32** | **21 (hard limit 29)** |
 | **SMs used (CAN)** | **4** | **2** |
 | **SMs free (CAN only)** | **4** | **6** |
 | **SMs free (CAN + FreeRTOS counter)** | — | **5** |
@@ -145,10 +149,11 @@ CAN2040-Lite's two CAN programs must fit in ≤ 29 words so that the 2-word
 FreeRTOS cycle-counter program can coexist on PIO0, leaving at most 1 spare
 word.
 
-Measured on RP2350: `rx.pio` = 7 words, `tx.pio` = 4 words, total **11**.
-The RX block (66 PIO cycles) and TX word (1026 PIO cycles for 32 bits) are
-calibrated to one bit time; a taken PIO branch costs 1 cycle on this part, so
-re-check the clock multipliers when porting to a different PIO version.
+`rx.pio` = 7 words, `tx.pio` = 14 words, total **21**.
+TX runs at 32 PIO cycles per bit (PIO clock = 32 * bitrate) with zero
+word-boundary jitter thanks to autopull.  RX captures 32 samples per bit in a
+66-cycle block (PIO clock = 66 * bitrate).  A taken PIO branch costs 1 cycle on
+this part; re-check these constants when porting to a different PIO version.
 
 ## Frame Processing Pipeline
 
@@ -189,12 +194,11 @@ Transmit on CAN-TX (bit-stuffed)
     |
     V
 Readback on CAN-RX (per bit):
-    - Sent recessive, read dominant → lost arbitration, abort
-    - ACK slot position known from transmit stream → ACK/NACK
+    - Sent recessive, read dominant → abort (lost arbitration / conflict)
     - 6+ consecutive dominant bits → error flag from another node
     |
     V
-Report: SUCCESS / ERROR / NACK
+Report: DONE / ERROR (application retries or evaluates ACK via RX)
 ```
 
 The signal path is **through the bus**: TX drives the transceiver, the
@@ -206,10 +210,10 @@ dominant bits from other nodes). It is not an internal transceiver loopback.
 | Error Type | can2040 | CAN2040-Lite |
 |------------|---------|-------------|
 | CRC error (RX) | Transmit error flag, retransmit | Discard frame, report to app |
-| ACK missing (TX readback) | Retransmit | Report NACK to app |
+| ACK missing (RX of own frame) | Retransmit | Report NACK to app |
 | Error frame (TX readback) | Error flag | Report error to app |
 | Stuff error | Error flag | Discard frame, report |
-| Lost arbitration (TX) | Automatic arbitration | Abort TX on recessive/dominant mismatch |
+| Lost arbitration (TX) | Automatic arbitration | Abort TX on readback mismatch |
 | Bus-off | Automatic state machine | N/A (no state machine) |
 
 **Key principle:** CRC errors are reported to the application layer but the
@@ -239,9 +243,9 @@ and a small mis-sample is harmless.
 
 ### Sampling Strategy
 
-- PIO clock = 32 × bitrate (same as can2040)
-- Example: 500 kbit/s → PIO clock = 16 MHz
-- Example: 1 Mbit/s → PIO clock = 32 MHz
+- TX PIO clock = 32 × bitrate; RX PIO clock = 66 × bitrate
+- Example: 500 kbit/s → TX 16 MHz, RX 33 MHz
+- Example: 1 Mbit/s → TX 32 MHz, RX 66 MHz
 - Sample at nominal bit center, re-aligning phase on each edge
 - Idle = 11 recessive bits; SOF = first dominant bit
 
@@ -250,9 +254,9 @@ and a small mis-sample is harmless.
 | Aspect | can2040 (precise) | CAN2040-Lite (edge-resynced) |
 |--------|-------------------|------------------------------|
 | Clock drift tolerance | Excellent (dedicated sync SM) | Good, bounded by edge interval |
-| Implementation complexity | High (4 SMs, full program memory) | Lower (2 SMs, ~18 words) |
+| Implementation complexity | High (4 SMs, full program memory) | Lower (2 SMs, 21 words) |
 | Frame loss in extreme drift | None | Possible only if edges are absent |
-| Resource usage | 4 SMs + whole 32-word block | 2 SMs, 11 words |
+| Resource usage | 4 SMs + whole 32-word block | 2 SMs, 21 words |
 
 ## DMA Integration
 

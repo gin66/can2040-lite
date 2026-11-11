@@ -150,6 +150,16 @@ static uint32_t g_last_tx;
 static const uint8_t loop_data[8] = {0x12, 0x34, 0x56, 0x78,
                                      0x9a, 0xbc, 0xde, 0xf0};
 
+static bool tx_wait_done(uint32_t timeout_ms) {
+    uint32_t start = millis();
+    while (!can2040_lite_pico_tx_done_pending() &&
+           !can2040_lite_pico_tx_error_pending()) {
+        if (millis() - start > timeout_ms)
+            return false;
+    }
+    return can2040_lite_pico_tx_done_pending() != 0;
+}
+
 static bool loopback_case(const char *name, int ack) {
     can_frame_t f;
     can_build_info_t info;
@@ -171,16 +181,20 @@ static bool loopback_case(const char *name, int ack) {
                             CAN2040_LITE_MAX_FRAME_BITS, &info);
     ok = ok && (total != 0);
 
+    // The SM drives through the CRC delimiter and parks recessive. On a
+    // single pin the following ACK slot reads recessive.
+    uint32_t tx_n = info.stuffed_bits + 1u;
     if (!ack) {
         // Keep the NACK frame for the periodic Saleae capture.
         memcpy(g_tx_bits, tx_bits, sizeof(g_tx_bits));
-        g_tx_total = total;
+        g_tx_total = tx_n;
         g_last_tx = millis();
     }
 
     can2040_lite_pico_rx_arm();
-    can2040_lite_pico_tx_frame(tx_bits, total);
+    can2040_lite_pico_tx_frame(tx_bits, tx_n);
     ok = ok && can2040_lite_pico_rx_wait(100);
+    ok = ok && can2040_lite_pico_tx_done_pending();
 
     memset(rx_bits, 0, sizeof(rx_bits));
     rx_n = can2040_lite_pico_rx_bits(rx_bits, CAN2040_LITE_MAX_FRAME_BITS);
@@ -188,12 +202,12 @@ static bool loopback_case(const char *name, int ack) {
 
     ok = ok && (got == VALID_FRAME);
     if (got == VALID_FRAME) {
-        ok = ok && (p.id == f.id) && (p.dlc == 8) && (p.ack == ack);
+        ok = ok && (p.id == f.id) && (p.dlc == 8) && (p.ack == 0);
         ok = ok && (memcmp(p.data, loop_data, 8) == 0);
     }
 
     Serial.printf("  %-18s expected %-13s got %-13s %s\n",
-                  name, ack ? "VALID/ACK" : "VALID/NACK",
+                  name, "VALID/NACK",
                   validity_name(got), ok ? "PASS" : "FAIL");
     Serial.flush();
     if (!ok) {
@@ -262,15 +276,16 @@ static void loopback_back_to_back() {
     ok = ok && n1 && n2;
 
     can2040_lite_pico_rx_arm();
-    can2040_lite_pico_tx_frame(b1, n1);
-    can2040_lite_pico_tx_frame(b2, n2);
+    can2040_lite_pico_tx_frame(b1, i1.stuffed_bits + 1u);
+    ok = ok && tx_wait_done(50);
+    can2040_lite_pico_tx_frame(b2, i2.stuffed_bits + 1u);
     ok = ok && can2040_lite_pico_rx_wait(200);
 
     memset(rx, 0, sizeof(rx));
     rxn = can2040_lite_pico_rx_bits(rx, CAN2040_LITE_MAX_FRAME_BITS);
     g1 = can_frame_decode(rx, rxn, &p1);
     ok = ok && (g1 == VALID_FRAME);
-    ok = ok && (p1.id == 0x123) && (p1.ack == 1);
+    ok = ok && (p1.id == 0x123) && (p1.ack == 0);
     ok = ok && (memcmp(p1.data, loop_data, 8) == 0);
 
     off = p1.total_bits;
@@ -307,9 +322,82 @@ static void loopback_back_to_back() {
         failed++;
 }
 
+#define ABORT_RX_GPIO 3
+
+static void expect_tx_abort(const char *name) {
+    uint32_t start = millis();
+    bool aborted;
+    bool high;
+    bool ok;
+
+    while (!can2040_lite_pico_tx_error_pending() &&
+           (millis() - start) < 20u)
+        ;
+    aborted = can2040_lite_pico_tx_error_pending() != 0;
+    high = digitalRead(LOOP_GPIO) == HIGH;
+    ok = aborted && high;
+
+    Serial.printf("  %-18s expected %-13s got %-13s %s\n",
+                  name, "stopped", aborted ? "stopped" : "kept going",
+                  ok ? "PASS" : "FAIL");
+    Serial.flush();
+    if (!ok)
+        Serial.printf("    tx line %s, abort %u\n", high ? "high" : "low",
+                      (unsigned)aborted);
+    if (ok)
+        passed++;
+    else
+        failed++;
+}
+
+// Readback is a separate pin, so it does not echo CAN-TX. A conflict is only
+// a recessive bit against a dominant bus. Dominant bits are not compared.
+// The pattern ends recessive so the park leaves CAN-TX released.
+static void loopback_abort() {
+    static const uint8_t recessive[8] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    };
+    // Bit 31 is the last driven bit and must be recessive.
+    static const uint8_t dominant[4] = {0x00, 0x00, 0x00, 0x01};
+    const uint32_t bit_us = 1000000u / CAN2040_LITE_BITRATE;
+    bool echo_ok;
+
+    can2040_lite_pico_tx_clear_status();
+    can2040_lite_pico_tx_set_readback_gpio(ABORT_RX_GPIO);
+    pinMode(ABORT_RX_GPIO, OUTPUT);
+    digitalWrite(ABORT_RX_GPIO, HIGH);
+
+    // All recessive, so a recessive readback matches until we force dominant.
+    can2040_lite_pico_tx_frame(recessive, 64);
+    delayMicroseconds(bit_us * 13u);
+    digitalWrite(ABORT_RX_GPIO, LOW);
+    delayMicroseconds(bit_us * 6u);
+    digitalWrite(ABORT_RX_GPIO, HIGH);
+    expect_tx_abort("PIO abort");
+
+    can2040_lite_pico_tx_clear_status();
+    digitalWrite(ABORT_RX_GPIO, HIGH);
+    can2040_lite_pico_tx_frame(dominant, 32);
+    echo_ok = tx_wait_done(20) && digitalRead(LOOP_GPIO) == HIGH &&
+              !can2040_lite_pico_tx_error_pending();
+    Serial.printf("  %-18s expected %-13s got %-13s %s\n",
+                  "PIO dominant ok", "finished",
+                  echo_ok ? "finished" : "aborted",
+                  echo_ok ? "PASS" : "FAIL");
+    Serial.flush();
+    if (echo_ok)
+        passed++;
+    else
+        failed++;
+
+    can2040_lite_pico_tx_clear_status();
+    can2040_lite_pico_tx_set_readback_gpio(LOOP_GPIO);
+}
+
 static void run_loopback() {
     if (can2040_lite_pico_rx_init(LOOP_GPIO, CAN2040_LITE_BITRATE) < 0 ||
-        can2040_lite_pico_tx_init(LOOP_GPIO, CAN2040_LITE_BITRATE) < 0) {
+        can2040_lite_pico_tx_init(LOOP_GPIO, LOOP_GPIO,
+                                  CAN2040_LITE_BITRATE) < 0) {
         Serial.println("  PIO loopback       PIO init FAILED");
         failed += 2;
         return;
@@ -317,6 +405,7 @@ static void run_loopback() {
     loopback_case("PIO loopback ACK", 1);
     loopback_case("PIO loopback NACK", 0);
     loopback_back_to_back();
+    loopback_abort();
 }
 #endif // CAN2040_LITE_ENABLE_PIO_LOOPBACK
 
@@ -398,10 +487,10 @@ void loop() {
         run_suite();
     }
 #if CAN2040_LITE_ENABLE_PIO_LOOPBACK
-    // Keep transmitting for Saleae/TX-timing captures.
+    // Keep transmitting for Saleae/TX-timing captures (one message per tick;
+    // the transmitter is one-shot and parks after each message).
     if (g_tx_total && (millis() - g_last_tx) > 200) {
         g_last_tx = millis();
-        can2040_lite_pico_tx_frame(g_tx_bits, g_tx_total);
         can2040_lite_pico_tx_frame(g_tx_bits, g_tx_total);
     }
 #endif

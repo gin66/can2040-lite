@@ -2,10 +2,10 @@
 ;
 ; CAN RX PIO program — oversampled raw capture.
 ;
-; Clock: PIO clock = 98 * bitrate.  One block is 98 PIO cycles: 31 samples
-; spaced 3 cycles apart, the 32nd sample, then push and loop setup.  The block
-; therefore lasts exactly one bit time and each 32-bit word holds 32 samples
-; of one bit (with a 5-cycle gap between words).
+; Clock: PIO clock = 66 * bitrate.  One block is exactly 66 PIO cycles:
+; set x,31 (1) + 32 * in pins,1 (32) + 31 taken jmp (31) + the final not-taken
+; jmp (1) + push (1).  The block therefore lasts exactly one bit time and each
+; 32-bit word holds 32 samples of one bit (one sample per cycle).
 ;
 ; The poll loop (outside the wrap) waits for SOF (dominant).  `jmp pin` uses
 ; the jmp-pin selected in software, so the GPIO stays configurable.  The poll

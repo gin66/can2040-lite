@@ -195,6 +195,8 @@ uint32_t can_frame_build(const can_frame_t *frame, frame_validity_t validity,
     }
 
     total = stuffed_bits;
+    // Tail is always these 13 bits. tx.pio shifts through the CRC delimiter
+    // (stuffed_bits + 1) and parks there. The recessive park is the rest.
     bits_put(bits, total++, 1);           // CRC delimiter
     bits_put(bits, total++, ack ? 0 : 1); // ACK slot (dominant = ACK)
     bits_put(bits, total++, 1);           // ACK delimiter

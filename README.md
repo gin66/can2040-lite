@@ -42,8 +42,10 @@ real-time error participation:
 - **No error counters / fault confinement** — no TEC/REC, Error Active /
   Error Passive, or bus-off state.
 - **No automatic retransmission** — the application decides whether to retry.
-- **No full arbitration participation** — TX aborts on a recessive-sent /
-  dominant-read mismatch, but the node does not compete to win arbitration.
+- **No full arbitration participation** — TX aborts only when it sent
+  recessive and the bus is dominant. The bit after the CRC is driven and
+  not compared; ACK and end of frame are the recessive park. The node does
+  not send an error flag.
 - **No RTR support** — remote transmission request frames are not transmitted
   or acted upon. (The test generator can still emit RTR vectors for negative
   tests.)
@@ -161,7 +163,7 @@ can2040-lite/
 │   ├── can2040_lite.c/.h        # Public API skeleton
 │   └── pico/
 │       ├── can2040_lite_pico.cpp/.h  # PIO/DMA backend
-│       └── rx.pio, tx.pio            # PIO programs (7 + 4 words)
+│       └── rx.pio, tx.pio            # PIO programs (7 + 14 words)
 └── extras/
     ├── tests/
     │   ├── common/
@@ -219,13 +221,14 @@ Options:
 
 - [x] Firmware skeleton and public API
 - [x] On-target RP2350 harness (vectors + API + loopback)
-- [x] PIO RX (32x oversampled capture) and TX (word shifter): 7 + 4 = 11
-      instructions, inside the 29-word budget
+- [x] PIO RX (32x oversampled capture) and one-shot full-message TX:
+      7 + 14 = 21 instructions, inside the 29-word budget.
+      The current TX program is not tested on hardware.
 - [x] TX/RX loopback with ACK and NACK readback
 - [x] Saleae verification at 125k, 500k and 1M; back-to-back frames (18-bit gap)
 
 ### Planned
-- [ ] Lost-arbitration abort (needs a dominant driver on the bus)
+- [ ] Full frame-level TX driver (stuffed prefix, ACK/NACK evaluation)
 - [ ] Error-frame injection and detection
 - [ ] Real-bus integration with a compliant peer/transceiver
 - [ ] Soak test and release

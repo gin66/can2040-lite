@@ -265,12 +265,14 @@ Steps:
 
 ## Phase 5 — PIO TX state machine + Saleae verification
 
-- [x] 5.1 Write `tx.pio`: 32-bit word shifter, MSB-first, one bit per 32.0625
-      PIO cycles on average. **4 PIO instructions**. Bus-idle wait and
-      per-bit RX compare are still TODO (software/backend). Combined rx+tx =
-      **11 words**, leaving 21 of the 29-word CAN budget unused.
-- [ ] 5.2 Abort on conflict: sent recessive but read dominant (lost
-      arbitration), stuff/bit error cases; no error-flag injection
+- [x] 5.1 Write `tx.pio`: 32-bit word shifter, MSB-first, exactly 32 PIO
+      cycles per bit (autopull, PIO clock = 32 x bitrate, no word-boundary
+      jitter).
+- [x] 5.2 One-shot full-message TX: software fills the FIFO with SOF through
+      the recessive bit after the CRC. The SM waits for 11 idle bit times,
+      shifts those bits, drives that last bit without sampling it, and parks.
+      No separate end-of-frame sequence and no error-flag injection. Combined
+      rx+tx = **21 words**.
 - [x] 5.3 Saleae TX capture (D0 = GP2) decodes ID 0x123, DLC 8, data
       12..F0, CRC 0x1738; both ACK and NACK slots observed at 125k, 500k
       and 1M

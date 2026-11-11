@@ -48,7 +48,7 @@ total**. RP2350 has 3 blocks and 12 SMs.
 
 | SM | Name  | Purpose | Program words | Notes |
 |----|-------|---------|---------------|-------|
-| 0  | rx    | **32× oversampled capture** — SOF poll, one word per bit, DMA | 7 | Software majority + edge re-sync |
+| 0  | rx    | **edge-pair capture** — two 16-bit edge timestamps per word | 7 | ISR deltas + can_edge_sm |
 | 1  | tx    | **32-bit word shifter** — MSB-first bit-stuffed stream | 4 | Idle wait/compare in software (TODO) |
 | 2  | FreeRTOS | 2-instruction cycle counter | 2 | Reserved |
 | 3  | —     | **UNUSED** | — | Free for custom PIO |
@@ -65,7 +65,7 @@ used.** The 29-word CAN budget is a hard constraint, verified with `pioasm`.
 With a single axis, FAS uses 1 SM but still claims the block's program memory;
 the other 3 SMs on PIO1 remain unclaimed.
 
-**CAN2040-Lite: 2 SMs on PIO0, 11 PIO program words (hard limit 29)**  
+**CAN2040-Lite: 2 SMs on PIO0, 21 PIO program words (hard limit 29)**  
 **FreeRTOS counter: 1 SM on PIO0, 2 program words**  
 **FastAccelStepper (4 axes): 4 SMs on PIO1, whole 32-word program**  
 **Free in suspended-spheres: 1 SM on PIO0; 0 on PIO1**  
@@ -135,7 +135,7 @@ re-synchronization into the RX program:
 | Component | can2040 | CAN2040-Lite |
 |-----------|---------|-------------|
 | sync SM | 13 | 0 (integrated into rx) |
-| rx SM | 2 | 7 (oversampled capture) |
+| rx SM | 2 | 7 (edge-pair capture) |
 | match SM | 10 | 0 (deferred to software) |
 | tx SM | 7 | 14 (one-shot message TX) |
 | **Total CAN program words** | **32** | **21 (hard limit 29)** |
@@ -149,11 +149,13 @@ CAN2040-Lite's two CAN programs must fit in ≤ 29 words so that the 2-word
 FreeRTOS cycle-counter program can coexist on PIO0, leaving at most 1 spare
 word.
 
-`rx.pio` = 7 words, `tx.pio` = 14 words, total **21**.
+`rx_pair.pio` = 7 words, `tx.pio` = 14 words, total **21**.
 TX runs at 32 PIO cycles per bit (PIO clock = 32 * bitrate) with zero
-word-boundary jitter thanks to autopull.  RX captures 32 samples per bit in a
-66-cycle block (PIO clock = 66 * bitrate).  A taken PIO branch costs 1 cycle on
-this part; re-check these constants when porting to a different PIO version.
+word-boundary jitter thanks to autopull.  RX counts a free-running two-cycle
+down-counter and packs the 1->0 timestamp and the following 0->1 timestamp
+into one word (two edges per FIFO word); `rx.pio` is the older 7-word 32x
+oversampler, kept as an alternative.  A taken PIO branch costs 1 cycle on this
+part; re-check these constants when porting to a different PIO version.
 
 ## Frame Processing Pipeline
 
@@ -161,21 +163,16 @@ this part; re-check these constants when porting to a different PIO version.
 CAN Bus (NRZ signal)
     |
     V
-SM0 (Rx — Edge-Resynced Sampling):
-    - Idle detection (11 recessive bits)
-    - SOF detection (first dominant bit)
-    - Fixed-rate sampling with hard re-sync on edges
-    - Frame-end detection (EOF 7 recessive + IFS 3 recessive)
-    - Readback monitoring (for transmitted frames)
+SM0 (Rx — Edge-Pair Capture), PIO 7 words:
+    - Free-running two-cycle counter
+    - One FIFO word per (1->0, 0->1) pair of edges
+    - FIFO-not-empty IRQ; no DMA
     |
     V
-DMA Transfer — Frame complete → copy to RAM buffer
-    |
-    V
-Software Post-Processing:
-    Step 1: Destuffing (remove stuff bits)
-    Step 2: CRC verification
-    Step 3: Frame parsing (ID, DLC, data)
+can_edge_pair_push -> can_edge_sm (software ISR):
+    - 16-bit deltas carried on a 31-bit virtual clock
+    - Bit clock, idle/SOF/EOF/IFS, stuffing, CRC-15, field parse
+    - ACK arm and observed ACK slot
     |
     V
 Application Callback (valid frames only)

@@ -10,9 +10,10 @@
 // 21 instructions, inside the 29-word budget that leaves 2 words for the
 // FreeRTOS cycle counter SM.
 //
-// RX uses rx_edge.pio (edge-timestamped, 7 words) with a FIFO-not-empty IRQ
-// that feeds each word into can_edge_sm.  When a frame completes, the IRQ
-// saves it and dispatches the callback.
+// RX uses rx_pair.pio (edge pairs, 7 words) with a FIFO-not-empty IRQ.  Each
+// word holds the 16-bit timestamps of a 1->0 edge and the following 0->1 edge;
+// can_edge_pair_push() turns them into per-edge pushes for can_edge_sm.  When a
+// frame completes, the IRQ saves it and dispatches the callback.
 
 #include <Arduino.h>
 #include <string.h>
@@ -27,13 +28,17 @@
 #include "can2040_lite.h"    // full struct can2040_lite definition
 #include "can2040_lite_proto.h"
 #include "can_edge_sm.h"
-#include "rx_edge.pio.h"
+#include "rx_pair.pio.h"
 #include "tx.pio.h"
 
 // TX is exactly 32 PIO cycles per bit; autopull refills the OSR for free so
 // there is no word-boundary jitter.  RX counts two-cycle ticks in X, so the
 // divider and ticks_per_bit are chosen together to make that count exact.
 static const float tx_clk_mult = 32.0f;
+
+// rx_pair.pio's capture path runs two cycles with no `jmp x--`, so each
+// inter-edge gap measures one tick short.  The pair decoder adds this back.
+static const uint32_t rx_pair_bias = 1;
 
 // TX is one-shot per CAN message.  The program raises one of these IRQs and
 // parks; software must re-prepare the SM for the next message.
@@ -45,8 +50,8 @@ static const uint CAN_TX_ERR_IRQ = 7;
 // A worst-case classic message is 6 words, so count + message + pad fit.
 static const uint CAN_TX_FIFO_WORDS = 8;
 
-static_assert(can_rx_edge_program.length + can_tx_program.length <= 29,
-              "rx_edge + tx PIO programs must fit in 29 words");
+static_assert(can_rx_pair_program.length + can_tx_program.length <= 29,
+              "rx_pair + tx PIO programs must fit in 29 words");
 
 static PIO rx_pio;
 static PIO tx_pio;
@@ -60,6 +65,7 @@ static pio_sm_config tx_cfg;
 
 // Edge state machine — processes FIFO words from the RX SM.
 static can_edge_sm_t edge_sm;
+static can_edge_pair_t edge_pair;
 
 // Flag set by the IRQ handler when a frame is fully parsed.
 static volatile bool frame_ready_flag = false;
@@ -67,15 +73,12 @@ static volatile bool frame_ready_flag = false;
 // The latest parsed frame (valid when frame_ready_flag is true).
 static can_parsed_t latest_parsed;
 
-// RX capture state.  rx_bias converts the raw X count into the ideal
-// two-cycle clock: each four-cycle edge path skips two decrements, so every
-// edge is another two ticks early.
-static uint rx_gpio;
+// RX capture state.  edge_pair carries the two-cycle PIO counter into
+// can_edge_sm's 31-bit virtual clock.  rx_last_us timestamps the last consumed
+// pair so a quiet tail can be advanced without a new edge.
 static uint32_t rx_sys_hz;
 static uint32_t rx_ticks_per_bit;
 static uint32_t rx_clkdiv_256;   // PIO divider in 1/256 units
-static uint32_t rx_bias;
-static uint32_t rx_last_time;
 static uint32_t rx_last_us;
 static uint rx_irq_num;
 static bool rx_initialized;
@@ -118,27 +121,23 @@ extern "C" int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
         return -1;
     }
     rx_sm = (uint)sm;
-    off = pio_add_program(rx_pio, &can_rx_edge_program);
+    off = pio_add_program(rx_pio, &can_rx_pair_program);
     if (off < 0) {
         Serial.println("rx init: no program space");
         return -1;
     }
     rx_offset = (uint)off;
 
-    rx_gpio = gpio;
     rx_sys_hz = clock_get_hz(clk_sys);
     if (!rx_clock_config(bitrate, &rx_ticks_per_bit, &rx_clkdiv_256)) {
         Serial.println("rx init: bad bitrate");
         return -1;
     }
-    rx_bias = 0;
-    rx_last_time = 0;
     rx_last_us = time_us_32();
 
-    // Edge RX: shift-left with autopush at 32 bits.  Each FIFO word is
-    // (time << 1) | level, where time is the low 31 bits of the free-
-    // running X counter at the moment of the edge.
-    rx_cfg = can_rx_edge_program_get_default_config(rx_offset);
+    // Edge-pair RX: shift-left with autopush at 32 bits.  One FIFO word is
+    // (time[1->0] << 16) | time[0->1], each the low 16 bits of X at the edge.
+    rx_cfg = can_rx_pair_program_get_default_config(rx_offset);
     sm_config_set_in_pins(&rx_cfg, gpio);
     sm_config_set_jmp_pin(&rx_cfg, gpio);
     sm_config_set_in_shift(&rx_cfg, false, true, 32); // shift left, autopush at 32
@@ -146,6 +145,7 @@ extern "C" int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
                                   (uint8_t)(rx_clkdiv_256 & 0xffu));
     sm_config_set_fifo_join(&rx_cfg, PIO_FIFO_JOIN_RX); // 8-deep joined RX
     can_edge_sm_init(&edge_sm, rx_ticks_per_bit);
+    can_edge_pair_init(&edge_pair, &edge_sm, 0, rx_pair_bias);
 
     pio_gpio_init(rx_pio, gpio);
     // Leave the pin direction alone: with loopback it is already an output.
@@ -277,7 +277,7 @@ static uint32_t rx_estimate_now(void) {
         elapsed_us--;
     cycles = (uint64_t)elapsed_us * rx_sys_hz / 1000000ull;
     ticks = cycles * 128ull / rx_clkdiv_256;
-    return (rx_last_time - (uint32_t)ticks) & CAN_EDGE_TIME_MASK;
+    return (edge_pair.time - (uint32_t)ticks) & CAN_EDGE_TIME_MASK;
 }
 
 // Drain every captured edge, then let the quiet tail advance to now so a
@@ -291,11 +291,8 @@ static void rx_service(struct can2040_lite *cd) {
     while (!pio_sm_is_rx_fifo_empty(rx_pio, rx_sm)) {
         uint32_t word = pio_sm_get(rx_pio, rx_sm);
 
-        rx_bias += 2u;
-        rx_last_time = (((word >> 1) & CAN_EDGE_TIME_MASK) - rx_bias) &
-                       CAN_EDGE_TIME_MASK;
         rx_last_us = time_us_32();
-        can_edge_sm_push(&edge_sm, can_edge_word(rx_last_time, word & 1u));
+        can_edge_pair_push(&edge_pair, word);
         while (rx_take(&p)) {
             rx_store(&p);
             rx_dispatch(&p, cd);
@@ -319,26 +316,18 @@ extern "C" void can2040_lite_pico_rx_arm(void) {
 
     irq_set_enabled(rx_irq_num, false);
     can_edge_sm_init(&edge_sm, rx_ticks_per_bit);
-    rx_bias = 0;
-    rx_last_time = 0;
+    can_edge_pair_init(&edge_pair, &edge_sm, 0, rx_pair_bias);
     rx_last_us = time_us_32();
     frame_ready_flag = false;
 
     pio_sm_set_enabled(rx_pio, rx_sm, false);
     pio_sm_clear_fifos(rx_pio, rx_sm);
     pio_sm_restart(rx_pio, rx_sm);
+    // pio_sm_init sets the PC to the program offset, `high_cnt`.  The caller
+    // arms while the bus is recessive, so the first captured 1->0 is SOF.  If
+    // an edge slips in during the arming sequence, that frame is lost to CRC;
+    // the parser resyncs at the next SOF.  X needs no seeding.
     pio_sm_init(rx_pio, rx_sm, rx_offset, &rx_cfg);
-
-    // X = 0 is the sentinel the program converts to 0xFFFFFFFF on its first
-    // `jmp x--` fall-through.  Entering the loop that matches the current pin
-    // makes that fall-through part of the steady loop instead of a false edge.
-    pio_sm_exec(rx_pio, rx_sm, pio_encode_set(pio_x, 0));
-    if (gpio_get(rx_gpio) == 0)
-        pio_sm_exec(rx_pio, rx_sm,
-                    pio_encode_jmp(rx_offset + can_rx_edge_offset_low));
-    else
-        pio_sm_exec(rx_pio, rx_sm,
-                    pio_encode_jmp(rx_offset + can_rx_edge_offset_high));
     pio_sm_set_enabled(rx_pio, rx_sm, true);
     irq_set_enabled(rx_irq_num, true);
 }

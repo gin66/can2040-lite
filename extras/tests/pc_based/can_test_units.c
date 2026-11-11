@@ -656,6 +656,55 @@ static void check_agrees(const uint8_t *bits, uint32_t nbits,
     }
 }
 
+// Feed edges as can_rx_pair words: (t[1->0] << 16) | t[0->1], each the low
+// 16 bits of the PIO's two-cycle counter.  *edge_no models the capture path:
+// every edge leaves X one count high (see rx_pair.pio), so the k-th timestamp
+// is ideal + k.  The decoder's bias of 1 puts the gap back.  Appends to an
+// existing decoder, so a second frame can follow the first across an idle gap.
+static void feed_pairs(can_edge_pair_t *pair, can_edge_sm_t *sm,
+                       const uint8_t *bits, uint32_t nbits,
+                       uint32_t t0, uint32_t ticks, uint32_t *edge_no) {
+    uint8_t prev = 1;
+    uint32_t hi = 0;
+    uint32_t i;
+    int have_hi = 0;
+    int started = sm->in_frame;
+
+    for (i = 0; i < nbits; i++) {
+        uint8_t bit = bits_get(bits, i);
+        if (started && !sm->in_frame)
+            break;
+        if (bit != prev) {
+            uint32_t t = (uint16_t)(edge_at(t0, ticks, i) + *edge_no);
+            (*edge_no)++;
+            if (!have_hi) {
+                hi = t;
+                have_hi = 1;
+            } else {
+                can_edge_pair_push(pair, (hi << 16) | t);
+                have_hi = 0;
+                started = 1;
+                if (!sm->in_frame)
+                    break;
+            }
+        }
+        prev = bit;
+    }
+}
+
+// One frame through the pair decoder, seeded so the SOF timestamp is t0.
+static void drive_pairs(can_edge_sm_t *sm, const uint8_t *bits, uint32_t nbits,
+                        uint32_t t0, uint32_t ticks) {
+    can_edge_pair_t pair;
+    uint32_t edge_no = 0;
+
+    can_edge_sm_init(sm, ticks);
+    can_edge_pair_init(&pair, sm, t0, 1);
+    feed_pairs(&pair, sm, bits, nbits, t0, ticks, &edge_no);
+    if (sm->in_frame)
+        can_edge_sm_time(sm, (pair.time - 16u * ticks) & CAN_EDGE_TIME_MASK);
+}
+
 // Stop on the 15th CRC bit, check that ACK is armed before the slot,
 // then finish.  A recessive ACK is consumed only by can_edge_sm_time().
 static void check_ack_arm(const can_frame_t *frame, int ack) {
@@ -1119,6 +1168,93 @@ static void test_edge_sm(void) {
     TEST_END();
 }
 
+static void test_edge_pair(void) {
+    static const uint8_t payload[8] = {
+        0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78
+    };
+    can_frame_t frame;
+    can_frame_t f2;
+    uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
+    uint8_t bits2[CAN2040_LITE_MAX_FRAME_BYTES];
+    can_build_info_t info;
+    can_build_info_t info2;
+    can_edge_sm_t sm;
+    can_parsed_t want;
+    uint32_t nbits;
+    uint32_t n2;
+
+    printf("\n-- Edge pair decoder --\n");
+
+    TEST_BEGIN("16-bit deltas reconstruct timestamps across a wrap");
+    {
+        can_edge_sm_t s;
+        can_edge_pair_t p;
+
+        can_edge_sm_init(&s, EDGE_TICKS);
+        can_edge_pair_init(&p, &s, 0x10010u, 0);
+        // 1->0 at 0x10010 (t16 0x0010), 0->1 at 0x0fff0 (t16 0xfff0).
+        can_edge_pair_push(&p, (0x0010u << 16) | 0xfff0u);
+        CHECK(p.time == 0x0fff0u);
+        CHECK(p.last == 0xfff0u);
+        // Continue below the wrap; the delta is still exact.
+        can_edge_pair_push(&p, (0xffe0u << 16) | 0xffd0u);
+        CHECK(p.time == 0x0ffd0u);
+        CHECK(p.last == 0xffd0u);
+    }
+    TEST_END();
+
+    TEST_BEGIN("frame decodes from pair words across a 16-bit wrap");
+    fill_std(&frame, 0x123, 8, payload);
+    nbits = can_frame_build(&frame, VALID_FRAME, 1, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    CHECK(can_frame_decode(bits, nbits, &want) == VALID_FRAME);
+    // 0x10100 is chosen so the frame's timestamps roll past 0x10000.
+    drive_pairs(&sm, bits, nbits, 0x10100u, EDGE_TICKS);
+    check_parsed(&sm, &want);
+    TEST_END();
+
+    TEST_BEGIN("wrapped idle gap does not disturb the next frame");
+    fill_std(&frame, 0x111, 2, payload);
+    fill_std(&f2, 0x222, 1, payload);
+    nbits = can_frame_build(&frame, VALID_FRAME, 0, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    n2 = can_frame_build(&f2, VALID_FRAME, 1, bits2,
+                         CAN2040_LITE_MAX_FRAME_BITS, &info2);
+    CHECK(n2 != 0);
+    {
+        can_edge_pair_t pair;
+        uint32_t t0 = 0x80000u;
+        uint32_t t1;
+        uint32_t edge_no = 0;
+
+        can_edge_sm_init(&sm, EDGE_TICKS);
+        can_edge_pair_init(&pair, &sm, t0, 1);
+        feed_pairs(&pair, &sm, bits, nbits, t0, EDGE_TICKS, &edge_no);
+        CHECK(sm.in_frame);
+        can_edge_sm_time(&sm, (pair.time - 16u * EDGE_TICKS) &
+                              CAN_EDGE_TIME_MASK);
+        CHECK(sm.frame_ready);
+        CHECK(sm.validity == VALID_FRAME);
+        sm.frame_ready = 0;
+
+        // More than 2^16 ticks later, so the 16-bit idle delta wraps.
+        t1 = (t0 - (nbits + 3000u) * EDGE_TICKS) & CAN_EDGE_TIME_MASK;
+        feed_pairs(&pair, &sm, bits2, n2, t1, EDGE_TICKS, &edge_no);
+        CHECK(sm.in_frame);
+        can_edge_sm_time(&sm, (pair.time - 16u * EDGE_TICKS) &
+                              CAN_EDGE_TIME_MASK);
+        CHECK(sm.frame_ready);
+        CHECK(sm.validity == VALID_FRAME);
+        CHECK(sm.parsed.id == 0x222);
+        CHECK(sm.parsed.dlc == 1);
+        CHECK(can_frame_decode(bits2, n2, &want) == VALID_FRAME);
+        CHECK(memcmp(sm.parsed.data, want.data, 1) == 0);
+    }
+    TEST_END();
+}
+
 int main(void) {
     printf("========================================\n");
     printf("CAN2040-Lite PC-based protocol tests\n");
@@ -1132,6 +1268,7 @@ int main(void) {
     test_build_errors();
     test_api_skeleton();
     test_edge_sm();
+    test_edge_pair();
 
     printf("\n========================================\n");
     printf("TOTAL: %d passed, %d failed\n", g_passed, g_failed);

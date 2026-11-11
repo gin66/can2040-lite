@@ -6,14 +6,14 @@
 //
 // can_edge_sm.h — ISR state machine for the edge-timestamp CAN receiver.
 //
-// Portable: no PIO dependency.  The live firmware still samples with rx.pio.
-// This machine is what makes a one-bit ACK possible.  It is not wired to a
-// pin, and it does not drive one.  A node must not ACK a frame it is
-// transmitting; crc_match and the observed ACK slot are separate so the
-// caller can tell those cases apart.
+// Portable: no PIO dependency.  The live firmware feeds it from rx_pair.pio
+// through can_edge_pair_push().  This machine is what makes a one-bit ACK
+// possible.  It is not wired to a pin, and it does not drive one.  A node must
+// not ACK a frame it is transmitting; crc_match and the observed ACK slot are
+// separate so the caller can tell those cases apart.
 //
-// Each FIFO word is one edge from rx_edge.pio, shift-left, autopush 32:
-//   bits[31:1] = X[30:0]   modulo-2^31 down-counter at the edge
+// can_edge_sm_push() takes one edge:
+//   bits[31:1] = modulo-2^31 down-counter value at the edge
 //   bit[0]     = pin level after the edge
 // X counts down.  Elapsed ticks are (earlier - later) mod 2^31.
 //
@@ -102,11 +102,36 @@ typedef struct {
 
 void can_edge_sm_init(can_edge_sm_t *sm, uint32_t ticks_per_bit);
 
-// One FIFO word: (time << 1) | level.  A 1→0 edge while idle is SOF.
+// One edge: (time << 1) | level.  A 1→0 edge while idle is SOF.
 void can_edge_sm_push(can_edge_sm_t *sm, uint32_t word);
 
 // Advance a quiet bus to this down-counter value.  No new edge.
 void can_edge_sm_time(can_edge_sm_t *sm, uint32_t now);
+
+// Reassembles can_rx_pair.pio words into single-edge pushes.  Each FIFO word
+// carries a 1→0 timestamp in bits[31:16] and the following 0→1 timestamp in
+// bits[15:0], both the low 16 bits of the PIO's two-cycle down-counter.
+//
+// Consecutive timestamps are differenced modulo 2^16 and carried on a 31-bit
+// virtual counter; the first timestamp after init is taken as `now`.  A gap
+// inside a frame is only a few bit times, so it never wraps.  The idle gap
+// before SOF may wrap, but can_edge_sm rebases at that SOF, so a shift of the
+// virtual counter by a multiple of 2^16 does not affect the frame.
+//
+// `bias` is added to every inter-edge distance.  The capture program's edge
+// path skips one counter decrement, so each gap measures one tick short;
+// pass 1 for rx_pair.pio.  A source with an ideal free-running clock passes 0.
+typedef struct {
+    can_edge_sm_t *sm;
+    uint32_t time;      // 31-bit down-counter value at the last edge
+    uint16_t last;      // last 16-bit PIO timestamp
+    uint32_t bias;      // ticks the capture path loses per edge
+    uint8_t have_last;
+} can_edge_pair_t;
+
+void can_edge_pair_init(can_edge_pair_t *pair, can_edge_sm_t *sm,
+                        uint32_t now, uint32_t bias);
+void can_edge_pair_push(can_edge_pair_t *pair, uint32_t word);
 
 #ifdef __cplusplus
 }

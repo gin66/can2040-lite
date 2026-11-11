@@ -164,8 +164,8 @@ can2040-lite/
 │   ├── can2040_lite.c/.h        # Public API skeleton
 │   └── pico/
 │       ├── can2040_lite_pico.cpp/.h  # PIO/DMA backend
-│       ├── rx.pio, tx.pio            # Live PIO programs (7 + 14 words)
-│       └── rx_edge.pio               # Edge RX, 7 words, not wired
+│       ├── rx_pair.pio, tx.pio       # Live PIO programs (7 + 14 words)
+│       └── rx.pio                    # Legacy 32x oversampled RX (7 words)
 └── extras/
     ├── tests/
     │   ├── common/
@@ -223,11 +223,12 @@ Options:
 
 - [x] Firmware skeleton and public API
 - [x] On-target RP2350 harness (vectors + API + loopback)
-- [x] PIO RX (32x oversampled capture) and one-shot full-message TX:
-      7 + 14 = 21 instructions, inside the 29-word budget.
+- [x] PIO RX and one-shot full-message TX: 7 + 14 = 21 instructions, inside
+      the 29-word budget.  The 32x oversampler remains as `rx.pio`.
       The current TX program is not tested on hardware.
-- [x] Edge RX program (`rx_edge.pio`, 7 words) and its ISR state machine.
-      Host-tested, not wired in place of the oversampler, not tested on hardware.
+- [x] Edge-pair RX program (`rx_pair.pio`, 7 words, two edges per FIFO word)
+      wired to the FIFO-not-empty IRQ, with a host-tested pair decoder feeding
+      the ISR state machine.  Not tested on hardware.
 - [x] TX/RX loopback with ACK and NACK readback
 - [x] Saleae verification at 125k, 500k and 1M; back-to-back frames (18-bit gap)
 

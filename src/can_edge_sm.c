@@ -342,3 +342,27 @@ void can_edge_sm_time(can_edge_sm_t *sm, uint32_t now) {
         return;
     advance_to(sm, now & CAN_EDGE_TIME_MASK);
 }
+
+static void pair_push(can_edge_pair_t *pair, uint16_t time16, uint8_t level) {
+    if (pair->have_last) {
+        uint32_t delta = (uint16_t)(pair->last - time16) + pair->bias;
+        pair->time = (pair->time - delta) & CAN_EDGE_TIME_MASK;
+    }
+    pair->last = time16;
+    pair->have_last = 1;
+    can_edge_sm_push(pair->sm, can_edge_word(pair->time, level));
+}
+
+void can_edge_pair_init(can_edge_pair_t *pair, can_edge_sm_t *sm,
+                        uint32_t now, uint32_t bias) {
+    pair->sm = sm;
+    pair->time = now & CAN_EDGE_TIME_MASK;
+    pair->last = 0;
+    pair->bias = bias;
+    pair->have_last = 0;
+}
+
+void can_edge_pair_push(can_edge_pair_t *pair, uint32_t word) {
+    pair_push(pair, (uint16_t)(word >> 16), 0);
+    pair_push(pair, (uint16_t)word, 1);
+}

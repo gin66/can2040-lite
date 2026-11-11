@@ -160,10 +160,12 @@ can2040-lite/
 ├── platformio.ini         # RP2350 target build (Arduino-Pico core)
 ├── src/
 │   ├── can2040_lite_proto.c/.h  # Shared protocol core (host + target)
+│   ├── can_edge_sm.c/.h         # Edge-RX ISR state machine (host-tested)
 │   ├── can2040_lite.c/.h        # Public API skeleton
 │   └── pico/
 │       ├── can2040_lite_pico.cpp/.h  # PIO/DMA backend
-│       └── rx.pio, tx.pio            # PIO programs (7 + 14 words)
+│       ├── rx.pio, tx.pio            # Live PIO programs (7 + 14 words)
+│       └── rx_edge.pio               # Edge RX, 7 words, not wired
 └── extras/
     ├── tests/
     │   ├── common/
@@ -224,6 +226,8 @@ Options:
 - [x] PIO RX (32x oversampled capture) and one-shot full-message TX:
       7 + 14 = 21 instructions, inside the 29-word budget.
       The current TX program is not tested on hardware.
+- [x] Edge RX program (`rx_edge.pio`, 7 words) and its ISR state machine.
+      Host-tested, not wired in place of the oversampler, not tested on hardware.
 - [x] TX/RX loopback with ACK and NACK readback
 - [x] Saleae verification at 125k, 500k and 1M; back-to-back frames (18-bit gap)
 

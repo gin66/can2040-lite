@@ -45,7 +45,7 @@ struct can2040_lite_msg {
     uint32_t dlc;         // 0..8
     uint8_t data[8];
     uint32_t flags;       // reserved
-    uint32_t crc_error;   // 1 if CRC failed (rx notifications)
+    uint32_t crc_error;   // RX only: 1 if CRC failed or the frame did not parse
 };
 
 struct can2040_lite_stats {
@@ -55,6 +55,7 @@ struct can2040_lite_stats {
     uint32_t tx_error;      // Frames with an error detected (readback)
     uint32_t crc_errors;    // Received frames with CRC errors
     uint32_t stuff_errors;  // Frames with stuffing violations
+    uint32_t bit_errors;    // Received frames with form/bit errors
     uint32_t rx_overflow;   // Frames dropped because no buffer was available
     uint32_t tx_attempt;    // Frames handed to the transmitter
 };

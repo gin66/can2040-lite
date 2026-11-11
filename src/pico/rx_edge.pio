@@ -15,8 +15,8 @@
 ; GPIO.  The RX FIFO is joined, 8 deep.
 ;
 ; `in x` reads X.  Only `out x` writes it.  Each edge path is four cycles and
-; does not decrement, so a capture is two counts short of a free-running
-; 2-cycle tick.  The ISR adds that constant if it needs cycle-accurate gaps.
+; does not decrement, so every capture is two counts short of a free-running
+; 2-cycle tick.  The ISR adds back those two ticks on each gap.
 ;
 ; X is 32 bits and wraps about every 2^32 ticks.  A not-taken `jmp x--`
 ; writes 0xFFFFFFFF and does not jump:
@@ -25,9 +25,10 @@
 ;   * low: `jmp x--, low` is the wrap instruction, so the fall-through
 ;     wraps back to `low`.
 ;
-; Start with X nonzero (0xFFFFFFFF) and the PC at `low` or `high` to match
-; the pin.  The file begins at `ht`; that is not the idle state.  The wrong
-; loop pushes one junk edge and then tracks.
+; Start at `low` or `high` to match the pin.  X may start at 0: the first
+; `jmp x--` in the steady loop seeds it with 0xFFFFFFFF.  The file begins at
+; `ht`; that is not the idle state, and entering the loop that does not match
+; the pin pushes one junk edge before tracking.
 
 .program can_rx_edge
 ht:

@@ -11,13 +11,17 @@
 
 #include <stdint.h>
 
+#include "can2040_lite_proto.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Number of raw oversampled words captured per arm (one word per bit plus
-// one marker word).  Enough for the longest classic CAN frame with margin.
-#define CAN2040_LITE_PICO_RX_WORDS 400u
+struct can2040_lite;
+
+/* Attach the Pico RX IRQ handler to the portable API.  The Pico backend
+ * calls this from rx_init() so can2040_lite.c stays Pico-free on the host. */
+void can2040_lite_pico_attach_rx_irq(void (*fn)(struct can2040_lite *));
 
 int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate);
 // gpio is CAN-TX; gpio_rx is the readback (CAN-RX) pin.  They are the same
@@ -25,14 +29,29 @@ int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate);
 int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
                               uint32_t bitrate);
 
-// Re-arm the RX SM at the SOF poll loop and start a DMA capture.
+// Re-arm the RX state machine.  The PIO SM polls for SOF; when a frame
+// arrives the IRQ handler feeds edge words to can_edge_sm and dispatches
+// the callback when frame_ready is set.
 void can2040_lite_pico_rx_arm(void);
 
-// Wait for the capture to finish.  Returns non-zero on success.
+// Called from can2040_lite_pio_irq_handler() to drain the RX FIFO and
+// feed edge words to the state machine.  Accepts the driver pointer
+// so it can update statistics and dispatch the callback.
+void can2040_lite_pico_rx_irq_handler(struct can2040_lite *cd);
+
+// Wait for the next frame to be parsed (sets frame_ready).  Returns 1 on
+// success, 0 on timeout.  Use can2040_lite_pico_rx_get_parsed() to read it.
 int can2040_lite_pico_rx_wait(uint32_t timeout_ms);
 
-// Convert captured words to bits (majority per bit word).  Skips the marker
-// word.  Returns the number of bits written.
+// Return the parsed frame from the edge state machine, or NULL if no
+// complete frame is available.  The caller must call this only after
+// can2040_lite_pico_rx_wait() returns 1.  Subsequent frames overwrite the
+// result.
+const can_parsed_t *can2040_lite_pico_rx_get_parsed(void);
+
+// Rebuild the on-wire bit stream from the last parsed frame: stuffed
+// SOF..CRC followed by the unstuffed tail.  Returns the number of bits
+// written.  Use can2040_lite_pico_rx_get_parsed() for the decoded frame.
 uint32_t can2040_lite_pico_rx_bits(uint8_t *bits, uint32_t max_bits);
 
 // One-shot message transmit.  `bits` is SOF through the recessive bit after

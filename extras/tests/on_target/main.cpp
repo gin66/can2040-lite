@@ -165,12 +165,11 @@ static bool loopback_case(const char *name, int ack) {
     can_build_info_t info;
     can_parsed_t p;
     uint8_t tx_bits[CAN2040_LITE_MAX_FRAME_BYTES];
-    uint8_t rx_bits[CAN2040_LITE_MAX_FRAME_BYTES];
     uint32_t total;
-    uint32_t rx_n;
     frame_validity_t got;
     bool ok = true;
 
+    memset(&p, 0, sizeof(p));
     memset(&f, 0, sizeof(f));
     f.id = 0x123;
     f.dlc = 8;
@@ -196,9 +195,11 @@ static bool loopback_case(const char *name, int ack) {
     ok = ok && can2040_lite_pico_rx_wait(100);
     ok = ok && can2040_lite_pico_tx_done_pending();
 
-    memset(rx_bits, 0, sizeof(rx_bits));
-    rx_n = can2040_lite_pico_rx_bits(rx_bits, CAN2040_LITE_MAX_FRAME_BITS);
-    got = can_frame_decode(rx_bits, rx_n, &p);
+    // Use the edge-based parsed frame directly (includes one-bit ACK).
+    const can_parsed_t *pp = can2040_lite_pico_rx_get_parsed();
+    got = pp ? pp->validity : INVALID_BIT;
+    if (pp)
+        memcpy(&p, pp, sizeof(p));
 
     ok = ok && (got == VALID_FRAME);
     if (got == VALID_FRAME) {
@@ -211,16 +212,12 @@ static bool loopback_case(const char *name, int ack) {
                   validity_name(got), ok ? "PASS" : "FAIL");
     Serial.flush();
     if (!ok) {
-        Serial.printf("    rx bits: %u, decoded id=0x%X dlc=%u ack=%u\n",
-                      (unsigned)rx_n, (unsigned)p.id, (unsigned)p.dlc,
-                      (unsigned)p.ack);
+        Serial.printf("    decoded id=0x%X dlc=%u ack=%u validity=%s\n",
+                      (unsigned)p.id, (unsigned)p.dlc, (unsigned)p.ack,
+                      validity_name(p.validity));
         Serial.printf("    first tx bits:");
         for (uint32_t i = 0; i < 40; i++)
             Serial.printf("%u", bits_get(tx_bits, i));
-        Serial.println();
-        Serial.printf("    first rx bits:");
-        for (uint32_t i = 0; i < 40; i++)
-            Serial.printf("%u", bits_get(rx_bits, i));
         Serial.println();
     }
     if (ok)
@@ -231,15 +228,7 @@ static bool loopback_case(const char *name, int ack) {
 }
 
 
-static void copy_bits(const uint8_t *src, uint32_t start, uint8_t *dst,
-                      uint32_t nbits) {
-    uint32_t i;
-    bits_clear(dst, nbits);
-    for (i = 0; i < nbits; i++)
-        bits_put(dst, i, bits_get(src, start + i));
-}
-
-static void loopback_back_to_back() {
+static void loopback_two_frames() {
     static const uint8_t data2[8] = {0xf0, 0xde, 0xbc, 0x9a,
                                      0x78, 0x56, 0x34, 0x12};
     can_frame_t f1;
@@ -250,16 +239,14 @@ static void loopback_back_to_back() {
     can_parsed_t p2;
     uint8_t b1[CAN2040_LITE_MAX_FRAME_BYTES];
     uint8_t b2[CAN2040_LITE_MAX_FRAME_BYTES];
-    uint8_t rx[CAN2040_LITE_MAX_FRAME_BYTES];
-    uint8_t tmp[CAN2040_LITE_MAX_FRAME_BYTES];
     uint32_t n1;
     uint32_t n2;
-    uint32_t rxn;
-    uint32_t off;
     frame_validity_t g1;
     frame_validity_t g2;
     bool ok = true;
 
+    memset(&p1, 0, sizeof(p1));
+    memset(&p2, 0, sizeof(p2));
     memset(&f1, 0, sizeof(f1));
     f1.id = 0x123;
     f1.dlc = 8;
@@ -275,46 +262,39 @@ static void loopback_back_to_back() {
                          CAN2040_LITE_MAX_FRAME_BITS, &i2);
     ok = ok && n1 && n2;
 
+    // First capture.
     can2040_lite_pico_rx_arm();
     can2040_lite_pico_tx_frame(b1, i1.stuffed_bits + 1u);
-    ok = ok && tx_wait_done(50);
-    can2040_lite_pico_tx_frame(b2, i2.stuffed_bits + 1u);
     ok = ok && can2040_lite_pico_rx_wait(200);
-
-    memset(rx, 0, sizeof(rx));
-    rxn = can2040_lite_pico_rx_bits(rx, CAN2040_LITE_MAX_FRAME_BITS);
-    g1 = can_frame_decode(rx, rxn, &p1);
+    const can_parsed_t *pp1 = can2040_lite_pico_rx_get_parsed();
+    g1 = pp1 ? pp1->validity : INVALID_BIT;
+    if (pp1)
+        memcpy(&p1, pp1, sizeof(p1));
     ok = ok && (g1 == VALID_FRAME);
     ok = ok && (p1.id == 0x123) && (p1.ack == 0);
     ok = ok && (memcmp(p1.data, loop_data, 8) == 0);
 
-    off = p1.total_bits;
-    while (off < rxn && bits_get(rx, off) == 1)
-        off++;
-    if (off < rxn) {
-        uint32_t left = rxn - off;
-        if (left > CAN2040_LITE_MAX_FRAME_BITS)
-            left = CAN2040_LITE_MAX_FRAME_BITS;
-        copy_bits(rx, off, tmp, left);
-        g2 = can_frame_decode(tmp, left, &p2);
-        ok = ok && (g2 == VALID_FRAME);
-        ok = ok && (p2.id == 0x456) && (p2.ack == 0);
-        ok = ok && (memcmp(p2.data, data2, 8) == 0);
-    } else {
-        g2 = INVALID_BIT;
-        ok = false;
-    }
+    // Second capture after re-arming.
+    can2040_lite_pico_rx_arm();
+    can2040_lite_pico_tx_frame(b2, i2.stuffed_bits + 1u);
+    ok = ok && can2040_lite_pico_rx_wait(200);
+    const can_parsed_t *pp2 = can2040_lite_pico_rx_get_parsed();
+    g2 = pp2 ? pp2->validity : INVALID_BIT;
+    if (pp2)
+        memcpy(&p2, pp2, sizeof(p2));
+    ok = ok && (g2 == VALID_FRAME);
+    ok = ok && (p2.id == 0x456) && (p2.ack == 0);
+    ok = ok && (memcmp(p2.data, data2, 8) == 0);
 
     Serial.printf("  %-18s expected %-13s got %-13s %s\n",
-                  "PIO back-to-back", "2 frames", validity_name(g2),
+                  "PIO two frames", "2 frames", validity_name(g2),
                   ok ? "PASS" : "FAIL");
     Serial.flush();
     if (!ok) {
-        Serial.printf("    first: %s id=0x%X total=%u\n",
-                      validity_name(g1), (unsigned)p1.id,
-                      (unsigned)p1.total_bits);
-        Serial.printf("    second start=%u got=%s id=0x%X\n",
-                      (unsigned)off, validity_name(g2), (unsigned)p2.id);
+        Serial.printf("    first: %s id=0x%X\n",
+                      validity_name(g1), (unsigned)p1.id);
+        Serial.printf("    second: %s id=0x%X\n",
+                      validity_name(g2), (unsigned)p2.id);
     }
     if (ok)
         passed++;
@@ -404,7 +384,7 @@ static void run_loopback() {
     }
     loopback_case("PIO loopback ACK", 1);
     loopback_case("PIO loopback NACK", 0);
-    loopback_back_to_back();
+    loopback_two_frames();
     loopback_abort();
 }
 #endif // CAN2040_LITE_ENABLE_PIO_LOOPBACK

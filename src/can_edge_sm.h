@@ -35,8 +35,9 @@
 // (after a pending stuff bit, if the CRC ended on a 5-run, and after the
 // CRC delimiter).  ack is the slot once ack_seen is set: 1 = dominant.
 //
-// Results stay until the next SOF edge or can_edge_sm_init().  Read them
-// when frame_ready becomes 1, before feeding the next falling edge.
+// Results stay readable until the caller clears frame_ready or calls
+// can_edge_sm_init().  A new SOF starts the next frame but does not discard
+// a result that has not been consumed yet.
 
 #ifndef CAN_EDGE_SM_H
 #define CAN_EDGE_SM_H

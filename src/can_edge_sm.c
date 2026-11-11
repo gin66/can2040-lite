@@ -275,6 +275,9 @@ static void advance_to(can_edge_sm_t *sm, uint32_t now) {
 
 static void start_frame(can_edge_sm_t *sm, uint32_t time) {
     uint32_t ticks = sm->ticks_per_bit;
+    uint8_t keep_ready = sm->frame_ready;
+    can_parsed_t keep_parsed = sm->parsed;
+    frame_validity_t keep_validity = sm->validity;
 
     memset(sm, 0, sizeof(*sm));
     sm->ticks_per_bit = ticks;
@@ -283,6 +286,15 @@ static void start_frame(can_edge_sm_t *sm, uint32_t time) {
     sm->in_frame = 1;
     sm->phase = PH_STUFF;
     sm->validity = INVALID_BIT;
+
+    // A frame that ended just before this SOF must remain readable until
+    // the caller consumes it, even though the parser is already in the
+    // next frame.
+    if (keep_ready) {
+        sm->parsed = keep_parsed;
+        sm->frame_ready = 1;
+        sm->validity = keep_validity;
+    }
 }
 
 void can_edge_sm_init(can_edge_sm_t *sm, uint32_t ticks_per_bit) {

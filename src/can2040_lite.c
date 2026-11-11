@@ -16,6 +16,14 @@
 
 #include "can2040_lite.h"
 
+/* Optional Pico backend hook: the target sets this during start() to attach
+ * the PIO RX interrupt handler.  When NULL (host tests), nothing happens.  */
+typedef void (*pico_rx_irq_fn)(struct can2040_lite *);
+static pico_rx_irq_fn pico_rx_irq = NULL;
+void can2040_lite_pico_attach_rx_irq(pico_rx_irq_fn fn) {
+    pico_rx_irq = fn;
+}
+
 void can2040_lite_setup(struct can2040_lite *cd, uint32_t pio_num) {
     if (!cd)
         return;
@@ -76,9 +84,10 @@ int can2040_lite_check_transmit(struct can2040_lite *cd) {
 }
 
 void can2040_lite_pio_irq_handler(struct can2040_lite *cd) {
-    if (!cd)
-        return;
-    // Backend hook: drain RX FIFO / DMA, detect frame end, decode, notify.
+    /* Backend hook: drain the RX FIFO and feed edge words to can_edge_sm.
+     * cd is optional; without it the backend only maintains its RX result. */
+    if (pico_rx_irq)
+        pico_rx_irq(cd);
 }
 
 void can2040_lite_get_statistics(struct can2040_lite *cd,

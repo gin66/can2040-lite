@@ -13,11 +13,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #include "can2040_lite_proto.h"
 #include "can2040_lite.h"
 #include "can_edge_sm.h"
 #include "can_frame_build.h"
+#include "ack_cycle_model.h"
+
+// The assembled PIO images address JMP targets as if the program were loaded
+// at 0.  The firmware adds the TX slot origin.  PICO_NO_HARDWARE keeps the
+// generated headers from pulling in the SDK.
+#define PICO_NO_HARDWARE 1
+#include "pico/ack.pio.h"
+#include "pico/tx.pio.h"
+#include "pico/can_pio_reloc.h"
 
 static int g_passed;
 static int g_failed;
@@ -1168,6 +1178,623 @@ static void test_edge_sm(void) {
     TEST_END();
 }
 
+/****************************************************************
+ * ACK schedule (can_ack_plan)
+ ****************************************************************/
+
+// Stuffer state and wire index at the first CRC bit, derived from the built
+// frame.  A stuff bit that separates header/data from the CRC field is
+// consumed first, matching what can_edge_sm has in its run/last when it
+// accepts the first CRC bit.
+static int crc_field_state(const uint8_t *bits, const can_build_info_t *info,
+                           uint32_t *crc_wire, uint8_t *run, uint8_t *last) {
+    uint32_t crc_start = info->unstuffed_bits - 15u;
+    uint32_t pos = 0;
+    uint32_t got = 0;
+    uint32_t r = 0;
+    uint8_t l = 1;
+
+    while (pos < info->stuffed_bits) {
+        uint8_t bit = bits_get(bits, pos);
+        if (r == 5u) {
+            r = 1;
+            l = bit;
+            pos++;
+            continue;
+        }
+        if (got == crc_start)
+            break;
+        if (r > 0u && bit == l)
+            r++;
+        else {
+            r = 1;
+            l = bit;
+        }
+        got++;
+        pos++;
+    }
+    if (got != crc_start)
+        return -1;
+    *crc_wire = pos;
+    *run = (uint8_t)r;
+    *last = l;
+    return 0;
+}
+
+static void check_ack_plan_frame(const can_frame_t *frame) {
+    uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
+    can_build_info_t info;
+    uint32_t crc_wire = 0;
+    uint8_t run = 0;
+    uint8_t last = 0;
+    uint32_t slot;
+    uint32_t terminal = 0;
+    uint32_t from;
+    uint32_t i;
+
+    CHECK(can_frame_build(frame, VALID_FRAME, 0, bits,
+                          CAN2040_LITE_MAX_FRAME_BITS, &info) != 0);
+    CHECK(crc_field_state(bits, &info, &crc_wire, &run, &last) == 0);
+    slot = info.stuffed_bits + 1u - crc_wire;
+
+    // Expected terminal edge from the builder's wire image.
+    for (i = 0; i < slot; i++) {
+        uint8_t cur = bits_get(bits, crc_wire + i);
+        uint8_t prev = (i == 0) ? bits_get(bits, crc_wire - 1u)
+                                : bits_get(bits, crc_wire + i - 1u);
+        if (cur != prev)
+            terminal = i;
+    }
+
+    for (from = 0; from <= slot + 1u; from++) {
+        can_ack_plan_t plan =
+            can_ack_plan(info.crc, run, last, from);
+        uint32_t edges = 0;
+        uint8_t level;
+        uint8_t sync;
+
+        for (i = 1; i < slot; i++) {
+            if (i > from &&
+                bits_get(bits, crc_wire + i) !=
+                    bits_get(bits, crc_wire + i - 1u))
+                edges++;
+        }
+        if (from < slot)
+            level = bits_get(bits, crc_wire + from);
+        else
+            level = 1;
+        sync = (terminal == 0)
+                   ? bits_get(bits, crc_wire - 1u)
+                   : bits_get(bits, crc_wire + terminal - 1u);
+
+        CHECK(plan.slot_bit == slot);
+        CHECK(plan.gap_bits == slot - terminal);
+        CHECK(plan.edges == edges);
+        CHECK(plan.level == level);
+        CHECK(plan.sync_level == sync);
+        CHECK(plan.ok == (from < terminal ? 1u : 0u));
+    }
+}
+
+static void test_ack_plan(void) {
+    static const uint8_t payload[8] = {
+        0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0
+    };
+    can_frame_t frame;
+    uint8_t dlc;
+
+    printf("\n-- ACK schedule --\n");
+
+    TEST_BEGIN("std/ext DLC sweep matches the builder's CRC field");
+    {
+        int ok = 1;
+        for (dlc = 0; dlc <= 8; dlc++) {
+            fill_std(&frame, 0x123, dlc, payload);
+            check_ack_plan_frame(&frame);
+            ok = ok && (g_test_failed == 0);
+            fill_std(&frame, 0x18febb11, dlc, payload);
+            frame.flags = CAN_FRAME_EXTENDED;
+            check_ack_plan_frame(&frame);
+            ok = ok && (g_test_failed == 0);
+        }
+        CHECK(ok);
+    }
+    TEST_END();
+
+    TEST_BEGIN("no stuff bits in the CRC field");
+    {
+        can_ack_plan_t plan = can_ack_plan(0x5555u, 1, 1, 0);
+        CHECK(plan.slot_bit == 16u);
+        CHECK(plan.gap_bits >= 1u && plan.gap_bits <= 5u);
+        CHECK(plan.ok);
+    }
+    TEST_END();
+
+    TEST_BEGIN("four stuff bits when run enters at 5");
+    {
+        can_ack_plan_t plan = can_ack_plan(0x0000u, 5, 0, 0);
+        CHECK(plan.slot_bit == 20u);
+        CHECK(plan.gap_bits == 2u); // trailing stuff bit, then delimiter
+        CHECK(plan.ok);
+    }
+    TEST_END();
+
+    TEST_BEGIN("builder emits CRC fields with 0 and 4 stuff bits");
+    {
+        uint32_t n;
+        uint32_t i;
+        int saw0 = 0;
+        int saw4 = 0;
+        for (n = 0; n < 300000u && (!saw0 || !saw4); n++) {
+            can_frame_t f;
+            uint8_t fb[CAN2040_LITE_MAX_FRAME_BYTES];
+            can_build_info_t bi;
+            uint32_t cw = 0;
+            uint8_t r = 0, l = 0;
+            uint32_t slot;
+            uint32_t stuffs;
+
+            memset(&f, 0, sizeof(f));
+            f.dlc = (uint8_t)((n / 2u) % 9u);
+            f.flags = (n & 1u) ? CAN_FRAME_EXTENDED : 0;
+            f.id = f.flags ? ((n * 0x45d9fu) & 0x1fffffffu)
+                           : ((n * 17u) & 0x7ffu);
+            for (i = 0; i < 8; i++)
+                f.data[i] = (uint8_t)(n * (i + 3u) + (n >> (i + 1u)));
+            if (can_frame_build(&f, VALID_FRAME, 0, fb,
+                                CAN2040_LITE_MAX_FRAME_BITS, &bi) == 0)
+                continue;
+            if (crc_field_state(fb, &bi, &cw, &r, &l) != 0)
+                continue;
+            slot = bi.stuffed_bits + 1u - cw;
+            stuffs = slot - 16u;
+            if (stuffs == 0 || stuffs == 4) {
+                can_ack_plan_t plan = can_ack_plan(bi.crc, r, l, 0);
+                CHECK(plan.slot_bit == slot);
+                if (stuffs == 0)
+                    saw0 = 1;
+                else
+                    saw4 = 1;
+            }
+        }
+        CHECK(saw0);
+        CHECK(saw4);
+    }
+    TEST_END();
+
+    TEST_BEGIN("terminal edge on the delimiter boundary (gap 1)");
+    {
+        can_ack_plan_t plan = can_ack_plan(0x0000u, 4, 0, 0);
+        CHECK(plan.gap_bits == 1u);
+        CHECK(plan.sync_level == 0u);
+        CHECK(plan.ok);
+    }
+    TEST_END();
+
+    TEST_BEGIN("recessive tail gives gap 5");
+    {
+        can_ack_plan_t plan = can_ack_plan(0x000fu, 1, 0, 0);
+        CHECK(plan.gap_bits == 5u);
+        CHECK(plan.sync_level == 0u);
+        CHECK(plan.ok);
+    }
+    TEST_END();
+
+    TEST_BEGIN("from_bit at or past the terminal edge is not armed");
+    {
+        can_ack_plan_t plan = can_ack_plan(0x0000u, 4, 0, 0);
+        uint32_t terminal = plan.slot_bit - plan.gap_bits;
+        can_ack_plan_t past = can_ack_plan(0x0000u, 4, 0, terminal);
+        can_ack_plan_t after = can_ack_plan(0x0000u, 4, 0, terminal + 1u);
+        can_ack_plan_t slot = can_ack_plan(0x0000u, 4, 0, plan.slot_bit);
+        CHECK(!past.ok);
+        CHECK(!after.ok);
+        CHECK(!slot.ok);
+    }
+    TEST_END();
+}
+
+/****************************************************************
+ * ACK cycle model (mirrors src/pico/ack.pio)
+ ****************************************************************/
+
+static uint32_t ack_gap_cycles(uint32_t gap_bits) {
+    return gap_bits * ACK_MODEL_CYCLES_PER_BIT + ACK_MODEL_GAP_OFFSET;
+}
+
+static void test_ack_cycle_model(void) {
+    ack_model_t m;
+
+    printf("\n-- ACK cycle model --\n");
+
+    TEST_BEGIN("follow: alternating edges, no pulse, X does not expire");
+    {
+        ack_edge_t edges[10];
+        int i;
+        for (i = 0; i < 10; i++) {
+            edges[i].cycle = (i + 1) * 32;
+            edges[i].level = (uint8_t)((i & 1) ? 1 : 0);
+        }
+        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0xffffffffu, 0, 0, 0);
+        ack_model_run(&m, 1, edges, 10, NULL, 0, 400);
+        CHECK(m.pulse_start < 0);
+        CHECK(m.x == 0xffffffffu - 10u);
+    }
+    TEST_END();
+
+    TEST_BEGIN("armed Y=0: recessive through the slot, ends in release");
+    {
+        ack_edge_t edges[1] = {{64, 0}};
+        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0, 0, ack_gap_cycles(1), 0);
+        ack_model_run(&m, 1, edges, 1, NULL, 0, 160);
+        CHECK(m.pulse_start < 0);
+        CHECK(m.pad == 1);
+        CHECK(m.pc == ACK_MODEL_WRAP_TARGET);
+    }
+    TEST_END();
+
+    TEST_BEGIN("armed Y=1, gap 1: dominant slot+0.25..slot+1.25");
+    {
+        ack_edge_t edges[1] = {{64, 0}};
+        uint32_t start = 64u + 32u + 8u;
+        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0, 1, ack_gap_cycles(1), 0);
+        ack_model_run(&m, 1, edges, 1, NULL, 0, 200);
+        CHECK(m.pulse_start == (int)start);
+        CHECK(m.pulse_end == (int)(start + 32u));
+    }
+    TEST_END();
+
+    TEST_BEGIN("armed Y=1, gap 5: same window relative to the slot");
+    {
+        ack_edge_t edges[1] = {{64, 0}};
+        uint32_t start = 64u + 5u * 32u + 8u;
+        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0, 1, ack_gap_cycles(5), 0);
+        ack_model_run(&m, 1, edges, 1, NULL, 0, 300);
+        CHECK(m.pulse_start == (int)start);
+        CHECK(m.pulse_end == (int)(start + 32u));
+    }
+    TEST_END();
+
+    TEST_BEGIN("Y set during the gap still pulses at slot+0.25");
+    {
+        ack_edge_t edges[1] = {{64, 0}};
+        ack_exec_event_t execs[1];
+        uint32_t start = 64u + 32u + 8u;
+        execs[0].cycle = 96;
+        execs[0].exec.kind = ACK_EXEC_SET_Y;
+        execs[0].exec.value = 1;
+        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0, 0, ack_gap_cycles(1), 0);
+        ack_model_run(&m, 1, edges, 1, execs, 1, 200);
+        // The allow steals one gap cycle, so it can arrive one TX cycle
+        // (1/32 bit) late; the inset has 0.3 bit of margin.
+        CHECK(m.pulse_start >= (int)start);
+        CHECK(m.pulse_start <= (int)start + 1);
+        CHECK(m.pulse_end == m.pulse_start + 32);
+    }
+    TEST_END();
+
+    TEST_BEGIN("late exec in release stays recessive");
+    {
+        ack_edge_t edges[1] = {{64, 0}};
+        ack_exec_event_t execs[1];
+        execs[0].cycle = 120;
+        execs[0].exec.kind = ACK_EXEC_SET_Y;
+        execs[0].exec.value = 1;
+        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0, 0, ack_gap_cycles(1), 0);
+        ack_model_run(&m, 1, edges, 1, execs, 1, 160);
+        CHECK(m.pulse_start < 0);
+        CHECK(m.pad == 1);
+    }
+    TEST_END();
+
+    TEST_BEGIN("exec during follow does not drop the next edge");
+    {
+        ack_edge_t edges[2] = {{200, 0}, {232, 1}};
+        ack_exec_event_t execs[2];
+        int cycle;
+        execs[0].cycle = 100;
+        execs[0].exec.kind = ACK_EXEC_SET_X;
+        execs[0].exec.value = 1;
+        execs[1].cycle = 101;
+        execs[1].exec.kind = ACK_EXEC_PULL;
+        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0xffffffffu, 0, 0, 44);
+        for (cycle = 0; cycle <= 235; cycle++) {
+            const ack_exec_t *exec = NULL;
+            int i;
+            uint8_t pin = ack_model_level(edges, 2, 1, cycle);
+            for (i = 0; i < 2; i++)
+                if (execs[i].cycle == cycle)
+                    exec = &execs[i].exec;
+            ack_model_step(&m, cycle, pin, exec);
+            if (cycle == 202)
+                CHECK(m.x == 0); // first edge counted
+        }
+        CHECK(m.pc == 8 || m.pc == 9); // second edge reached gap
+        CHECK(m.x != 0xffffffffu);     // OSR gap was loaded by out x, 32
+    }
+    TEST_END();
+
+    TEST_BEGIN("both entry polarities pulse at the same slot offset");
+    {
+        ack_edge_t high_edges[1] = {{64, 0}};
+        ack_edge_t low_edges[1] = {{64, 1}};
+        uint32_t start = 64u + 32u + 8u;
+
+        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0, 1, ack_gap_cycles(1), 0);
+        ack_model_run(&m, 1, high_edges, 1, NULL, 0, 160);
+        CHECK(m.pulse_start == (int)start);
+        CHECK(m.pulse_end == (int)(start + 32u));
+
+        ack_model_init(&m, ACK_MODEL_PC_LOW, 0, 1, ack_gap_cycles(1), 0);
+        ack_model_run(&m, 0, low_edges, 1, NULL, 0, 160);
+        CHECK(m.pulse_start == (int)start);
+        CHECK(m.pulse_end == (int)(start + 32u));
+    }
+    TEST_END();
+}
+
+/****************************************************************
+ * ACK arming model (steps 1-5 of the Pico backend)
+ ****************************************************************/
+
+typedef struct {
+    uint32_t seq;
+    uint32_t step;
+    uint32_t arm_step;
+    uint32_t allow_step;
+    uint32_t arm_from;
+    bool handled;
+    bool armed;
+    bool allowed;
+    bool tx_active;
+    can_ack_plan_t plan;
+} ack_logic_t;
+
+static void ack_logic_reset(ack_logic_t *l) {
+    memset(l, 0, sizeof(*l));
+    l->arm_step = UINT32_MAX;
+    l->allow_step = UINT32_MAX;
+}
+
+// Mirrors the backend: compute the plan once at the CRC start, arm when the
+// pad matches the plan, allow only after crc_match, and never arm for a frame
+// this node transmitted.
+static void ack_logic_step(ack_logic_t *l, can_edge_sm_t *sm, uint8_t pad) {
+    l->step++;
+    if (sm->frame_seq != l->seq) {
+        l->seq = sm->frame_seq;
+        l->handled = false;
+        l->armed = false;
+        l->allowed = false;
+    }
+    if (sm->in_frame && sm->crc_started && !l->handled) {
+        uint32_t rel = (sm->last_edge_raw >= sm->crc_raw_start)
+                           ? sm->last_edge_raw - sm->crc_raw_start
+                           : 0u;
+        l->handled = true;
+        l->arm_from = rel;
+        l->plan = can_ack_plan(sm->crc_calc, sm->crc_run_start,
+                               sm->crc_last_start, rel);
+        if (!l->tx_active && l->plan.ok && pad == l->plan.level) {
+            l->armed = true;
+            l->arm_step = l->step;
+        }
+    }
+    if (sm->in_frame && sm->crc_match && l->armed && !l->allowed) {
+        l->allowed = true;
+        l->allow_step = l->step;
+    }
+    if (sm->validity == INVALID_CRC || sm->validity == INVALID_STUFF)
+        l->armed = false;
+}
+
+// Feed one frame bit by bit, advancing a quiet bit clock like the RX path.
+static void drive_frame_ack(can_edge_sm_t *sm, const uint8_t *bits,
+                            uint32_t nbits, uint32_t t0, uint32_t ticks,
+                            ack_logic_t *l, bool tx_active) {
+    uint8_t prev = 1;
+    uint32_t i;
+
+    can_edge_sm_init(sm, ticks);
+    ack_logic_reset(l);
+    l->tx_active = tx_active;
+    for (i = 0; i < nbits; i++) {
+        uint8_t bit = bits_get(bits, i);
+        if (bit != prev) {
+            can_edge_sm_push(sm, can_edge_word(edge_at(t0, ticks, i), bit));
+            ack_logic_step(l, sm, sm->level);
+            if (!sm->in_frame)
+                return;
+        }
+        prev = bit;
+        if (sm->in_frame) {
+            can_edge_sm_time(sm, edge_at(t0, ticks, i + 1u));
+            ack_logic_step(l, sm, sm->level);
+        }
+        if (!sm->in_frame)
+            return;
+    }
+}
+
+static void ack_logic_on_frame(can_frame_t *frame, frame_validity_t validity,
+                               ack_logic_t *l, bool tx_active) {
+    uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
+    can_build_info_t info;
+    can_edge_sm_t sm;
+    uint32_t nbits;
+
+    nbits = can_frame_build(frame, validity, 0, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    drive_frame_ack(&sm, bits, nbits, EDGE_T0, EDGE_TICKS, l, tx_active);
+}
+
+// A JMP's low 5 bits are the absolute target.  Adding the origin must not
+// spill into the condition or delay fields.
+static void check_relocated(const uint16_t *insns, uint32_t n,
+                            uint32_t origin) {
+    uint32_t i;
+
+    for (i = 0; i < n; i++) {
+        uint16_t in = insns[i];
+        uint16_t got = can_pio_reloc_instr(in, origin);
+
+        if ((in >> 13) == 0) {
+            uint32_t addr = in & 31u;
+            CHECK(addr + origin < 32u);
+            CHECK((got & 31u) == addr + origin);
+            CHECK((got & 0xffe0u) == (in & 0xffe0u));
+        } else {
+            CHECK(got == in);
+        }
+    }
+}
+
+static void test_ack_reloc(void) {
+    enum {
+        ACK_N = sizeof(can_ack_program_instructions) /
+                sizeof(can_ack_program_instructions[0]),
+        TX_N = sizeof(can_tx_program_instructions) /
+               sizeof(can_tx_program_instructions[0])
+    };
+    const uint32_t origin = 11; // RX at 25, then TX, in pio_add_program
+    uint32_t rel;
+
+    printf("\n-- ACK image relocation --\n");
+
+    TEST_BEGIN("ack and tx are 13 and 14 words");
+    CHECK(ACK_N == 13u);
+    CHECK(TX_N == 14u);
+    TEST_END();
+
+    TEST_BEGIN("origin 0 leaves both images unchanged");
+    check_relocated(can_ack_program_instructions, ACK_N, 0);
+    check_relocated(can_tx_program_instructions, TX_N, 0);
+    TEST_END();
+
+    TEST_BEGIN("origin 11 relocates JMP targets and keeps other words");
+    check_relocated(can_ack_program_instructions, ACK_N, origin);
+    check_relocated(can_tx_program_instructions, TX_N, origin);
+    // release (word 0) and the dominant drive (word 11) are the PC checks.
+    CHECK((can_pio_reloc_instr(can_ack_program_instructions[0], origin) >>
+           13) != 0);
+    CHECK((can_pio_reloc_instr(can_ack_program_instructions[12], origin) &
+           31u) == origin);
+    CHECK((can_pio_reloc_instr(can_ack_program_instructions[11], origin) >>
+           13) != 0);
+    TEST_END();
+
+    TEST_BEGIN("allow and release use absolute SMx_ADDR");
+    CHECK(!can_ack_release_pc(0, origin));
+    CHECK(can_ack_release_pc(origin + CAN_ACK_PC_RELEASE, origin));
+    CHECK(!can_ack_allow_pc(origin + CAN_ACK_PC_RELEASE, origin));
+    CHECK(!can_ack_allow_pc(origin - 1u, origin));
+    for (rel = 1; rel < CAN_ACK_PC_SET_PINS; rel++)
+        CHECK(can_ack_allow_pc(origin + rel, origin));
+    for (rel = CAN_ACK_PC_SET_PINS; rel < ACK_N; rel++)
+        CHECK(!can_ack_allow_pc(origin + rel, origin));
+    CHECK(CAN_ACK_ENTRY_HIGH == 1u);
+    CHECK(CAN_ACK_ENTRY_LOW == 4u);
+    TEST_END();
+}
+
+static void test_ack_backend_model(void) {
+    can_frame_t found[PAT_COUNT];
+    can_frame_t dom;
+    can_frame_t rec4;
+    can_build_info_t info;
+    can_edge_sm_t sm;
+    ack_logic_t l;
+    bool have_dom;
+    bool have_rec4;
+
+    printf("\n-- ACK arming model --\n");
+    find_tail_patterns(found);
+    have_dom = (found[PAT_DOM_EDGE].flags & 0x80u) != 0;
+    have_rec4 = (found[PAT_REC4].flags & 0x80u) != 0;
+    dom = found[PAT_DOM_EDGE];
+    rec4 = found[PAT_REC4];
+    dom.flags = (uint8_t)(dom.flags & ~0x80u);
+    rec4.flags = (uint8_t)(rec4.flags & ~0x80u);
+
+    TEST_BEGIN("valid frame, dominant last CRC bit, gap 1: arm then allow");
+    if (have_dom) {
+        ack_logic_on_frame(&dom, VALID_FRAME, &l, false);
+        CHECK(l.handled);
+        CHECK(l.armed);
+        CHECK(l.allowed);
+        CHECK(l.plan.gap_bits == 1u);
+        CHECK(l.arm_step < l.allow_step);
+    } else {
+        CHECK(0);
+    }
+    TEST_END();
+
+    TEST_BEGIN("valid frame, 5-bit recessive tail: gap preload");
+    if (have_rec4) {
+        ack_logic_on_frame(&rec4, VALID_FRAME, &l, false);
+        CHECK(l.armed);
+        CHECK(l.allowed);
+        CHECK(l.plan.gap_bits == 5u);
+        CHECK(l.plan.gap_bits * ACK_MODEL_CYCLES_PER_BIT +
+                  ACK_MODEL_GAP_OFFSET == 162u);
+    } else {
+        CHECK(0);
+    }
+    TEST_END();
+
+    TEST_BEGIN("INVALID_CRC and INVALID_STUFF never set Y");
+    {
+        can_frame_t f;
+        fill_std(&f, 0x123, 8, (const uint8_t *)"12345678");
+        ack_logic_on_frame(&f, INVALID_CRC, &l, false);
+        CHECK(!l.allowed);
+        ack_logic_on_frame(&f, INVALID_STUFF, &l, false);
+        CHECK(!l.allowed);
+    }
+    TEST_END();
+
+    TEST_BEGIN("word that already contains the terminal edge does not arm");
+    if (have_dom) {
+        uint8_t frame_bits[CAN2040_LITE_MAX_FRAME_BYTES];
+        uint32_t crc_wire = 0;
+        uint8_t run = 0, last = 0;
+        uint32_t slot;
+        uint32_t nbits;
+
+        nbits = can_frame_build(&dom, VALID_FRAME, 0, frame_bits,
+                                CAN2040_LITE_MAX_FRAME_BITS, &info);
+        CHECK(nbits != 0);
+        CHECK(crc_field_state(frame_bits, &info, &crc_wire, &run, &last) == 0);
+        slot = info.stuffed_bits + 1u - crc_wire;
+        // Drive through the delimiter bit; the terminal edge is inside the
+        // word the model inspects.
+        can_edge_sm_init(&sm, EDGE_TICKS);
+        ack_logic_reset(&l);
+        drive_span(&sm, frame_bits, 0, crc_wire + slot,
+                   EDGE_T0, EDGE_TICKS);
+        ack_logic_step(&l, &sm, sm.level);
+        CHECK(sm.crc_started);
+        CHECK(l.handled);
+        CHECK(!l.plan.ok);
+        CHECK(!l.armed);
+    } else {
+        CHECK(0);
+    }
+    TEST_END();
+
+    TEST_BEGIN("a frame this node transmitted is never armed");
+    if (have_dom) {
+        ack_logic_on_frame(&dom, VALID_FRAME, &l, true);
+        CHECK(l.handled);
+        CHECK(!l.armed);
+        CHECK(!l.allowed);
+    } else {
+        CHECK(0);
+    }
+    TEST_END();
+}
+
 static void test_edge_pair(void) {
     static const uint8_t payload[8] = {
         0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78
@@ -1268,6 +1895,10 @@ int main(void) {
     test_build_errors();
     test_api_skeleton();
     test_edge_sm();
+    test_ack_plan();
+    test_ack_cycle_model();
+    test_ack_reloc();
+    test_ack_backend_model();
     test_edge_pair();
 
     printf("\n========================================\n");

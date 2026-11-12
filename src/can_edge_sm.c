@@ -119,6 +119,16 @@ static void accept_unstuffed(can_edge_sm_t *sm, uint8_t bit, uint32_t bit_end) {
     int covered = !sm->header_known || sm->unstuffed < sm->crc_start;
     int last_crc;
 
+    // The first CRC bit is at unstuffed index crc_start.  Remember the
+    // stuffer state and the raw wire index there for the ACK schedule.
+    if (sm->header_known && !sm->crc_started &&
+        sm->unstuffed == sm->crc_start) {
+        sm->crc_started = 1;
+        sm->crc_raw_start = sm->raw_bits - 1u;
+        sm->crc_run_start = (uint8_t)sm->run;
+        sm->crc_last_start = sm->last;
+    }
+
     if (covered)
         crc_bit(sm, bit);
     else
@@ -275,11 +285,13 @@ static void advance_to(can_edge_sm_t *sm, uint32_t now) {
 
 static void start_frame(can_edge_sm_t *sm, uint32_t time) {
     uint32_t ticks = sm->ticks_per_bit;
+    uint32_t seq = sm->frame_seq + 1u;
     uint8_t keep_ready = sm->frame_ready;
     can_parsed_t keep_parsed = sm->parsed;
     frame_validity_t keep_validity = sm->validity;
 
     memset(sm, 0, sizeof(*sm));
+    sm->frame_seq = seq;
     sm->ticks_per_bit = ticks;
     sm->mark = time & CAN_EDGE_TIME_MASK;
     sm->level = 0;
@@ -325,6 +337,7 @@ void can_edge_sm_push(can_edge_sm_t *sm, uint32_t word) {
     was_in_frame = 1;
     advance_to(sm, time);
     if (sm->in_frame) {
+        sm->last_edge_raw = sm->raw_bits;
         sm->level = new_level;
         return;
     }
@@ -365,4 +378,72 @@ void can_edge_pair_init(can_edge_pair_t *pair, can_edge_sm_t *sm,
 void can_edge_pair_push(can_edge_pair_t *pair, uint32_t word) {
     pair_push(pair, (uint16_t)(word >> 16), 0);
     pair_push(pair, (uint16_t)word, 1);
+}
+
+uint8_t can_edge_sm_past_ack_slot(const can_edge_sm_t *sm) {
+    return (uint8_t)(!sm->in_frame || sm->ack_seen);
+}
+
+#define CAN_ACK_MAX_WIRE 21u   // 15 CRC + up to 4 stuff + delimiter
+
+can_ack_plan_t can_ack_plan(uint16_t crc, uint8_t run, uint8_t last,
+                            uint32_t from_bit) {
+    uint8_t wire[CAN_ACK_MAX_WIRE];
+    can_ack_plan_t plan;
+    uint32_t n = 0;
+    uint32_t terminal = 0;       // last change at or before the slot
+    uint32_t i;
+    uint8_t level = (uint8_t)(last & 1u);
+    uint32_t r = run;
+
+    for (i = 0; i < 15u; i++) {
+        uint8_t bit = (uint8_t)((crc >> (14u - i)) & 1u);
+
+        // Same rule as the receive stuffer: a 5-run inserts the opposite
+        // level and the run restarts at the stuff bit.
+        if (r == 5u) {
+            uint8_t s = (uint8_t)(1u - level);
+            wire[n++] = s;
+            r = 1;
+            level = s;
+        }
+        wire[n++] = bit;
+        if (r > 0u && bit == level)
+            r++;
+        else {
+            r = 1;
+            level = bit;
+        }
+    }
+    // A CRC sequence that ends on a 5-run still owes one stuff bit before
+    // the delimiter.  Stuffing stops there.
+    if (r == 5u) {
+        uint8_t s = (uint8_t)(1u - level);
+        wire[n++] = s;
+        r = 1;
+        level = s;
+    }
+    wire[n++] = 1u;              // CRC delimiter, unstuffed
+
+    // Terminal edge: the last level change at or before the slot boundary.
+    // Index 0 is the change from `last` into the first CRC bit.
+    for (i = 1; i < n; i++) {
+        if (wire[i] != wire[i - 1u])
+            terminal = i;
+    }
+
+    plan.slot_bit = n;
+    plan.gap_bits = n - terminal;
+    plan.edges = 0;
+    for (i = 1; i < n; i++) {
+        if (i > from_bit && wire[i] != wire[i - 1u])
+            plan.edges++;
+    }
+    plan.level = (from_bit < n) ? wire[from_bit]
+                                : 1u; // ACK slot is recessive before we drive
+    plan.sync_level = (terminal == 0u) ? (uint8_t)(last & 1u)
+                                      : wire[terminal - 1u];
+    plan.ok = (from_bit < terminal) ? 1u : 0u;
+
+    return plan;
 }

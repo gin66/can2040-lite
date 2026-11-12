@@ -62,6 +62,7 @@ typedef struct {
     uint32_t ticks_per_bit;
 
     // Running capture.  mark/accum/level are the bit clock.
+    uint32_t frame_seq;         // incremented at every SOF
     uint32_t mark;
     uint32_t accum;
     uint8_t level;
@@ -78,7 +79,12 @@ typedef struct {
     uint32_t unstuffed;
     uint32_t crc_start;
     uint32_t raw_bits;
+    uint32_t last_edge_raw;     // raw wire index of the bit at the last edge
     uint32_t stuffed_raw;
+    uint32_t crc_raw_start;     // raw wire index of the first CRC bit
+    uint8_t crc_run_start;      // stuffer state entering the CRC field
+    uint8_t crc_last_start;
+    uint8_t crc_started;
     uint8_t header_known;
     uint8_t is_ext;
     uint8_t is_rtr;
@@ -132,6 +138,39 @@ typedef struct {
 void can_edge_pair_init(can_edge_pair_t *pair, can_edge_sm_t *sm,
                         uint32_t now, uint32_t bias);
 void can_edge_pair_push(can_edge_pair_t *pair, uint32_t word);
+
+// ACK schedule for the expected CRC field.  Pure: no PIO types, no state.
+//
+// `crc` is the 15 expected CRC bits, MSB first on the wire.  `run`/`last` are
+// the stuffer state at the start of the CRC field (`last` 1 = recessive).
+// `from_bit` is a wire index measured from the first CRC bit; 0 asks for the
+// plan at the CRC-field boundary, and n>0 means wire bit n has been seen.
+//
+// The plan walks the CRC bits with the same stuffing rule as can_edge_sm.  A
+// 5-run inserts the opposite bit and the run restarts at 1; a 5-run at the end
+// of the CRC sequence inserts one trailing stuff bit before the delimiter.
+//
+// `slot_bit` is the wire index of the ACK slot relative to the first CRC bit.
+// `edges` counts level changes strictly after `from_bit` through the terminal
+// edge (the last change at or before the slot boundary).  `gap_bits` is the
+// distance from the terminal edge to the slot boundary.  `level` is the pad
+// level at `from_bit`; `sync_level` is the level just before the terminal
+// edge.  `ok` is 0 when `from_bit` is already at or past the terminal edge.
+typedef struct {
+    uint32_t edges;
+    uint32_t gap_bits;
+    uint32_t slot_bit;
+    uint8_t level;
+    uint8_t sync_level;
+    uint8_t ok;
+} can_ack_plan_t;
+
+can_ack_plan_t can_ack_plan(uint16_t crc, uint8_t run, uint8_t last,
+                            uint32_t from_bit);
+
+// True once the parser has finished the ACK slot (or the frame ended).  The
+// ACK helper may restart its follow loop only after this.
+uint8_t can_edge_sm_past_ack_slot(const can_edge_sm_t *sm);
 
 #ifdef __cplusplus
 }

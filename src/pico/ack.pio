@@ -1,0 +1,42 @@
+; SPDX-License-Identifier: GPL-3.0-only
+;
+; CAN ACK helper — overlay of the TX instruction slot.
+;
+; This image follows bus edges and fires one inset dominant pulse on the ACK
+; slot after the CPU allows it.  The CPU only sets Y after the received CRC
+; matched; it never places the pulse itself.
+;
+;   high / low   entry, chosen from the pad level at start
+;   X            edges still to come, minus one, once armed;
+;                0xFFFFFFFF while only following
+;   OSR          gap cycles from the terminal edge to the fire check
+;   Y            0 until the CRC matches; 1 allows the pulse
+;
+; The schedule (can_ack_plan) supplies X = edges - 1 and the OSR gap.  The
+; gap is 32 * gap_bits + 2 so the dominant drive starts a quarter bit into
+; the ACK slot.  The delay is [30] rather than [31]: the following `jmp
+; release` takes one more cycle, which makes the dominant window exactly
+; 32 cycles (one bit) from slot+0.25 to slot+1.25.
+
+.program can_ack
+.wrap_target
+release:
+    set pins, 1              ; recessive, every iteration
+.wrap                        ; wrap target = wrap = release
+high:
+    jmp pin, high
+    jmp x--, low
+    jmp gap                  ; X expired on a falling edge
+low:
+    jmp pin, rose
+    jmp low
+rose:
+    jmp x--, high
+    jmp gap                  ; X expired on a rising edge
+gap:
+    out x, 32                ; X = gap cycles; autopull off
+gaploop:
+    jmp x--, gaploop
+    jmp !y, release          ; not verified
+    set pins, 0 [30]         ; 32 cycles with the jmp below
+    jmp release

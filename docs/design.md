@@ -7,9 +7,10 @@ Kevin O'Connor. See [`LICENSE`](../LICENSE) for the full license text.
 ## Restrictions
 
 CAN2040-Lite is **not a full CAN node**; it is a classic CAN 2.0B data-frame
-transceiver. It deliberately does not implement:
+transceiver. It does implement ACK generation with the TX-slot helper in
+[`ack_generation.md`](ack_generation.md) (steps 1–3 are in the firmware;
+on-target verification is pending). It deliberately does not implement:
 
-- ACK generation — it only observes the ACK slot via readback
 - error-flag generation — it only observes 6+ dominant bits
 - TEC/REC, Error Active/Passive, or bus-off
 - automatic retransmission (the application retries)
@@ -20,8 +21,9 @@ transceiver. It deliberately does not implement:
 - hardware acceptance filters (software filtering only)
 - an on-chip transceiver (an external CAN transceiver is required)
 
-A compliant node must be present on the bus to provide ACK and error
-confinement.
+A compliant node must be present on the bus for error confinement. The
+ACK helper in [`ack_generation.md`](ack_generation.md) is in the firmware;
+its on-target verification is still pending.
 
 ## SM Reduction from can2040
 
@@ -98,10 +100,15 @@ re-synchronization into the RX program:
 
 #### Why no match SM?
 
-- CRC match detection triggers ACK injection in can2040
-- CAN2040-Lite does NOT inject ACKs — it only observes them via readback
-- CRC matching is deferred to software post-processing
-- Saves the match SM entirely
+- can2040's match SM detects the CRC and signals the ACK in PIO
+- CRC matching stays in software (`can_edge_sm`)
+- There is no third CAN state machine and no second bit-level receiver
+- The ACK pulse is an image of the TX instruction slot. The SM follows bus
+  edges and the CPU only sets a go flag after the CRC matches. See
+  [`ack_generation.md`](ack_generation.md) and [`todo.md`](todo.md)
+
+Steps 1–3 (schedule, image, backend) are implemented and host-tested; the
+on-target checks are still pending.
 
 #### Why TX path (SM1)?
 
@@ -149,7 +156,8 @@ CAN2040-Lite's two CAN programs must fit in ≤ 29 words so that the 2-word
 FreeRTOS cycle-counter program can coexist on PIO0, leaving at most 1 spare
 word.
 
-`rx_pair.pio` = 7 words, `tx.pio` = 14 words, total **21**.
+`rx_pair.pio` = 7 words, `tx.pio` = 14 words, total **21**.  The 13-word
+`ack.pio` image overlays the TX slot, so the resident maximum is unchanged.
 TX runs at 32 PIO cycles per bit (PIO clock = 32 * bitrate) with zero
 word-boundary jitter thanks to autopull.  RX counts a free-running two-cycle
 down-counter and packs the 1->0 timestamp and the following 0->1 timestamp
@@ -173,6 +181,7 @@ can_edge_pair_push -> can_edge_sm (software ISR):
     - 16-bit deltas carried on a 31-bit virtual clock
     - Bit clock, idle/SOF/EOF/IFS, stuffing, CRC-15, field parse
     - ACK arm and observed ACK slot
+    - can_ack follows the RX pad; a CRC match lets it pulse the TX pad
     |
     V
 Application Callback (valid frames only)

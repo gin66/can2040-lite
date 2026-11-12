@@ -109,13 +109,14 @@ The bus remains unaffected by the receiver (no error flags, no arbitration parti
 - ✅ Frame transmission (bit-stuffed)
 - ✅ Readback path (transmitted bits monitored on CAN-RX)
 - ✅ ACK evaluation (from readback)
+- ✅ ACK generation by the TX-slot helper (`ack_generation.md`, `todo.md`);
+  host-side schedule and cycle model pass, on-target verification pending
 - ✅ Error frame evaluation (from readback)
 
 ### Not Implemented (restrictions)
 
 CAN2040-Lite is **not a full CAN node**; it is a data-frame transceiver.
 
-- ❌ ACK generation/injection (the compliant master node ACKs)
 - ❌ Error-flag generation (the compliant master node signals errors)
 - ❌ Arbitration participation beyond abort-on-conflict
 - ❌ Automatic retransmission (the application handles retries)
@@ -266,8 +267,10 @@ The TX SM (SM1) handles transmission with bus idle wait:
    such a run is detected on RX during the transmit window, the error is
    reported to the application.
 
-7. **No Injection:** CAN2040-Lite does NOT inject ACK bits or error flags — it
-   only observes them. A compliant CAN node on the bus handles these.
+7. **No error-flag injection:** CAN2040-Lite does not inject error flags; it
+   only observes runs of 6+ dominant bits. A compliant peer handles error
+   confinement. ACK generation is the separate TX-slot helper in
+   `ack_generation.md`; its on-target verification is pending.
 
 ### PIO Capture Engine
 
@@ -477,7 +480,8 @@ compliant. It is a classic CAN 2.0B *data-frame* transceiver.
 
 Limitations include:
 
-- **No ACK generation** — only ACK-slot observation via readback
+- **ACK generation on-target verification is pending** — the TX-slot
+  helper in `ack_generation.md` is implemented and host-tested (`todo.md`)
 - **No error-flag generation** — only error observation (6+ dominant bits)
 - **No fault confinement** — no TEC/REC, Error Active/Passive, or bus-off
 - **No automatic retransmission** — the application retries
@@ -490,7 +494,8 @@ Limitations include:
 - **No on-chip transceiver** — an external CAN transceiver is required
 
 **At least one standards-compliant CAN controller must be present on the
-network** to provide ACK and error confinement.
+network** for error confinement. The ACK helper is in the firmware; its
+on-target verification is still pending.
 
 ---
 
@@ -532,8 +537,8 @@ The architecture treats CAN as:
 
 > a self-clocking serial bitstream with delayed software validation
 
-By eliminating the separate sync SM and integrating re-sync into the rx path,
-and by using readback instead of ACK injection, CAN2040-Lite reduces the state
+By eliminating the separate sync SM, integrating re-sync into the rx path,
+and reusing the TX SM for ACK injection, CAN2040-Lite reduces the state
 machine footprint from 4 SMs to 2 while maintaining full CAN communication
 capability. It also avoids can2040's need to occupy a block's entire 32-word
 instruction memory: the two CAN2040-Lite programs are much smaller, so other
@@ -563,7 +568,7 @@ This ensures correctness before hardware-specific code is written.
 ### Decision Log
 
 - **2025-11-08:** Confirmed 2-SM allocation for CAN2040-Lite on PIO0 (SM0 rx + SM1 tx), FastAccelStepper uses PIO1
-- **2025-11-08:** Match SM merged into Rx SM (no ACK injection needed)
+- **2025-11-08:** Match SM merged into Rx SM (CRC match in software; ACK later reuses the TX slot)
 - **2025-11-08:** TX path added (SM1, readback + ACK/ERR evaluation)
 - **2025-11-08:** CRC errors reported to application (not silently dropped)
 - **2025-11-08:** Another full CAN node on bus handles ACK/error confinement
@@ -591,6 +596,10 @@ This ensures correctness before hardware-specific code is written.
 - **2026-11-08 (budget):** Hard PIO budget: rx + tx programs ≤ 29 instructions;
   2 of PIO0's 32 words are reserved for the FreeRTOS 2-instruction cycle
   counter SM.
+- **2026-11-12:** ACK generation decided: edge-locked pulse in a 14-word
+  overlay of the TX slot, gated by CRC match. Steps 1–3 (schedule, 13-word
+  image, backend) are implemented and host-tested; on-target verification
+  remains. `ack_generation.md`, implementation order in `todo.md`.
 
 ### Project Name
 

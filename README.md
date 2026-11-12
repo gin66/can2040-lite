@@ -27,16 +27,20 @@ cannot share one SM without stalling one direction while the other runs.
 
 - Raspberry Pi Pico (rp2040) or Pico 2 (rp2350)
 - Standard CAN transceiver (e.g., SN65HVD230, TJA1050)
-- At least one other fully CAN-compliant node on the bus (for arbitration, ACK, error handling)
+- At least one other fully CAN-compliant node on the bus (for arbitration
+  and error handling). ACK generation is implemented as the TX-slot helper
+  in `docs/ack_generation.md`; its on-target verification (step 4 of
+  `docs/todo.md`) is still pending.
 
 ## Restrictions
 
 CAN2040-Lite is **not a full CAN node**. It is a lightweight data-frame
-transceiver and deliberately omits the protocol mechanisms that require
+transceiver. ACK generation is an edge-locked pulse on the TX state machine
+(`docs/ack_generation.md`, work order in `docs/todo.md`); the host-side
+schedule and cycle model pass, while step 4 needs the RP2350 and a logic
+analyzer. It deliberately omits the protocol mechanisms that require
 real-time error participation:
 
-- **No ACK generation** — it only observes the ACK slot via readback. A
-  compliant node on the bus must ACK.
 - **No error-flag generation** — it only observes 6+ dominant bits and reports
   the error; it never injects an error flag.
 - **No error counters / fault confinement** — no TEC/REC, Error Active /
@@ -55,12 +59,15 @@ real-time error participation:
 - **No hardware acceptance filters** — filtering is done in software.
 - **No on-chip transceiver** — an external CAN transceiver is required.
 
-A CAN2040-Lite network must contain **at least one compliant CAN node** to
-provide ACK and error confinement.
+A CAN2040-Lite network must contain **at least one compliant CAN node** for
+error confinement. CAN2040-Lite now drives ACKs on its own; that helper's
+on-target verification is pending.
 
 Current implementation notes (not protocol requirements): the target backend
-captures one frame per arm (no background RX queue/IRQ yet), statistics
-counters are defined but not yet populated, and frames are not timestamped.
+services the RX FIFO from its not-empty IRQ, statistics capture RX/TX totals,
+and frames are not timestamped. The ACK helper swaps the TX instruction image;
+its schedule and cycle model are host-tested, and on-target verification is
+pending.
 
 ## Project: suspended-spheres
 
@@ -156,6 +163,8 @@ can2040-lite/
 ├── docs/
 │   ├── white_paper.md     # Design specification
 │   ├── design.md          # SM reduction plan, API design
+│   ├── ack_generation.md  # ACK helper design and status
+│   ├── todo.md            # ACK helper implementation order
 │   └── tdd_plan.md        # TDD implementation plan
 ├── platformio.ini         # RP2350 target build (Arduino-Pico core)
 ├── src/
@@ -165,6 +174,7 @@ can2040-lite/
 │   └── pico/
 │       ├── can2040_lite_pico.cpp/.h  # PIO/DMA backend
 │       ├── rx_pair.pio, tx.pio       # Live PIO programs (7 + 14 words)
+│       ├── ack.pio                   # ACK helper overlay (13 words)
 │       └── rx.pio                    # Legacy 32x oversampled RX (7 words)
 └── extras/
     ├── tests/
@@ -233,6 +243,8 @@ Options:
 - [x] Saleae verification at 125k, 500k and 1M; back-to-back frames (18-bit gap)
 
 ### Planned
+- [ ] ACK helper on-target verification and go-window measurement
+      (`docs/todo.md` steps 4–5)
 - [ ] Full frame-level TX driver (stuffed prefix, ACK/NACK evaluation)
 - [ ] Error-frame injection and detection
 - [ ] Real-bus integration with a compliant peer/transceiver

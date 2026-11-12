@@ -1,8 +1,9 @@
 # CAN2040-Lite — TDD Implementation Plan
 
-**Status:** Draft 0.4 — Phases 0–3 complete; PIO loopback/Saleae verified at
-125k/500k/1M (2026-11-08). Arbitration abort, error injection, and real-bus
-integration remain.
+**Status:** Draft 0.5 — Phases 0–3 complete; PIO loopback/Saleae verified at
+125k/500k/1M (2026-11-08). ACK helper steps 1–3 (schedule, PIO image,
+backend) are implemented and host-tested; on-target and go-window checks
+remain. Arbitration abort, error injection, and real-bus integration remain.
 **Scope:** Audit corrections, test-generator rewrite, host unit tests, PIO
 validation, integration testing.
 **License:** GPL-3.0-only (derived from can2040). See `LICENSE`.
@@ -16,12 +17,17 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked
   words of instruction memory; 2 words are reserved for the FreeRTOS
   cycle-counter SM (a 2-instruction program), leaving at most 1 spare word.
   This budget is verified with `pioasm` before C5/C6 can pass.
-  **Measured now:** rx = 7, tx = 4, total = **11** words; TX→RX loopback
-  (ACK + NACK) passes on RP2350.
+  **Measured now:** rx = 7, tx = 14, total = **21** words; TX→RX loopback
+  (ACK + NACK) passes on RP2350.  The ACK image reuses the 14-word TX slot
+  and is 13 words, so the resident maximum stays 21.
 
 **Protocol restrictions (also in README / white paper / design):**
-- Not a full CAN node: no ACK generation, no error-flag generation, no TEC/REC,
-  no Error Active/Passive, no bus-off.
+- Not a full CAN node: no error-flag generation, no TEC/REC, no Error
+  Active/Passive, no bus-off.
+- ACK generation is specified in `ack_generation.md` and tracked in
+  `todo.md`. Steps 1–3 (schedule, PIO image, backend) are implemented and
+  host-tested; the on-target and go-window checks remain. The phases below
+  predate that work and describe the receive/transmit core.
 - **No RTR support** — the node neither transmits nor acts on remote frames.
   The test generator may still emit RTR vectors for negative tests.
 - No CAN FD, no programmable bit timing (SJW/TSEG), no hardware acceptance

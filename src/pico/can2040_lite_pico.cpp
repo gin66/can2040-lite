@@ -28,6 +28,8 @@
 #include "can2040_lite.h"    // full struct can2040_lite definition
 #include "can2040_lite_proto.h"
 #include "can_edge_sm.h"
+#include "can_pio_reloc.h"
+#include "ack.pio.h"
 #include "rx_pair.pio.h"
 #include "tx.pio.h"
 
@@ -52,6 +54,17 @@ static const uint CAN_TX_FIFO_WORDS = 8;
 
 static_assert(can_rx_pair_program.length + can_tx_program.length <= 29,
               "rx_pair + tx PIO programs must fit in 29 words");
+static_assert(can_rx_pair_program.length + can_ack_program.length <= 29,
+              "rx_pair + ack PIO programs must fit in 29 words");
+
+// ack.pio addresses are program-relative.  SMx_ADDR is absolute; add
+// tx_offset before comparing.  See can_pio_reloc.h.
+
+// The ACK image is clocked like TX.  The plan's gap is whole bit times; the
+// model adds two cycles so the inset drive starts at slot + 0.25 bit:
+//   set pins,0[30] starts at gap_bits*32 + 2 + 6 = slot + 8 cycles.
+static const uint32_t ACK_CYCLES_PER_BIT = 32;
+static const uint32_t ACK_GAP_OFFSET_CYCLES = 2;
 
 static PIO rx_pio;
 static PIO tx_pio;
@@ -60,8 +73,23 @@ static uint tx_sm;
 static uint rx_offset;
 static uint tx_offset;
 static uint tx_gpio;
+static uint tx_rx_gpio;
 static pio_sm_config rx_cfg;
 static pio_sm_config tx_cfg;
+static pio_sm_config ack_cfg;
+static bool tx_initialized;
+
+// ACK helper state.  The helper is resident on the TX instruction slot while
+// this node is not transmitting.  It follows the RX pad and fires only after
+// the receive parser allows it.
+static bool ack_image_loaded;
+static bool ack_arm_outstanding;
+static bool ack_allow_sent;
+static bool ack_frame_handled;
+static uint32_t ack_frame_seq;
+static can_ack_plan_t ack_plan;
+static bool tx_active;
+static bool tx_done_seen;
 
 // Edge state machine — processes FIFO words from the RX SM.
 static can_edge_sm_t edge_sm;
@@ -84,6 +112,10 @@ static uint rx_irq_num;
 static bool rx_initialized;
 
 static void can2040_lite_pico_rx_isr(void);
+extern "C" int can2040_lite_pico_tx_done_pending(void);
+extern "C" int can2040_lite_pico_tx_error_pending(void);
+static void ack_start_follow(void);
+static void ack_abort_for_tx(void);
 
 static float clkdiv_for(uint32_t bitrate, float mult) {
     return (float)clock_get_hz(clk_sys) / (mult * (float)bitrate);
@@ -206,6 +238,17 @@ extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
     sm_config_set_fifo_join(&tx_cfg, PIO_FIFO_JOIN_TX); // 8-deep TX FIFO
     sm_config_set_clkdiv(&tx_cfg, clkdiv_for(bitrate, tx_clk_mult));
 
+    // The ACK image shares the TX slot.  It follows the RX pad and uses the
+    // same SET/OUT and clock settings; only the pull is manual.
+    tx_rx_gpio = gpio_rx;
+    ack_cfg = can_ack_program_get_default_config(tx_offset);
+    sm_config_set_out_pins(&ack_cfg, gpio, 1);
+    sm_config_set_set_pins(&ack_cfg, gpio, 1);
+    sm_config_set_jmp_pin(&ack_cfg, gpio_rx);
+    sm_config_set_out_shift(&ack_cfg, false, false, 32); // manual pull
+    sm_config_set_fifo_join(&ack_cfg, PIO_FIFO_JOIN_TX);
+    sm_config_set_clkdiv(&ack_cfg, clkdiv_for(bitrate, tx_clk_mult));
+
     pio_gpio_init(tx_pio, gpio);
     if (gpio_rx != gpio)
         pio_gpio_init(tx_pio, gpio_rx);
@@ -216,6 +259,12 @@ extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
     pio_sm_init(tx_pio, tx_sm, tx_offset, &tx_cfg);
     pio_sm_set_pins_with_mask(tx_pio, tx_sm, 1u << gpio, 1u << gpio);
     pio_sm_set_enabled(tx_pio, tx_sm, false); // one-shot: started by tx_frame()
+
+    tx_initialized = true;
+    tx_active = false;
+    tx_done_seen = false;
+    ack_image_loaded = false;
+    ack_start_follow();                       // receive helper at idle
     return 0;
 }
 
@@ -280,6 +329,186 @@ static uint32_t rx_estimate_now(void) {
     return (edge_pair.time - (uint32_t)ticks) & CAN_EDGE_TIME_MASK;
 }
 
+// Copy one image into the fixed TX instruction slot.  The caller has already
+// disabled the SM.  JMP targets in the assembled arrays are relative to
+// origin 0; relocate them the same way pio_add_program does.
+static void ack_copy_image(const uint16_t *insns, uint len) {
+    for (uint i = 0; i < len; i++)
+        tx_pio->instr_mem[tx_offset + i] =
+            can_pio_reloc_instr(insns[i], tx_offset);
+}
+
+// Restart the helper in follow mode at the RX pad's current level.  Used at
+// init, after rx re-arm, and once this node's own transmit has passed its ACK
+// slot.
+static void ack_start_follow(void) {
+    uint32_t save;
+    uint32_t pc;
+    uint8_t level;
+
+    if (!tx_initialized)
+        return;
+    save = save_and_disable_interrupts();
+    pio_sm_set_enabled(tx_pio, tx_sm, false);
+    if (!ack_image_loaded) {
+        ack_copy_image(can_ack_program_instructions, can_ack_program.length);
+        ack_image_loaded = true;
+    }
+
+    level = gpio_get(tx_rx_gpio) ? 1u : 0u;
+    pc = tx_offset + (level ? CAN_ACK_ENTRY_HIGH : CAN_ACK_ENTRY_LOW);
+    pio_sm_init(tx_pio, tx_sm, pc, &ack_cfg);
+    pio_sm_set_pins_with_mask(tx_pio, tx_sm, 1u << tx_gpio, 1u << tx_gpio);
+    pio_sm_clear_fifos(tx_pio, tx_sm);
+
+    // Follow with X = 0xFFFFFFFF and Y = 0.
+    pio_sm_put_blocking(tx_pio, tx_sm, 0xffffffffu);
+    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_pull(false, true));
+    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_out(pio_x, 32));
+    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_set(pio_y, 0));
+
+    ack_arm_outstanding = false;
+    ack_allow_sent = false;
+    ack_frame_handled = false;
+    ack_frame_seq = edge_sm.frame_seq;
+    pio_sm_set_enabled(tx_pio, tx_sm, true);
+    restore_interrupts(save);
+}
+
+// Abort the helper before loading can_tx.  The pad is forced recessive first,
+// so an in-flight receive is NACKed rather than ACKed by a stale arm.
+static void ack_abort_for_tx(void) {
+    uint32_t save;
+
+    if (!tx_initialized)
+        return;
+    save = save_and_disable_interrupts();
+    if (ack_image_loaded) {
+        pio_sm_exec_wait_blocking(tx_pio, tx_sm,
+                                  pio_encode_set(pio_pins, 1));
+        pio_sm_set_enabled(tx_pio, tx_sm, false);
+        ack_copy_image(can_tx_program_instructions, can_tx_program.length);
+        ack_image_loaded = false;
+    }
+    ack_arm_outstanding = false;
+    ack_allow_sent = false;
+    restore_interrupts(save);
+}
+
+static uint32_t ack_bit_us(void) {
+    uint64_t us = (uint64_t)rx_ticks_per_bit * 2u * rx_clkdiv_256 * 1000000ull;
+    us /= (uint64_t)rx_sys_hz * 256ull;
+    return us ? (uint32_t)us : 1u;
+}
+
+// Preload the gap in the OSR, the edge count in X, and clear Y.
+static void ack_arm(const can_ack_plan_t *plan) {
+    uint32_t gap = plan->gap_bits * ACK_CYCLES_PER_BIT +
+                   ACK_GAP_OFFSET_CYCLES;
+
+    pio_sm_clear_fifos(tx_pio, tx_sm);
+    pio_sm_put_blocking(tx_pio, tx_sm, gap);
+    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_pull(false, false));
+    pio_sm_exec_wait_blocking(tx_pio, tx_sm,
+                              pio_encode_set(pio_x, (uint8_t)(plan->edges - 1u)));
+    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_set(pio_y, 0));
+    ack_arm_outstanding = true;
+    ack_allow_sent = false;
+}
+
+// Set Y only while the pulse instruction is still ahead.  A late allow in the
+// gap is harmless; one after set pins is not.
+static void ack_allow(void) {
+    // SMx_ADDR is the absolute instruction address, not the offset within
+    // can_ack.  Release and the dominant drive are past the point where
+    // setting Y can still allow this slot.
+    if (!can_ack_allow_pc(tx_pio->sm[tx_sm].addr, tx_offset))
+        return;
+    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_set(pio_y, 1));
+    ack_allow_sent = true;
+}
+
+// Called after every pair push (and after a quiet-tail advance).  It computes
+// the plan once per frame at the CRC start, arms the helper, and lets it fire
+// only when the receive parser reports a CRC match.
+static void ack_on_push(void) {
+    uint32_t rel;
+    uint8_t pad;
+
+    if (!tx_initialized || !ack_image_loaded || tx_active)
+        return;
+
+    if (edge_sm.frame_seq != ack_frame_seq) {
+        ack_frame_seq = edge_sm.frame_seq;
+        ack_frame_handled = false;
+        ack_arm_outstanding = false;
+        ack_allow_sent = false;
+    }
+
+    if (edge_sm.in_frame && edge_sm.crc_started && !ack_frame_handled) {
+        ack_frame_handled = true;
+        rel = (edge_sm.last_edge_raw >= edge_sm.crc_raw_start)
+                  ? edge_sm.last_edge_raw - edge_sm.crc_raw_start
+                  : 0u;
+        ack_plan = can_ack_plan(edge_sm.crc_calc, edge_sm.crc_run_start,
+                                edge_sm.crc_last_start, rel);
+        pad = gpio_get(tx_rx_gpio) ? 1u : 0u;
+        if (ack_plan.ok && pad == ack_plan.level) {
+            ack_arm(&ack_plan);
+        } else if (ack_plan.ok) {
+            // The first CRC edge may be about to arrive.  Spin for at most
+            // two bit times; if the pad reaches the planned level, the
+            // helper has already followed that edge and the remaining edge
+            // count is the plan's.
+            uint32_t limit = 2u * ack_bit_us();
+            uint32_t start = time_us_32();
+            uint8_t old = pad;
+            while ((gpio_get(tx_rx_gpio) ? 1u : 0u) == old &&
+                   (uint32_t)(time_us_32() - start) < limit)
+                ;
+            pad = gpio_get(tx_rx_gpio) ? 1u : 0u;
+            if (pad == ack_plan.level)
+                ack_arm(&ack_plan);
+        }
+    }
+
+    if (edge_sm.in_frame && edge_sm.crc_match && ack_arm_outstanding &&
+        !ack_allow_sent)
+        ack_allow();
+
+    if (edge_sm.validity == INVALID_CRC || edge_sm.validity == INVALID_STUFF) {
+        if (ack_arm_outstanding) {
+            pio_sm_exec_wait_blocking(tx_pio, tx_sm,
+                                      pio_encode_set(pio_y, 0));
+            ack_arm_outstanding = false;
+        }
+    }
+}
+
+// Reload the helper after this node's own transmit, or restart the follow
+// loop after a completed ACK slot.  Called from the ISR and the polling path.
+static void ack_service(void) {
+    if (!tx_initialized)
+        return;
+
+    if (tx_active) {
+        if (!tx_done_seen &&
+            (can2040_lite_pico_tx_done_pending() ||
+             can2040_lite_pico_tx_error_pending()))
+            tx_done_seen = true;
+        if (tx_done_seen && can_edge_sm_past_ack_slot(&edge_sm)) {
+            tx_active = false;
+            ack_start_follow();
+        }
+        return;
+    }
+
+    if (ack_image_loaded &&
+        can_ack_release_pc(tx_pio->sm[tx_sm].addr, tx_offset) &&
+        can_edge_sm_past_ack_slot(&edge_sm))
+        ack_start_follow();
+}
+
 // Drain every captured edge, then let the quiet tail advance to now so a
 // recessive CRC/ACK/EOF tail can finish without a further edge.
 static void rx_service(struct can2040_lite *cd) {
@@ -293,6 +522,7 @@ static void rx_service(struct can2040_lite *cd) {
 
         rx_last_us = time_us_32();
         can_edge_pair_push(&edge_pair, word);
+        ack_on_push();
         while (rx_take(&p)) {
             rx_store(&p);
             rx_dispatch(&p, cd);
@@ -300,10 +530,12 @@ static void rx_service(struct can2040_lite *cd) {
     }
 
     can_edge_sm_time(&edge_sm, rx_estimate_now());
+    ack_on_push();
     while (rx_take(&p)) {
         rx_store(&p);
         rx_dispatch(&p, cd);
     }
+    ack_service();
 }
 
 static void can2040_lite_pico_rx_isr(void) {
@@ -330,6 +562,10 @@ extern "C" void can2040_lite_pico_rx_arm(void) {
     pio_sm_init(rx_pio, rx_sm, rx_offset, &rx_cfg);
     pio_sm_set_enabled(rx_pio, rx_sm, true);
     irq_set_enabled(rx_irq_num, true);
+
+    // The helper follows only while this node is not transmitting.
+    if (!tx_active)
+        ack_start_follow();
 }
 
 extern "C" int can2040_lite_pico_rx_wait(uint32_t timeout_ms) {
@@ -349,6 +585,8 @@ extern "C" int can2040_lite_pico_rx_wait(uint32_t timeout_ms) {
             if (got)
                 rx_store(&p);
             restore_interrupts(save);
+            ack_on_push();
+            ack_service();
             if (got) {
                 rx_dispatch(&p, rx_driver);
                 break;
@@ -469,9 +707,11 @@ extern "C" uint32_t can2040_lite_pico_rx_bits(uint8_t *bits,
 }
 
 extern "C" void can2040_lite_pico_tx_set_readback_gpio(uint32_t gpio) {
+    tx_rx_gpio = gpio;
     pio_gpio_init(tx_pio, gpio);
     pio_sm_set_jmp_pin(tx_pio, tx_sm, gpio);
     sm_config_set_jmp_pin(&tx_cfg, gpio);
+    sm_config_set_jmp_pin(&ack_cfg, gpio);
 }
 
 extern "C" int can2040_lite_pico_tx_done_pending(void) {
@@ -508,6 +748,12 @@ extern "C" void can2040_lite_pico_tx_frame(const uint8_t *bits,
     // Count word plus the autopull pad occupy two FIFO entries.
     if (!bits || nbits == 0 || words + 2u > CAN_TX_FIFO_WORDS)
         return;
+
+    // An in-flight receive is NACKed: force the pad recessive, swap in the
+    // TX image, then run the normal transmit path.
+    ack_abort_for_tx();
+    tx_active = true;
+    tx_done_seen = false;
 
     // Halt the SM, clear the FIFOs/shift counters and point it at `reload`.
     // Restart leaves the OSR shift count at 32 (empty), so the pull below

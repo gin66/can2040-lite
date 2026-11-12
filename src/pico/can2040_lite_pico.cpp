@@ -10,10 +10,10 @@
 // programs are 7 + 14 = 21 instructions, inside the 29-word budget that
 // leaves 2 words for the FreeRTOS cycle counter SM.
 //
-// RX uses rx_pair.pio (edge pairs, 7 words) with a FIFO-not-empty IRQ.  Each
-// word holds the 16-bit timestamps of a 1->0 edge and the following 0->1 edge;
-// can_edge_pair_push() turns them into per-edge pushes for can_edge_sm.  The
-// application installs the PIO IRQ handler and calls
+// RX uses the runtime pair-capture program (edge pairs, 7 words) with a
+// FIFO-not-empty IRQ.  Each word holds the 16-bit timestamps of a 1->0 edge
+// and the following 0->1 edge; can_edge_pair_push() turns them into per-edge
+// pushes for can_edge_sm.  The application installs the PIO IRQ handler and calls
 // can2040_lite_pio_irq_handler(); this backend exposes the hardware through
 // the portable ops table, whose poll() reports a finished TX and then the
 // parsed frames.  The portable handler owns dispatch and statistics.
@@ -31,16 +31,14 @@
 #include "can2040_lite.h"    // full struct can2040_lite definition
 #include "can2040_lite_proto.h"
 #include "can_edge_sm.h"
+#include "can_pio_program.h"
 #include "can_pio_reloc.h"
-#include "ack.pio.h"
-#include "rx_pair.pio.h"
-#include "tx.pio.h"
 // TX is exactly 32 PIO cycles per bit; autopull refills the OSR for free so
 // there is no word-boundary jitter.  RX counts two-cycle ticks in X, so the
 // divider and ticks_per_bit are chosen together to make that count exact.
 static const float tx_clk_mult = 32.0f;
 
-// rx_pair.pio's capture path runs two cycles with no `jmp x--`, so each
+// The pair capture path runs two cycles with no `jmp x--`, so each
 // inter-edge gap measures one tick short.  The pair decoder adds this back.
 static const uint32_t rx_pair_bias = 1;
 
@@ -54,12 +52,16 @@ static const uint CAN_TX_ERR_IRQ = 7;
 // A worst-case classic message is 6 words, so count + message + pad fit.
 static const uint CAN_TX_FIFO_WORDS = 8;
 
-static_assert(can_rx_pair_program.length + can_tx_program.length <= 29,
+static_assert(CAN_PIO_RX_PAIR_LENGTH + CAN_PIO_TX_LENGTH <= 29,
               "rx_pair + tx PIO programs must fit in 29 words");
-static_assert(can_rx_pair_program.length + can_ack_program.length <= 29,
+#if CAN_ACK_GENERATION_SUPPORT
+static_assert(CAN_PIO_ACK_LENGTH <= CAN_PIO_TX_LENGTH,
+              "ack PIO image must fit the TX instruction slot");
+static_assert(CAN_PIO_RX_PAIR_LENGTH + CAN_PIO_ACK_LENGTH <= 29,
               "rx_pair + ack PIO programs must fit in 29 words");
+#endif
 
-// ack.pio addresses are program-relative.  SMx_ADDR is absolute; add
+// ACK image addresses are program-relative.  SMx_ADDR is absolute; add
 // tx_offset before comparing.  See can_pio_reloc.h.
 
 // The ACK image is clocked like TX.  The plan's gap is whole bit times; the
@@ -79,20 +81,26 @@ static uint tx_gpio;
 static uint tx_rx_gpio;
 static pio_sm_config rx_cfg;
 static pio_sm_config tx_cfg;
+#if CAN_ACK_GENERATION_SUPPORT
 static pio_sm_config ack_cfg;
+#endif
 static bool tx_initialized;
 
 // ACK helper state.  The helper is resident on the TX instruction slot while
 // this node is not transmitting.  It follows the RX pad and fires only after
 // the receive parser allows it.
+#if CAN_ACK_GENERATION_SUPPORT
 static bool ack_image_loaded;
 static bool ack_arm_outstanding;
 static bool ack_allow_sent;
 static bool ack_frame_handled;
 static uint32_t ack_frame_seq;
 static can_ack_plan_t ack_plan;
+#endif
 static bool tx_active;
+#if CAN_ACK_GENERATION_SUPPORT
 static bool tx_done_seen;
+#endif
 static bool tx_finished_reported;
 
 // Edge state machine — processes FIFO words from the RX SM.
@@ -123,12 +131,27 @@ static uint ev_tail;
 
 extern "C" int can2040_lite_pico_tx_done_pending(void);
 extern "C" int can2040_lite_pico_tx_error_pending(void);
+#if CAN_ACK_GENERATION_SUPPORT
 static void ack_start_follow(void);
 static void ack_abort_for_tx(void);
+#endif
 static void pico_service_events(void);
 
 static float clkdiv_for(uint32_t bitrate, float mult) {
     return (float)clock_get_hz(clk_sys) / (mult * (float)bitrate);
+}
+
+static pio_program_t pio_program_of(const can_pio_program_t *p) {
+    pio_program_t prog = {};
+
+    prog.instructions = p->code;
+    prog.length = p->length;
+    prog.origin = -1;
+    prog.pio_version = 0;
+#if PICO_PIO_VERSION > 0
+    prog.used_gpio_ranges = 0;
+#endif
+    return prog;
 }
 
 // Choose a divider and a whole number of two-cycle ticks per bit.  The PIO
@@ -153,6 +176,8 @@ static bool rx_clock_config(uint32_t bitrate, uint32_t *ticks,
 }
 
 extern "C" int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
+    const can_pio_program_t *prog = can_pio_rx_pair_program();
+    pio_program_t pio_prog = pio_program_of(prog);
     int sm;
     int off;
 
@@ -163,7 +188,7 @@ extern "C" int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
         return -1;
     }
     rx_sm = (uint)sm;
-    off = pio_add_program(rx_pio, &can_rx_pair_program);
+    off = pio_add_program(rx_pio, &pio_prog);
     if (off < 0) {
         Serial.println("rx init: no program space");
         return -1;
@@ -179,7 +204,9 @@ extern "C" int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
 
     // Edge-pair RX: shift-left with autopush at 32 bits.  One FIFO word is
     // (time[1->0] << 16) | time[0->1], each the low 16 bits of X at the edge.
-    rx_cfg = can_rx_pair_program_get_default_config(rx_offset);
+    rx_cfg = pio_get_default_sm_config();
+    sm_config_set_wrap(&rx_cfg, rx_offset + prog->wrap_target,
+                       rx_offset + prog->wrap);
     sm_config_set_in_pins(&rx_cfg, gpio);
     sm_config_set_jmp_pin(&rx_cfg, gpio);
     sm_config_set_in_shift(&rx_cfg, false, true, 32); // shift left, autopush at 32
@@ -217,6 +244,8 @@ extern "C" int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
 
 extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
                                          uint32_t bitrate) {
+    const can_pio_program_t *prog = can_pio_tx_program();
+    pio_program_t pio_prog = pio_program_of(prog);
     int sm;
     int off;
 
@@ -227,7 +256,7 @@ extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
         return -1;
     }
     tx_sm = (uint)sm;
-    off = pio_add_program(tx_pio, &can_tx_program);
+    off = pio_add_program(tx_pio, &pio_prog);
     if (off < 0) {
         Serial.println("tx init: no program space");
         return -1;
@@ -237,7 +266,9 @@ extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
     pio_interrupt_clear(tx_pio, CAN_TX_DONE_IRQ);
     pio_interrupt_clear(tx_pio, CAN_TX_ERR_IRQ);
 
-    tx_cfg = can_tx_program_get_default_config(tx_offset);
+    tx_cfg = pio_get_default_sm_config();
+    sm_config_set_wrap(&tx_cfg, tx_offset + prog->wrap_target,
+                       tx_offset + prog->wrap);
     sm_config_set_out_pins(&tx_cfg, gpio, 1);
     sm_config_set_set_pins(&tx_cfg, gpio, 1);
     sm_config_set_jmp_pin(&tx_cfg, gpio_rx);
@@ -245,16 +276,24 @@ extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
     sm_config_set_fifo_join(&tx_cfg, PIO_FIFO_JOIN_TX); // 8-deep TX FIFO
     sm_config_set_clkdiv(&tx_cfg, clkdiv_for(bitrate, tx_clk_mult));
 
+    tx_rx_gpio = gpio_rx;
+#if CAN_ACK_GENERATION_SUPPORT
     // The ACK image shares the TX slot.  It follows the RX pad and uses the
     // same SET/OUT and clock settings; only the pull is manual.
-    tx_rx_gpio = gpio_rx;
-    ack_cfg = can_ack_program_get_default_config(tx_offset);
+    {
+        const can_pio_program_t *ack = can_pio_ack_program();
+
+        ack_cfg = pio_get_default_sm_config();
+        sm_config_set_wrap(&ack_cfg, tx_offset + ack->wrap_target,
+                           tx_offset + ack->wrap);
+    }
     sm_config_set_out_pins(&ack_cfg, gpio, 1);
     sm_config_set_set_pins(&ack_cfg, gpio, 1);
     sm_config_set_jmp_pin(&ack_cfg, gpio_rx);
     sm_config_set_out_shift(&ack_cfg, false, false, 32); // manual pull
     sm_config_set_fifo_join(&ack_cfg, PIO_FIFO_JOIN_TX);
     sm_config_set_clkdiv(&ack_cfg, clkdiv_for(bitrate, tx_clk_mult));
+#endif
 
     pio_gpio_init(tx_pio, gpio);
     if (gpio_rx != gpio)
@@ -275,9 +314,11 @@ extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
 
     tx_initialized = true;
     tx_active = false;
+#if CAN_ACK_GENERATION_SUPPORT
     tx_done_seen = false;
     ack_image_loaded = false;
     ack_start_follow();                       // receive helper at idle
+#endif
     return 0;
 }
 
@@ -332,6 +373,7 @@ static uint32_t rx_estimate_now(void) {
 // Copy one image into the fixed TX instruction slot.  The caller has already
 // disabled the SM.  JMP targets in the assembled arrays are relative to
 // origin 0; relocate them the same way pio_add_program does.
+#if CAN_ACK_GENERATION_SUPPORT
 static void ack_copy_image(const uint16_t *insns, uint len) {
     for (uint i = 0; i < len; i++)
         tx_pio->instr_mem[tx_offset + i] =
@@ -351,7 +393,9 @@ static void ack_start_follow(void) {
     save = save_and_disable_interrupts();
     pio_sm_set_enabled(tx_pio, tx_sm, false);
     if (!ack_image_loaded) {
-        ack_copy_image(can_ack_program_instructions, can_ack_program.length);
+        const can_pio_program_t *ack = can_pio_ack_program();
+
+        ack_copy_image(ack->code, ack->length);
         ack_image_loaded = true;
     }
 
@@ -384,10 +428,12 @@ static void ack_abort_for_tx(void) {
         return;
     save = save_and_disable_interrupts();
     if (ack_image_loaded) {
+        const can_pio_program_t *tx = can_pio_tx_program();
+
         pio_sm_exec_wait_blocking(tx_pio, tx_sm,
                                   pio_encode_set(pio_pins, 1));
         pio_sm_set_enabled(tx_pio, tx_sm, false);
-        ack_copy_image(can_tx_program_instructions, can_tx_program.length);
+        ack_copy_image(tx->code, tx->length);
         ack_image_loaded = false;
     }
     ack_arm_outstanding = false;
@@ -508,6 +554,7 @@ static void ack_service(void) {
         can_edge_sm_past_ack_slot(&edge_sm))
         ack_start_follow();
 }
+#endif // CAN_ACK_GENERATION_SUPPORT
 
 // Report a finished TX from the PIO flags, then every parsed frame.  The
 // portable handler calls this through poll() so there is one reporting path.
@@ -529,7 +576,11 @@ static void pico_service_events(void) {
             push_event(&ev);
             can2040_lite_pico_tx_clear_status();
             tx_finished_reported = true;
+#if CAN_ACK_GENERATION_SUPPORT
             tx_done_seen = true;
+#else
+            tx_active = false;
+#endif
         }
     }
 
@@ -538,7 +589,9 @@ static void pico_service_events(void) {
 
         rx_last_us = time_us_32();
         can_edge_pair_push(&edge_pair, word);
+#if CAN_ACK_GENERATION_SUPPORT
         ack_on_push();
+#endif
         while (rx_take(&p)) {
             rx_store(&p);
             memset(&ev, 0, sizeof(ev));
@@ -549,7 +602,9 @@ static void pico_service_events(void) {
     }
 
     can_edge_sm_time(&edge_sm, rx_estimate_now());
+#if CAN_ACK_GENERATION_SUPPORT
     ack_on_push();
+#endif
     while (rx_take(&p)) {
         rx_store(&p);
         memset(&ev, 0, sizeof(ev));
@@ -557,7 +612,9 @@ static void pico_service_events(void) {
         ev.rx = p;
         push_event(&ev);
     }
+#if CAN_ACK_GENERATION_SUPPORT
     ack_service();
+#endif
 }
 
 static int pico_poll(struct can2040_lite_event *ev) {
@@ -589,8 +646,10 @@ extern "C" void can2040_lite_pico_rx_arm(void) {
     irq_set_enabled(rx_irq_num, true);
 
     // The helper follows only while this node is not transmitting.
+#if CAN_ACK_GENERATION_SUPPORT
     if (!tx_active)
         ack_start_follow();
+#endif
 }
 
 extern "C" int can2040_lite_pico_rx_wait(uint32_t timeout_ms) {
@@ -723,7 +782,9 @@ extern "C" void can2040_lite_pico_tx_set_readback_gpio(uint32_t gpio) {
     pio_gpio_init(tx_pio, gpio);
     pio_sm_set_jmp_pin(tx_pio, tx_sm, gpio);
     sm_config_set_jmp_pin(&tx_cfg, gpio);
+#if CAN_ACK_GENERATION_SUPPORT
     sm_config_set_jmp_pin(&ack_cfg, gpio);
+#endif
 }
 
 extern "C" int can2040_lite_pico_tx_done_pending(void) {
@@ -770,23 +831,29 @@ static int pico_hw_start(struct can2040_lite *cd, uint32_t sys_clock,
 static void pico_hw_stop(struct can2040_lite *cd) {
     (void)cd;
     if (rx_initialized) {
+        pio_program_t prog = pio_program_of(can_pio_rx_pair_program());
+
         pio_sm_set_enabled(rx_pio, rx_sm, false);
         pio_set_irq0_source_enabled(
             rx_pio,
             (pio_interrupt_source_t)(pis_sm0_rx_fifo_not_empty + rx_sm),
             false);
         pio_sm_unclaim(rx_pio, rx_sm);
-        pio_remove_program(rx_pio, &can_rx_pair_program, rx_offset);
+        pio_remove_program(rx_pio, &prog, rx_offset);
         rx_initialized = false;
     }
     if (tx_initialized) {
+        pio_program_t prog = pio_program_of(can_pio_tx_program());
+
         pio_sm_set_enabled(tx_pio, tx_sm, false);
         pio_set_irq0_source_enabled(tx_pio, pis_interrupt6, false);
         pio_set_irq0_source_enabled(tx_pio, pis_interrupt7, false);
         pio_sm_unclaim(tx_pio, tx_sm);
-        pio_remove_program(tx_pio, &can_tx_program, tx_offset);
+        pio_remove_program(tx_pio, &prog, tx_offset);
         tx_initialized = false;
+#if CAN_ACK_GENERATION_SUPPORT
         ack_image_loaded = false;
+#endif
         tx_active = false;
         tx_finished_reported = false;
     }
@@ -817,6 +884,7 @@ extern "C" void can2040_lite_critical_exit(uint32_t token) {
 // joined FIFO holds the remaining words.  Returns 0 if the SM accepted it.
 extern "C" int can2040_lite_pico_tx_frame(const uint8_t *bits,
                                           uint32_t nbits) {
+    const can_pio_program_t *tx = can_pio_tx_program();
     uint32_t words = (nbits + 31u) / 32u;
 
     // Count word plus the autopull pad occupy two FIFO entries.
@@ -825,18 +893,22 @@ extern "C" int can2040_lite_pico_tx_frame(const uint8_t *bits,
 
     // An in-flight receive is NACKed: force the pad recessive, swap in the
     // TX image, then run the normal transmit path.
+#if CAN_ACK_GENERATION_SUPPORT
     ack_abort_for_tx();
+#endif
     tx_active = true;
+#if CAN_ACK_GENERATION_SUPPORT
     tx_done_seen = false;
+#endif
     tx_finished_reported = false;
 
     // Halt the SM, clear the FIFOs/shift counters and point it at `reload`.
     // Restart leaves the OSR shift count at 32 (empty), so the pull below
     // is not the autopull no-op that a full OSR would be.  X is set by the
     // first instruction after enable; restart does not clear it.
-    // `can_tx_wrap` is the `set x, 22` that arms the idle count. Enabling the
-    // SM runs it once, then the program wraps to the recessive poll.
-    pio_sm_init(tx_pio, tx_sm, tx_offset + can_tx_wrap, &tx_cfg);
+    // `wrap` is the `set x, 22` that arms the idle count. Enabling the SM
+    // runs it once, then the program wraps to the recessive poll.
+    pio_sm_init(tx_pio, tx_sm, tx_offset + tx->wrap, &tx_cfg);
     pio_sm_set_pins_with_mask(tx_pio, tx_sm, 1u << tx_gpio, 1u << tx_gpio);
 
     // jmp y-- falls through on the bit where Y was already 0, so the count

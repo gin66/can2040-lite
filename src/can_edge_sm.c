@@ -119,6 +119,8 @@ static void accept_unstuffed(can_edge_sm_t *sm, uint8_t bit, uint32_t bit_end) {
     int covered = !sm->header_known || sm->unstuffed < sm->crc_start;
     int last_crc;
 
+    (void)bit_end;
+#if CAN_ACK_GENERATION_SUPPORT
     // The first CRC bit is at unstuffed index crc_start.  Remember the
     // stuffer state and the raw wire index there for the ACK schedule.
     if (sm->header_known && !sm->crc_started &&
@@ -128,6 +130,7 @@ static void accept_unstuffed(can_edge_sm_t *sm, uint8_t bit, uint32_t bit_end) {
         sm->crc_run_start = (uint8_t)sm->run;
         sm->crc_last_start = sm->last;
     }
+#endif
 
     if (covered)
         crc_bit(sm, bit);
@@ -162,12 +165,14 @@ static void accept_unstuffed(can_edge_sm_t *sm, uint8_t bit, uint32_t bit_end) {
 
     // The ACK slot is the bit after the delimiter.  A 5-run still owes
     // its stuff bit before that delimiter.
+#if CAN_ACK_GENERATION_SUPPORT
     {
         uint32_t ahead = (sm->run == 5) ? 2u : 1u;
         sm->ack_armed = 1;
         sm->ack_arm_time =
             (bit_end - ahead * sm->ticks_per_bit) & CAN_EDGE_TIME_MASK;
     }
+#endif
     if (sm->run == 5)
         sm->need_stuff = 1;
     else
@@ -285,13 +290,17 @@ static void advance_to(can_edge_sm_t *sm, uint32_t now) {
 
 static void start_frame(can_edge_sm_t *sm, uint32_t time) {
     uint32_t ticks = sm->ticks_per_bit;
+#if CAN_ACK_GENERATION_SUPPORT
     uint32_t seq = sm->frame_seq + 1u;
+#endif
     uint8_t keep_ready = sm->frame_ready;
     can_parsed_t keep_parsed = sm->parsed;
     frame_validity_t keep_validity = sm->validity;
 
     memset(sm, 0, sizeof(*sm));
+#if CAN_ACK_GENERATION_SUPPORT
     sm->frame_seq = seq;
+#endif
     sm->ticks_per_bit = ticks;
     sm->mark = time & CAN_EDGE_TIME_MASK;
     sm->level = 0;
@@ -337,7 +346,9 @@ void can_edge_sm_push(can_edge_sm_t *sm, uint32_t word) {
     was_in_frame = 1;
     advance_to(sm, time);
     if (sm->in_frame) {
+#if CAN_ACK_GENERATION_SUPPORT
         sm->last_edge_raw = sm->raw_bits;
+#endif
         sm->level = new_level;
         return;
     }
@@ -380,6 +391,7 @@ void can_edge_pair_push(can_edge_pair_t *pair, uint32_t word) {
     pair_push(pair, (uint16_t)word, 1);
 }
 
+#if CAN_ACK_GENERATION_SUPPORT
 uint8_t can_edge_sm_past_ack_slot(const can_edge_sm_t *sm) {
     return (uint8_t)(!sm->in_frame || sm->ack_seen);
 }
@@ -447,3 +459,4 @@ can_ack_plan_t can_ack_plan(uint16_t crc, uint8_t run, uint8_t last,
 
     return plan;
 }
+#endif // CAN_ACK_GENERATION_SUPPORT

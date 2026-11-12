@@ -172,8 +172,8 @@ can2040-lite/
 │   ├── can2040.h                # Source-compatible can2040 aliases
 │   └── pico/
 │       ├── can2040_lite_pico.cpp/.h  # PIO/DMA backend
-│       ├── rx_pair.pio, tx.pio       # Live PIO programs (7 + 14 words)
-│       ├── ack.pio                   # ACK helper overlay (13 words)
+│       ├── can_pio_program.c/.h      # Runtime PIO images (7 + 14 words)
+│       ├── can_pio_reloc.h           # TX/ACK image relocation helpers
 │       └── rx.pio                    # Legacy 32x oversampled RX (7 words)
 └── extras/
     ├── tests/
@@ -236,9 +236,9 @@ Options:
 - [x] PIO RX and one-shot full-message TX: 7 + 14 = 21 instructions, inside
       the 29-word budget.  The 32x oversampler remains as `rx.pio`.
       The current TX program is not tested on hardware.
-- [x] Edge-pair RX program (`rx_pair.pio`, 7 words, two edges per FIFO word)
-      wired to the FIFO-not-empty IRQ, with a host-tested pair decoder feeding
-      the ISR state machine.  Not tested on hardware.
+- [x] Edge-pair RX program (`can_pio_program.c`, 7 words, two edges per FIFO
+      word) wired to the FIFO-not-empty IRQ, with a host-tested pair decoder
+      feeding the ISR state machine.  Not tested on hardware.
 - [x] TX/RX loopback with ACK and NACK readback
 - [x] Saleae verification at 125k, 500k and 1M; back-to-back frames (18-bit gap)
 

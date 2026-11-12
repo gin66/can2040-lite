@@ -16,7 +16,7 @@
 
 #include <stdint.h>
 
-// ack.pio, program-relative.  SMx_ADDR is the absolute PC, so compare
+// ACK image, program-relative.  SMx_ADDR is the absolute PC, so compare
 // addr - origin against these.
 #define CAN_ACK_PC_RELEASE  0u
 #define CAN_ACK_PC_SET_PINS 11u

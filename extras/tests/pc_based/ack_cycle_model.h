@@ -4,12 +4,13 @@
 // CAN2040-Lite is derived from can2040 (Copyright (C) 2021 Kevin O'Connor),
 // licensed under GPL-3.0-only. See LICENSE for the full license text.
 //
-// ack_cycle_model.h — cycle model for src/pico/ack.pio.
+// ack_cycle_model.h — cycle model for the ACK PIO image.
 //
 // Header-only so it is part of the same `make test` entry.  The instruction
-// table mirrors ack.pio; the model runs one instruction per cycle, including
-// jmp x-- pre-decrement semantics, delay slots, and pio_sm_exec as one stolen
-// cycle that replaces the instruction the SM would have run.
+// table mirrors can_pio_ack_program(); the model runs one instruction per
+// cycle, including jmp x-- pre-decrement semantics, delay slots, and
+// pio_sm_exec as one stolen cycle that replaces the instruction the SM would
+// have run.
 
 #ifndef ACK_CYCLE_MODEL_H
 #define ACK_CYCLE_MODEL_H
@@ -37,7 +38,7 @@ typedef struct {
     uint8_t value;
 } ack_insn_t;
 
-// Mirrors the pioasm output for ack.pio.  13 words, 32 cycles per bit.
+// Mirrors can_pio_ack_program().  13 words, 32 cycles per bit.
 static const ack_insn_t ack_program_model[] = {
     {ACK_I_SET_PINS,    0,  0,  1}, //  0 release: set pins, 1
     {ACK_I_JMP_PIN,     1,  0,  0}, //  1 high: jmp pin, high

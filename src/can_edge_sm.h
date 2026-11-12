@@ -6,11 +6,11 @@
 //
 // can_edge_sm.h — ISR state machine for the edge-timestamp CAN receiver.
 //
-// Portable: no PIO dependency.  The live firmware feeds it from rx_pair.pio
-// through can_edge_pair_push().  This machine is what makes a one-bit ACK
-// possible.  It is not wired to a pin, and it does not drive one.  A node must
-// not ACK a frame it is transmitting; crc_match and the observed ACK slot are
-// separate so the caller can tell those cases apart.
+// Portable: no PIO dependency.  The live firmware feeds it from the pair
+// capture program through can_edge_pair_push().  This machine is what makes
+// a one-bit ACK possible.  It is not wired to a pin, and it does not drive
+// one.  A node must not ACK a frame it is transmitting; crc_match and the
+// observed ACK slot are separate so the caller can tell those cases apart.
 //
 // can_edge_sm_push() takes one edge:
 //   bits[31:1] = modulo-2^31 down-counter value at the edge
@@ -44,6 +44,7 @@
 
 #include <stdint.h>
 
+#include "can2040_lite_config.h"
 #include "can2040_lite_proto.h"
 
 #ifdef __cplusplus
@@ -62,7 +63,9 @@ typedef struct {
     uint32_t ticks_per_bit;
 
     // Running capture.  mark/accum/level are the bit clock.
+#if CAN_ACK_GENERATION_SUPPORT
     uint32_t frame_seq;         // incremented at every SOF
+#endif
     uint32_t mark;
     uint32_t accum;
     uint8_t level;
@@ -79,12 +82,16 @@ typedef struct {
     uint32_t unstuffed;
     uint32_t crc_start;
     uint32_t raw_bits;
+#if CAN_ACK_GENERATION_SUPPORT
     uint32_t last_edge_raw;     // raw wire index of the bit at the last edge
+#endif
     uint32_t stuffed_raw;
+#if CAN_ACK_GENERATION_SUPPORT
     uint32_t crc_raw_start;     // raw wire index of the first CRC bit
     uint8_t crc_run_start;      // stuffer state entering the CRC field
     uint8_t crc_last_start;
     uint8_t crc_started;
+#endif
     uint8_t header_known;
     uint8_t is_ext;
     uint8_t is_rtr;
@@ -97,8 +104,10 @@ typedef struct {
 
     // Outputs.  Meaningful when the corresponding flag is set.
     uint8_t crc_match;          // 15 CRC bits are in and match crc_calc
+#if CAN_ACK_GENERATION_SUPPORT
     uint8_t ack_armed;          // crc_match; ACK slot starts at ack_arm_time
     uint32_t ack_arm_time;
+#endif
     uint8_t ack_seen;
     uint8_t ack;                // 1 = ACK slot was dominant
     uint8_t frame_ready;
@@ -114,7 +123,7 @@ void can_edge_sm_push(can_edge_sm_t *sm, uint32_t word);
 // Advance a quiet bus to this down-counter value.  No new edge.
 void can_edge_sm_time(can_edge_sm_t *sm, uint32_t now);
 
-// Reassembles can_rx_pair.pio words into single-edge pushes.  Each FIFO word
+// Reassembles pair-capture words into single-edge pushes.  Each FIFO word
 // carries a 1→0 timestamp in bits[31:16] and the following 0→1 timestamp in
 // bits[15:0], both the low 16 bits of the PIO's two-cycle down-counter.
 //
@@ -126,7 +135,8 @@ void can_edge_sm_time(can_edge_sm_t *sm, uint32_t now);
 //
 // `bias` is added to every inter-edge distance.  The capture program's edge
 // path skips one counter decrement, so each gap measures one tick short;
-// pass 1 for rx_pair.pio.  A source with an ideal free-running clock passes 0.
+// pass 1 for the pair capture.  A source with an ideal free-running clock
+// passes 0.
 typedef struct {
     can_edge_sm_t *sm;
     uint32_t time;      // 31-bit down-counter value at the last edge
@@ -139,6 +149,7 @@ void can_edge_pair_init(can_edge_pair_t *pair, can_edge_sm_t *sm,
                         uint32_t now, uint32_t bias);
 void can_edge_pair_push(can_edge_pair_t *pair, uint32_t word);
 
+#if CAN_ACK_GENERATION_SUPPORT
 // ACK schedule for the expected CRC field.  Pure: no PIO types, no state.
 //
 // `crc` is the 15 expected CRC bits, MSB first on the wire.  `run`/`last` are
@@ -171,6 +182,7 @@ can_ack_plan_t can_ack_plan(uint16_t crc, uint8_t run, uint8_t last,
 // True once the parser has finished the ACK slot (or the frame ended).  The
 // ACK helper may restart its follow loop only after this.
 uint8_t can_edge_sm_past_ack_slot(const can_edge_sm_t *sm);
+#endif // CAN_ACK_GENERATION_SUPPORT
 
 #ifdef __cplusplus
 }

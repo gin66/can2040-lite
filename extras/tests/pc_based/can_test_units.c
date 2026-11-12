@@ -21,12 +21,8 @@
 #include "can_frame_build.h"
 #include "ack_cycle_model.h"
 
-// The assembled PIO images address JMP targets as if the program were loaded
-// at 0.  The firmware adds the TX slot origin.  PICO_NO_HARDWARE keeps the
-// generated headers from pulling in the SDK.
-#define PICO_NO_HARDWARE 1
-#include "pico/ack.pio.h"
-#include "pico/tx.pio.h"
+// The PIO images are built at runtime by the portable program builder.
+#include "pico/can_pio_program.h"
 #include "pico/can_pio_reloc.h"
 
 static int g_passed;
@@ -1110,7 +1106,8 @@ static void check_agrees(const uint8_t *bits, uint32_t nbits,
 
 // Feed edges as can_rx_pair words: (t[1->0] << 16) | t[0->1], each the low
 // 16 bits of the PIO's two-cycle counter.  *edge_no models the capture path:
-// every edge leaves X one count high (see rx_pair.pio), so the k-th timestamp
+// every edge leaves X one count high (see can_pio_rx_pair_program()), so the
+// k-th timestamp
 // is ideal + k.  The decoder's bias of 1 puts the gap back.  Appends to an
 // existing decoder, so a second frame can follow the first across an idle gap.
 static void feed_pairs(can_edge_pair_t *pair, can_edge_sm_t *sm,
@@ -1837,7 +1834,7 @@ static void test_ack_plan(void) {
 }
 
 /****************************************************************
- * ACK cycle model (mirrors src/pico/ack.pio)
+ * ACK cycle model (mirrors can_pio_ack_program())
  ****************************************************************/
 
 static uint32_t ack_gap_cycles(uint32_t gap_bits) {
@@ -2093,37 +2090,34 @@ static void check_relocated(const uint16_t *insns, uint32_t n,
 }
 
 static void test_ack_reloc(void) {
-    enum {
-        ACK_N = sizeof(can_ack_program_instructions) /
-                sizeof(can_ack_program_instructions[0]),
-        TX_N = sizeof(can_tx_program_instructions) /
-               sizeof(can_tx_program_instructions[0])
-    };
+    const can_pio_program_t *ack = can_pio_ack_program();
+    const can_pio_program_t *tx = can_pio_tx_program();
+    const uint16_t *ack_insns = ack->code;
+    const uint16_t *tx_insns = tx->code;
+    uint32_t ack_n = ack->length;
+    uint32_t tx_n = tx->length;
     const uint32_t origin = 11; // RX at 25, then TX, in pio_add_program
     uint32_t rel;
 
     printf("\n-- ACK image relocation --\n");
 
     TEST_BEGIN("ack and tx are 13 and 14 words");
-    CHECK(ACK_N == 13u);
-    CHECK(TX_N == 14u);
+    CHECK(ack_n == 13u);
+    CHECK(tx_n == 14u);
     TEST_END();
 
     TEST_BEGIN("origin 0 leaves both images unchanged");
-    check_relocated(can_ack_program_instructions, ACK_N, 0);
-    check_relocated(can_tx_program_instructions, TX_N, 0);
+    check_relocated(ack_insns, ack_n, 0);
+    check_relocated(tx_insns, tx_n, 0);
     TEST_END();
 
     TEST_BEGIN("origin 11 relocates JMP targets and keeps other words");
-    check_relocated(can_ack_program_instructions, ACK_N, origin);
-    check_relocated(can_tx_program_instructions, TX_N, origin);
+    check_relocated(ack_insns, ack_n, origin);
+    check_relocated(tx_insns, tx_n, origin);
     // release (word 0) and the dominant drive (word 11) are the PC checks.
-    CHECK((can_pio_reloc_instr(can_ack_program_instructions[0], origin) >>
-           13) != 0);
-    CHECK((can_pio_reloc_instr(can_ack_program_instructions[12], origin) &
-           31u) == origin);
-    CHECK((can_pio_reloc_instr(can_ack_program_instructions[11], origin) >>
-           13) != 0);
+    CHECK((can_pio_reloc_instr(ack_insns[0], origin) >> 13) != 0);
+    CHECK((can_pio_reloc_instr(ack_insns[12], origin) & 31u) == origin);
+    CHECK((can_pio_reloc_instr(ack_insns[11], origin) >> 13) != 0);
     TEST_END();
 
     TEST_BEGIN("allow and release use absolute SMx_ADDR");
@@ -2133,7 +2127,7 @@ static void test_ack_reloc(void) {
     CHECK(!can_ack_allow_pc(origin - 1u, origin));
     for (rel = 1; rel < CAN_ACK_PC_SET_PINS; rel++)
         CHECK(can_ack_allow_pc(origin + rel, origin));
-    for (rel = CAN_ACK_PC_SET_PINS; rel < ACK_N; rel++)
+    for (rel = CAN_ACK_PC_SET_PINS; rel < ack_n; rel++)
         CHECK(!can_ack_allow_pc(origin + rel, origin));
     CHECK(CAN_ACK_ENTRY_HIGH == 1u);
     CHECK(CAN_ACK_ENTRY_LOW == 4u);

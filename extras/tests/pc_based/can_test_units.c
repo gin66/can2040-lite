@@ -471,6 +471,7 @@ static void test_api_skeleton(void) {
     struct can2040_lite_msg msg;
 
     TEST_BEGIN("API setup/start/transmit/stop");
+    can2040_lite_set_hw(NULL);
     memset(&msg, 0, sizeof(msg));
     can2040_lite_setup(&cd, 0);
     CHECK(can2040_lite_check_transmit(&cd) == 0);
@@ -482,7 +483,10 @@ static void test_api_skeleton(void) {
     msg.dlc = 8;
     CHECK(can2040_lite_transmit(&cd, &msg) == 0);
 
-    msg.dlc = 9;
+    msg.dlc = 9; // accepted: 8 data bytes, wire DLC nibble 9
+    CHECK(can2040_lite_transmit(&cd, &msg) == 0);
+
+    msg.dlc = 16; // rejected
     CHECK(can2040_lite_transmit(&cd, &msg) == -1);
 
     msg.dlc = 0;
@@ -493,10 +497,448 @@ static void test_api_skeleton(void) {
     CHECK(can2040_lite_transmit(&cd, &msg) == 0);
 
     can2040_lite_get_statistics(&cd, &st);
-    CHECK(st.tx_attempt == 2);
+    CHECK(st.tx_attempt == 3);
 
     can2040_lite_stop(&cd);
     CHECK(can2040_lite_check_transmit(&cd) == 0);
+    TEST_END();
+}
+
+/****************************************************************
+ * API transmit queue, packer, and reporting (fake ops table)
+ ****************************************************************/
+
+#define FAKE_MAX 16
+
+static struct can2040_lite_event fake_ev[FAKE_MAX];
+static int fake_ev_head;
+static int fake_ev_tail;
+static uint8_t fake_tx[FAKE_MAX][CAN2040_LITE_MAX_FRAME_BYTES];
+static uint32_t fake_tx_nbits[FAKE_MAX];
+static int fake_tx_count;
+static int fake_start_count;
+static int fake_stop_count;
+
+static int fake_hw_start(struct can2040_lite *cd, uint32_t sys_clock,
+                         uint32_t bitrate, int32_t gpio_rx, int32_t gpio_tx) {
+    (void)cd; (void)sys_clock; (void)bitrate; (void)gpio_rx; (void)gpio_tx;
+    fake_start_count++;
+    return 0;
+}
+
+static void fake_hw_stop(struct can2040_lite *cd) {
+    (void)cd;
+    fake_stop_count++;
+}
+
+static int fake_hw_tx_frame(const uint8_t *bits, uint32_t nbits) {
+    uint32_t i;
+    if (fake_tx_count < FAKE_MAX) {
+        bits_clear(fake_tx[fake_tx_count], CAN2040_LITE_MAX_FRAME_BITS);
+        for (i = 0; i < nbits; i++)
+            bits_put(fake_tx[fake_tx_count], i, bits_get(bits, i));
+        fake_tx_nbits[fake_tx_count] = nbits;
+    }
+    fake_tx_count++;
+    return 0;
+}
+
+static int fake_hw_poll(struct can2040_lite_event *ev) {
+    if (fake_ev_head == fake_ev_tail)
+        return 0;
+    *ev = fake_ev[fake_ev_head];
+    fake_ev_head = (fake_ev_head + 1) % FAKE_MAX;
+    return 1;
+}
+
+static const struct can2040_lite_hw fake_hw = {
+    fake_hw_start, fake_hw_stop, fake_hw_tx_frame, fake_hw_poll
+};
+
+static void fake_reset(void) {
+    fake_ev_head = 0;
+    fake_ev_tail = 0;
+    fake_tx_count = 0;
+    fake_start_count = 0;
+    fake_stop_count = 0;
+    can2040_lite_set_hw(&fake_hw);
+}
+
+static void fake_push_event(const struct can2040_lite_event *ev) {
+    fake_ev[fake_ev_tail] = *ev;
+    fake_ev_tail = (fake_ev_tail + 1) % FAKE_MAX;
+}
+
+static void fake_push_tx_done(int err) {
+    struct can2040_lite_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = 1;
+    ev.tx_error = err;
+    fake_push_event(&ev);
+}
+
+static void frame_from_msg(const struct can2040_lite_msg *m, can_frame_t *f) {
+    memset(f, 0, sizeof(*f));
+    f->id = m->id & 0x1fffffffu;
+    f->dlc = (uint8_t)(m->dlc > 8u ? 8u : m->dlc);
+    if (m->id & CAN2040_LITE_ID_EFF)
+        f->flags |= CAN_FRAME_EXTENDED;
+    if (m->id & CAN2040_LITE_ID_RTR)
+        f->flags |= CAN_FRAME_RTR;
+    memcpy(f->data, m->data, sizeof(f->data));
+}
+
+// Queue a parsed RX event built from a frame.  For INVALID_BIT the parser
+// output is overridden because can_frame_build's bit flip presents as a CRC
+// mismatch to can_frame_decode.
+static void fake_push_rx_frame(const can_frame_t *f, frame_validity_t validity,
+                               int ack) {
+    uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
+    can_build_info_t info;
+    struct can2040_lite_event ev;
+    uint32_t n;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = 2;
+    n = can_frame_build(f, validity, ack, bits, CAN2040_LITE_MAX_FRAME_BITS,
+                        &info);
+    CHECK(n != 0);
+    CHECK(can_frame_decode(bits, n, &ev.rx) != INVALID_STUFF ||
+          validity == INVALID_STUFF);
+    if (validity == INVALID_BIT)
+        ev.rx.validity = INVALID_BIT;
+    else if (validity == INVALID_STUFF)
+        ev.rx.validity = INVALID_STUFF;
+    fake_push_event(&ev);
+}
+
+static int cb_count;
+static uint32_t cb_notify[FAKE_MAX];
+static struct can2040_lite_msg cb_msg[FAKE_MAX];
+static int cb_reenter;
+static int cb_reenter_result;
+static uint32_t cb_reenter_msg_id_after;
+
+static void test_cb(struct can2040_lite *cd, uint32_t notify,
+                    struct can2040_lite_msg *msg) {
+    if (cb_count < FAKE_MAX) {
+        cb_notify[cb_count] = notify;
+        cb_msg[cb_count] = *msg;
+    }
+    cb_count++;
+
+    if (cb_reenter && (notify & CAN2040_LITE_NOTIFY_TX)) {
+        struct can2040_lite_msg m;
+        cb_reenter = 0;
+        memset(&m, 0, sizeof(m));
+        m.id = 0x777;
+        m.dlc = 0;
+        cb_reenter_result = can2040_lite_transmit(cd, &m);
+        cb_reenter_msg_id_after = msg->id;
+    }
+}
+
+static void cb_reset(void) {
+    cb_count = 0;
+    cb_reenter = 0;
+    cb_reenter_result = -1;
+    cb_reenter_msg_id_after = 0;
+    memset(cb_notify, 0, sizeof(cb_notify));
+    memset(cb_msg, 0, sizeof(cb_msg));
+}
+
+static int packed_matches_oracle(const uint8_t *packed, uint32_t nbits,
+                                 const can_frame_t *f, uint32_t *oracle_nbits) {
+    uint8_t oracle[CAN2040_LITE_MAX_FRAME_BYTES];
+    can_build_info_t info;
+    uint32_t n;
+    uint32_t i;
+
+    n = can_frame_build(f, VALID_FRAME, 0, oracle, CAN2040_LITE_MAX_FRAME_BITS,
+                        &info);
+    CHECK(n != 0);
+    *oracle_nbits = info.stuffed_bits + 1u;
+    if (nbits != info.stuffed_bits + 1u)
+        return 0;
+    for (i = 0; i < nbits; i++)
+        if (bits_get(packed, i) != bits_get(oracle, i))
+            return 0;
+    return 1;
+}
+
+static void start_for_test(struct can2040_lite *cd, int32_t gpio_tx) {
+    fake_reset();
+    cb_reset();
+    can2040_lite_setup(cd, 0);
+    can2040_lite_callback_config(cd, test_cb);
+    can2040_lite_start(cd, 120000000u, 500000u, 0, gpio_tx);
+}
+
+static void test_api_queue(void) {
+    struct can2040_lite cd;
+    struct can2040_lite_stats st;
+    struct can2040_lite_msg msg;
+    struct can2040_lite_msg msgs[5];
+    can_frame_t frame;
+    uint8_t un[CAN2040_LITE_MAX_FRAME_BYTES];
+    uint32_t ulen;
+    uint32_t oracle_nbits;
+    uint32_t i;
+    int j;
+
+    printf("\n-- API queue and reports --\n");
+
+    TEST_BEGIN("five transmits queue, fifth rejected, order preserved");
+    start_for_test(&cd, 1);
+    memset(msgs, 0, sizeof(msgs));
+    for (i = 0; i < 5; i++) {
+        msgs[i].id = 0x100u + i;
+        msgs[i].dlc = 1;
+        msgs[i].data[0] = (uint8_t)i;
+    }
+    for (i = 0; i < 4; i++)
+        CHECK(can2040_lite_transmit(&cd, &msgs[i]) == 0);
+    CHECK(can2040_lite_transmit(&cd, &msgs[4]) == -1);
+    CHECK(fake_tx_count == 1); // only the head was handed to the SM
+    CHECK(can2040_lite_check_transmit(&cd) == 0);
+
+    // Complete the first through a matching RX parse with ACK.
+    frame_from_msg(&msgs[0], &frame);
+    fake_push_rx_frame(&frame, VALID_FRAME, 1);
+    can2040_lite_pio_irq_handler(&cd);
+    CHECK(fake_tx_count == 2); // next message started
+    CHECK(can2040_lite_check_transmit(&cd) == 1);
+    CHECK(can2040_lite_transmit(&cd, &msgs[4]) == 0);
+
+    // The fake saw 0x100 then 0x101, in call order.
+    frame_from_msg(&msgs[0], &frame);
+    CHECK(packed_matches_oracle(fake_tx[0], fake_tx_nbits[0], &frame,
+                                &oracle_nbits));
+    frame_from_msg(&msgs[1], &frame);
+    CHECK(packed_matches_oracle(fake_tx[1], fake_tx_nbits[1], &frame,
+                                &oracle_nbits));
+    TEST_END();
+
+    TEST_BEGIN("stop keeps the queue; setup clears it and the statistics");
+    start_for_test(&cd, 1);
+    memset(&msg, 0, sizeof(msg));
+    msg.id = 0x201;
+    CHECK(can2040_lite_transmit(&cd, &msg) == 0);
+    msg.id = 0x202;
+    CHECK(can2040_lite_transmit(&cd, &msg) == 0);
+    can2040_lite_stop(&cd);
+    CHECK(can2040_lite_check_transmit(&cd) == 0);
+    CHECK(fake_stop_count == 1);
+    can2040_lite_start(&cd, 120000000u, 500000u, 0, 1);
+    CHECK(can2040_lite_check_transmit(&cd) == 1); // both still queued
+    CHECK(fake_start_count == 2);
+    CHECK(fake_tx_count == 2); // the head is handed to the SM again
+
+    fake_reset();
+    can2040_lite_setup(&cd, 0);
+    can2040_lite_start(&cd, 120000000u, 500000u, 0, 1);
+    can2040_lite_get_statistics(&cd, &st);
+    CHECK(st.tx_attempt == 0);
+    CHECK(st.tx_total == 0);
+    CHECK(st.rx_total == 0);
+    CHECK(fake_tx_count == 0); // empty queue starts nothing
+    TEST_END();
+
+    TEST_BEGIN("gpio_tx == -1 is receive-only");
+    start_for_test(&cd, -1);
+    memset(&msg, 0, sizeof(msg));
+    msg.id = 0x123;
+    CHECK(can2040_lite_transmit(&cd, &msg) == -1);
+    CHECK(can2040_lite_check_transmit(&cd) == 0);
+    TEST_END();
+
+    TEST_BEGIN("DLC 15 queues with nibble 15 and eight data bytes; 16 rejected");
+    start_for_test(&cd, 1);
+    memset(&msg, 0, sizeof(msg));
+    msg.id = 0x321;
+    msg.dlc = 15;
+    for (i = 0; i < 8; i++)
+        msg.data[i] = (uint8_t)(0xa0u + i);
+    CHECK(can2040_lite_transmit(&cd, &msg) == 0);
+    CHECK(fake_tx_count == 1);
+    ulen = bit_unstuff(fake_tx[0], fake_tx_nbits[0] - 1u, un,
+                       CAN2040_LITE_MAX_FRAME_BITS);
+    CHECK(ulen == 19u + 64u + 15u);
+    CHECK(get_field(un, 15, 4) == 15);
+    for (i = 0; i < 64; i++) {
+        uint8_t want = (uint8_t)((msg.data[i / 8u] >> (7u - (i % 8u))) & 1u);
+        CHECK(bits_get(un, 19u + i) == want);
+    }
+    msg.dlc = 16;
+    CHECK(can2040_lite_transmit(&cd, &msg) == -1);
+    TEST_END();
+
+    TEST_BEGIN("packed bits match the frame builder (std/ext/RTR)");
+    {
+        struct can2040_lite_msg packed_msgs[3];
+        memset(packed_msgs, 0, sizeof(packed_msgs));
+        packed_msgs[0].id = 0x123;
+        packed_msgs[0].dlc = 8;
+        for (i = 0; i < 8; i++)
+            packed_msgs[0].data[i] = (uint8_t)(i * 0x11u);
+        packed_msgs[1].id = CAN2040_LITE_ID_EFF | 0x18febb11u;
+        packed_msgs[1].dlc = 5;
+        for (i = 0; i < 5; i++)
+            packed_msgs[1].data[i] = (uint8_t)(0xf0u + i);
+        packed_msgs[2].id = CAN2040_LITE_ID_RTR | 0x456;
+        packed_msgs[2].dlc = 8;
+        for (j = 0; j < 3; j++) {
+            start_for_test(&cd, 1);
+            CHECK(can2040_lite_transmit(&cd, &packed_msgs[j]) == 0);
+            CHECK(fake_tx_count == 1);
+            frame_from_msg(&packed_msgs[j], &frame);
+            CHECK(packed_matches_oracle(fake_tx[0], fake_tx_nbits[0], &frame,
+                                        &oracle_nbits));
+        }
+    }
+    TEST_END();
+
+    TEST_BEGIN("EFF is bit 31 and RTR is bit 30 in reports");
+    start_for_test(&cd, 1);
+    memset(&msg, 0, sizeof(msg));
+    msg.id = CAN2040_LITE_ID_EFF | 0x18febb11u;
+    msg.dlc = 1;
+    msg.data[0] = 0x5a;
+    CHECK(can2040_lite_transmit(&cd, &msg) == 0);
+    frame_from_msg(&msg, &frame);
+    fake_push_rx_frame(&frame, VALID_FRAME, 1);
+    CHECK(can2040_lite_transmit(&cd, &msg) == 0); // second queues
+    can2040_lite_pio_irq_handler(&cd);
+    CHECK(cb_count == 1);
+    CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_TX);
+    CHECK(cb_msg[0].id & CAN2040_LITE_ID_EFF);
+    CHECK((cb_msg[0].id & CAN2040_LITE_ID_EFF) == (1u << 31));
+
+    cb_reset();
+    memset(&frame, 0, sizeof(frame));
+    frame.id = 0x456;
+    frame.dlc = 0;
+    frame.flags = CAN_FRAME_RTR;
+    fake_push_rx_frame(&frame, VALID_FRAME, 0);
+    can2040_lite_pio_irq_handler(&cd);
+    CHECK(cb_count == 1);
+    CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_RX);
+    CHECK((cb_msg[0].id & CAN2040_LITE_ID_RTR) == (1u << 30));
+    TEST_END();
+
+    TEST_BEGIN("valid RX calls back once and counts rx_total");
+    start_for_test(&cd, 1);
+    memset(&frame, 0, sizeof(frame));
+    frame.id = 0x123;
+    frame.dlc = 2;
+    frame.data[0] = 0xde;
+    frame.data[1] = 0xad;
+    fake_push_rx_frame(&frame, VALID_FRAME, 0);
+    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_get_statistics(&cd, &st);
+    CHECK(cb_count == 1);
+    CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_RX);
+    CHECK(cb_msg[0].id == 0x123);
+    CHECK(cb_msg[0].dlc == 2);
+    CHECK(cb_msg[0].data[0] == 0xde && cb_msg[0].data[1] == 0xad);
+    CHECK(st.rx_total == 1);
+    TEST_END();
+
+    TEST_BEGIN("CRC, stuff and form errors do not call back");
+    start_for_test(&cd, 1);
+    memset(&frame, 0, sizeof(frame));
+    frame.id = 0x123;
+    frame.dlc = 8;
+    for (i = 0; i < 8; i++)
+        frame.data[i] = (uint8_t)i;
+    fake_push_rx_frame(&frame, INVALID_CRC, 0);
+    fake_push_rx_frame(&frame, INVALID_STUFF, 0);
+    fake_push_rx_frame(&frame, INVALID_BIT, 0);
+    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_get_statistics(&cd, &st);
+    CHECK(cb_count == 0);
+    CHECK(st.parse_error == 3);
+    CHECK(st.crc_errors == 1);
+    CHECK(st.stuff_errors == 1);
+    CHECK(st.bit_errors == 1);
+    CHECK(st.rx_total == 0);
+    TEST_END();
+
+    TEST_BEGIN("matching ACK completes TX; NACK does not call back");
+    start_for_test(&cd, 1);
+    memset(&msg, 0, sizeof(msg));
+    msg.id = 0x123;
+    msg.dlc = 8;
+    for (i = 0; i < 8; i++)
+        msg.data[i] = (uint8_t)(0x30u + i);
+    CHECK(can2040_lite_transmit(&cd, &msg) == 0);
+    frame_from_msg(&msg, &frame);
+    fake_push_rx_frame(&frame, VALID_FRAME, 1);
+    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_get_statistics(&cd, &st);
+    CHECK(cb_count == 1);
+    CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_TX);
+    CHECK(cb_msg[0].id == 0x123);
+    CHECK(st.tx_total == 1);
+    CHECK(st.tx_attempt == 1);
+
+    start_for_test(&cd, 1);
+    CHECK(can2040_lite_transmit(&cd, &msg) == 0);
+    fake_push_rx_frame(&frame, VALID_FRAME, 0);
+    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_get_statistics(&cd, &st);
+    CHECK(cb_count == 0);
+    CHECK(st.tx_nack == 1);
+    CHECK(st.parse_error == 1);
+    CHECK(st.tx_attempt == 1 && st.tx_total == 0);
+    TEST_END();
+
+    TEST_BEGIN("tx_error completes the head without a callback");
+    start_for_test(&cd, 1);
+    memset(&msg, 0, sizeof(msg));
+    msg.id = 0x222;
+    CHECK(can2040_lite_transmit(&cd, &msg) == 0);
+    fake_push_tx_done(1);
+    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_get_statistics(&cd, &st);
+    CHECK(cb_count == 0);
+    CHECK(st.tx_error == 1);
+    CHECK(st.parse_error == 1);
+    CHECK(st.tx_total == 0);
+    TEST_END();
+
+    TEST_BEGIN("two RX results before the callback report overflow");
+    start_for_test(&cd, 1);
+    memset(&frame, 0, sizeof(frame));
+    frame.id = 0x111;
+    frame.dlc = 1;
+    fake_push_rx_frame(&frame, VALID_FRAME, 0);
+    frame.id = 0x222;
+    fake_push_rx_frame(&frame, VALID_FRAME, 0);
+    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_get_statistics(&cd, &st);
+    CHECK(cb_count == 2);
+    CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_ERROR);
+    CHECK(cb_msg[0].id == 0);
+    CHECK(cb_notify[1] == CAN2040_LITE_NOTIFY_RX);
+    CHECK(cb_msg[1].id == 0x222);
+    CHECK(st.rx_overflow == 1);
+    CHECK(st.rx_total == 2);
+    TEST_END();
+
+    TEST_BEGIN("callback may transmit; its message pointer stays valid");
+    start_for_test(&cd, 1);
+    memset(&msg, 0, sizeof(msg));
+    msg.id = 0x123;
+    msg.dlc = 3;
+    CHECK(can2040_lite_transmit(&cd, &msg) == 0);
+    frame_from_msg(&msg, &frame);
+    fake_push_rx_frame(&frame, VALID_FRAME, 1);
+    cb_reenter = 1;
+    can2040_lite_pio_irq_handler(&cd);
+    CHECK(cb_reenter_result == 0);
+    CHECK(cb_reenter_msg_id_after == 0x123);
+    CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_TX);
     TEST_END();
 }
 
@@ -1894,6 +2336,7 @@ int main(void) {
     test_invalid_frames();
     test_build_errors();
     test_api_skeleton();
+    test_api_queue();
     test_edge_sm();
     test_ack_plan();
     test_ack_cycle_model();

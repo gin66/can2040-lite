@@ -19,10 +19,6 @@ extern "C" {
 
 struct can2040_lite;
 
-/* Attach the Pico RX IRQ handler to the portable API.  The Pico backend
- * calls this from rx_init() so can2040_lite.c stays Pico-free on the host. */
-void can2040_lite_pico_attach_rx_irq(void (*fn)(struct can2040_lite *));
-
 int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate);
 // gpio is CAN-TX; gpio_rx is the readback (CAN-RX) pin.  They are the same
 // pin in loopback tests and different with a real transceiver.
@@ -30,14 +26,9 @@ int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
                               uint32_t bitrate);
 
 // Re-arm the RX state machine.  The PIO SM polls for SOF; when a frame
-// arrives the IRQ handler feeds edge words to can_edge_sm and dispatches
-// the callback when frame_ready is set.
+// arrives the application's PIO IRQ handler calls
+// can2040_lite_pio_irq_handler(), which drains this backend through poll().
 void can2040_lite_pico_rx_arm(void);
-
-// Called from can2040_lite_pio_irq_handler() to drain the RX FIFO and
-// feed edge words to the state machine.  Accepts the driver pointer
-// so it can update statistics and dispatch the callback.
-void can2040_lite_pico_rx_irq_handler(struct can2040_lite *cd);
 
 // Wait for the next frame to be parsed (sets frame_ready).  Returns 1 on
 // success, 0 on timeout.  Use can2040_lite_pico_rx_get_parsed() to read it.
@@ -61,8 +52,9 @@ uint32_t can2040_lite_pico_rx_bits(uint8_t *bits, uint32_t max_bits);
 // is the ACK slot, the end of frame and the interframe space.  ERR is only a
 // recessive bit read as dominant.  A dominant bit is not a conflict.  DONE
 // means the shift ended.  ACK vs NACK is on the RX capture, not on these
-// IRQs.  Call only when the previous message is finished.
-void can2040_lite_pico_tx_frame(const uint8_t *bits, uint32_t nbits);
+// IRQs.  Call only when the previous message is finished.  Returns 0 if the
+// state machine accepted the message, -1 otherwise.
+int can2040_lite_pico_tx_frame(const uint8_t *bits, uint32_t nbits);
 
 // Change the readback pin used by the TX SM (e.g. to inject bus faults in a
 // test).  Takes effect for the next message.

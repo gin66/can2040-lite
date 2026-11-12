@@ -11,7 +11,10 @@
 #include <Arduino.h>
 #include <string.h>
 
-#include "can2040_lite.h"
+#include <hardware/irq.h>
+#include <hardware/pio.h>
+
+#include "can2040.h"
 #include "can2040_lite_pico.h"
 #include "can2040_lite_proto.h"
 #include "can_frame_build.h"
@@ -100,28 +103,79 @@ static void run_vector(const frame_vector *v) {
 }
 
 
+#ifndef CAN2040_LITE_ENABLE_PIO_LOOPBACK
+#define CAN2040_LITE_ENABLE_PIO_LOOPBACK 0
+#endif
+
+#ifndef CAN2040_LITE_BITRATE
+#define CAN2040_LITE_BITRATE 500000u
+#endif
+
+// CAN-TX and CAN-RX share this pin in loopback tests.
+#define LOOP_GPIO 2
+
+static struct can2040 cbus;
+static volatile uint32_t public_tx_notify;
+static volatile uint32_t public_rx_notify;
+
+static void can2040_app_cb(struct can2040 *cd, uint32_t notify,
+                           struct can2040_msg *msg) {
+    (void)cd;
+    (void)msg;
+    if (notify & CAN2040_NOTIFY_TX)
+        public_tx_notify++;
+    if (notify & CAN2040_NOTIFY_RX)
+        public_rx_notify++;
+}
+
+static void can2040_pio_irq(void) {
+    can2040_pio_irq_handler(&cbus);
+}
+
+// Application entry point, matching the can2040 documented startup sequence.
 static void run_api_smoke() {
-    struct can2040_lite cd;
-    struct can2040_lite_stats st;
-    struct can2040_lite_msg msg;
+    struct can2040_stats st;
+    struct can2040_msg msg;
+    uint32_t start;
     bool ok;
 
     memset(&msg, 0, sizeof(msg));
-    can2040_lite_setup(&cd, 0);
-    can2040_lite_start(&cd, 150000000u, 500000u, 0, 1);
+    public_tx_notify = 0;
+    public_rx_notify = 0;
+
+    can2040_setup(&cbus, 0);
+    can2040_callback_config(&cbus, can2040_app_cb);
+    irq_set_exclusive_handler(PIO0_IRQ_0, can2040_pio_irq);
+    irq_set_enabled(PIO0_IRQ_0, true);
+    can2040_start(&cbus, 150000000u, CAN2040_LITE_BITRATE,
+                  LOOP_GPIO, LOOP_GPIO);
 
     msg.id = 0x123;
     msg.dlc = 8;
-    ok = can2040_lite_check_transmit(&cd) == 1;
-    ok = ok && (can2040_lite_transmit(&cd, &msg) == 0);
+    for (uint32_t i = 0; i < 8; i++)
+        msg.data[i] = (uint8_t)(0x10u + i);
 
-    can2040_lite_get_statistics(&cd, &st);
+    ok = can2040_check_transmit(&cbus) == 1;
+    ok = ok && (can2040_transmit(&cbus, &msg) == 0);
+
+    // A single-pin loopback reads a recessive ACK slot, so NOTIFY_TX only
+    // arrives with a second node.  Stop once the result is in either way.
+    start = millis();
+    while (millis() - start < 50u) {
+        can2040_get_statistics(&cbus, &st);
+        if (public_tx_notify || st.tx_nack || st.tx_error ||
+            st.tx_attempt > st.tx_total)
+            break;
+        delay(1);
+    }
+
+    can2040_get_statistics(&cbus, &st);
     ok = ok && (st.tx_attempt == 1);
-    can2040_lite_stop(&cd);
-    ok = ok && (can2040_lite_check_transmit(&cd) == 0);
+    can2040_stop(&cbus);
+    ok = ok && (can2040_check_transmit(&cbus) == 0);
 
     Serial.printf("  %-18s expected %-13s got %-13s %s\n",
-                  "API skeleton", "usable", "usable", ok ? "PASS" : "FAIL");
+                  "Public API", "usable", "usable", ok ? "PASS" : "FAIL");
     if (ok)
         passed++;
     else
@@ -132,16 +186,8 @@ static void run_api_smoke() {
 /****************************************************************
  * PIO loopback (TX and RX on the same GPIO)
  ****************************************************************/
-#ifndef CAN2040_LITE_ENABLE_PIO_LOOPBACK
-#define CAN2040_LITE_ENABLE_PIO_LOOPBACK 0
-#endif
-
-#ifndef CAN2040_LITE_BITRATE
-#define CAN2040_LITE_BITRATE 500000u
-#endif
 
 #if CAN2040_LITE_ENABLE_PIO_LOOPBACK
-#define LOOP_GPIO 2
 static bool loopback_done;
 static uint8_t g_tx_bits[CAN2040_LITE_MAX_FRAME_BYTES];
 static uint32_t g_tx_total;

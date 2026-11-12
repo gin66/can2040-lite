@@ -29,16 +29,15 @@ cannot share one SM without stalling one direction while the other runs.
 - Standard CAN transceiver (e.g., SN65HVD230, TJA1050)
 - At least one other fully CAN-compliant node on the bus (for arbitration
   and error handling). ACK generation is implemented as the TX-slot helper
-  in `docs/ack_generation.md`; its on-target verification (step 4 of
-  `docs/todo.md`) is still pending.
+  in `docs/ack_generation.md`; its on-target verification is still pending.
 
 ## Restrictions
 
 CAN2040-Lite is **not a full CAN node**. It is a lightweight data-frame
 transceiver. ACK generation is an edge-locked pulse on the TX state machine
-(`docs/ack_generation.md`, work order in `docs/todo.md`); the host-side
-schedule and cycle model pass, while step 4 needs the RP2350 and a logic
-analyzer. It deliberately omits the protocol mechanisms that require
+(`docs/ack_generation.md`); the host-side schedule and cycle model pass,
+while the on-target check needs the RP2350 and a logic analyzer. It
+deliberately omits the protocol mechanisms that require
 real-time error participation:
 
 - **No error-flag generation** — it only observes 6+ dominant bits and reports
@@ -50,9 +49,9 @@ real-time error participation:
   recessive and the bus is dominant. The bit after the CRC is driven and
   not compared; ACK and end of frame are the recessive park. The node does
   not send an error flag.
-- **No RTR support** — remote transmission request frames are not transmitted
-  or acted upon. (The test generator can still emit RTR vectors for negative
-  tests.)
+- **No RTR reply** — an RTR is transmitted and a received RTR is delivered
+  with the RTR flag set. The node does not answer a received RTR with a
+  data frame.
 - **No CAN FD** — classic CAN 2.0B only.
 - **No programmable bit timing** — fixed 32× oversampling; no SJW or
   TSEG1/TSEG2 configuration.
@@ -164,13 +163,13 @@ can2040-lite/
 │   ├── white_paper.md     # Design specification
 │   ├── design.md          # SM reduction plan, API design
 │   ├── ack_generation.md  # ACK helper design and status
-│   ├── todo.md            # ACK helper implementation order
 │   └── tdd_plan.md        # TDD implementation plan
 ├── platformio.ini         # RP2350 target build (Arduino-Pico core)
 ├── src/
 │   ├── can2040_lite_proto.c/.h  # Shared protocol core (host + target)
 │   ├── can_edge_sm.c/.h         # Edge-RX ISR state machine (host-tested)
-│   ├── can2040_lite.c/.h        # Public API skeleton
+│   ├── can2040_lite.c/.h        # Public API, transmit queue, frame packer
+│   ├── can2040.h                # Source-compatible can2040 aliases
 │   └── pico/
 │       ├── can2040_lite_pico.cpp/.h  # PIO/DMA backend
 │       ├── rx_pair.pio, tx.pio       # Live PIO programs (7 + 14 words)
@@ -198,7 +197,7 @@ The test generator creates valid and invalid CAN frames with proper bit stuffing
 ### Features
 
 - Standard (11-bit) and extended (29-bit) frames
-- RTR vectors for negative tests (the node itself does not support RTR)
+- RTR vectors (the node transmits an RTR and does not answer one)
 - Configurable payload (0-8 bytes)
 - Valid frames with correct CRC-15 and stuffing
 - Invalid frames: CRC errors, stuff violations, bit errors
@@ -213,7 +212,7 @@ The test generator creates valid and invalid CAN frames with proper bit stuffing
 Options:
   --std          Standard frame (11-bit ID) [default]
   --ext          Extended frame (29-bit ID)
-  --rtr          Generate an RTR vector (node does not support RTR)
+  --rtr          Generate an RTR vector (the node does not answer an RTR)
   --id <num>     CAN ID (decimal, default 0x123)
   --data <hex>   Payload hex string (e.g., 1234567890ABCDEF)
   --dlc <n>      Data length code (0-8, default 8)
@@ -231,7 +230,8 @@ Options:
 - [x] Test generator with TDD framework
 - [x] Host unit tests (stuffing, CRC-15, frame layout, decode)
 
-- [x] Firmware skeleton and public API
+- [x] Public API, transmit queue, and frame packer (`src/can2040.h`).
+      Host-tested. Not run on hardware.
 - [x] On-target RP2350 harness (vectors + API + loopback)
 - [x] PIO RX and one-shot full-message TX: 7 + 14 = 21 instructions, inside
       the 29-word budget.  The 32x oversampler remains as `rx.pio`.
@@ -244,8 +244,7 @@ Options:
 
 ### Planned
 - [ ] ACK helper on-target verification and go-window measurement
-      (`docs/todo.md` steps 4–5)
-- [ ] Full frame-level TX driver (stuffed prefix, ACK/NACK evaluation)
+      (`docs/ack_generation.md`)
 - [ ] Error-frame injection and detection
 - [ ] Real-bus integration with a compliant peer/transceiver
 - [ ] Soak test and release

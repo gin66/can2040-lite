@@ -24,12 +24,12 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked
 **Protocol restrictions (also in README / white paper / design):**
 - Not a full CAN node: no error-flag generation, no TEC/REC, no Error
   Active/Passive, no bus-off.
-- ACK generation is specified in `ack_generation.md` and tracked in
-  `todo.md`. Steps 1–3 (schedule, PIO image, backend) are implemented and
-  host-tested; the on-target and go-window checks remain. The phases below
-  predate that work and describe the receive/transmit core.
-- **No RTR support** — the node neither transmits nor acts on remote frames.
-  The test generator may still emit RTR vectors for negative tests.
+- ACK generation is specified in `ack_generation.md`. The schedule, the PIO
+  image, and the backend are implemented and host-tested; the on-target and
+  go-window checks remain. The phases below predate that work and describe
+  the receive/transmit core.
+- **No RTR reply** — an RTR is transmitted and a received RTR is delivered.
+  The node does not answer a received RTR with a data frame.
 - No CAN FD, no programmable bit timing (SJW/TSEG), no hardware acceptance
   filters, and no on-chip transceiver (external transceiver required).
 - No automatic retransmission; the application retries.

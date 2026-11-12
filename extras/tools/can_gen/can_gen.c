@@ -32,7 +32,7 @@ static void print_usage(void) {
     printf("Options:\n");
     printf("  --std          Standard frame (11-bit ID) [default]\n");
     printf("  --ext          Extended frame (29-bit ID)\n");
-    printf("  --rtr          Generate an RTR vector (node does not support RTR)\n");
+    printf("  --rtr          Generate an RTR vector (the node does not answer an RTR)\n");
     printf("  --id <num>     CAN ID (decimal or 0xhex, default 0x123)\n");
     printf("  --data <hex>   Payload hex string (e.g., 1234567890ABCDEF)\n");
     printf("  --dlc <n>      Data length code (0-8, default from payload)\n");

@@ -1,10 +1,18 @@
 # ACK generation
 
-Status: **steps 1–3 implemented, on-target verification pending.** The
+Status: **implemented and host-tested; on-target verification pending.** The
 schedule, the `can_ack` PIO image (13 words), and the Pico backend are in
-the tree and host-tested. Steps 4–5 of [`todo.md`](todo.md) need hardware.
+the tree. The analyzer cases and the go-window measurement need hardware.
 The parser still observes the slot (`can_edge_sm.ack_seen` / `ack`) as
 before.
+
+Two firmware gaps are still open. Arming fires when the plan is `ok` and
+the pad level matches; it does not recompute `from_bit` after the pad has
+already moved, and it does not require the next edge to be one bit away.
+Follow mode restarts only when the RX service runs, the program counter is
+in `release`, and the parser is past the ACK slot. A recessive slot produces
+no FIFO word, so the next frame's first edge finds the parser already inside
+that frame and the helper stays in `release`. A stale X must not pulse.
 
 The node will ACK a frame it received, and did not itself transmit, with an
 edge-locked pulse on the TX state machine. The pulse is armed from the
@@ -90,7 +98,7 @@ is a few hundredths of a bit. Edge detection itself is one TX cycle
 | B. Hardware alarm | Drop | The Pico alarm pool is the microsecond timer. It is not phase-locked to the CAN bit, and the pin is owned by PIO. |
 | C1. Countdown from the exec instant | Drop | The pulse tracks `pio_sm_exec` latency. That latency is interrupt jitter. |
 | C2. Compare two free-running counters | Drop | RX and TX use different dividers. `rx_pair.pio` skips one tick of X on every edge. Reading RX X injects an instruction into the pair shifter. |
-| D. CRC in PIO (can2040 match SM) | Parked | Cycle-exact, and the only option that removes the CPU from the last bit. It needs a bit-level receiver and about 10 words. Build it only if the go-window measurement in `todo.md` fails. |
+| D. CRC in PIO (can2040 match SM) | Parked | Cycle-exact, and the only option that removes the CPU from the last bit. It needs a bit-level receiver and about 10 words. Build it only if the go-window measurement in §7 fails. |
 | E. Observe only | Shipped behavior, and the runtime fallback | Late arm, own transmit, CRC or stuff failure, and an aborted helper all leave the slot recessive. |
 
 One driver, rated for 1 Mbit/s. A 500 kbit/s spin and a 1 Mbit/s helper would
@@ -126,7 +134,7 @@ pad (0 = dominant). The pin poll is the RX pad. Autopull is off.
 
 ```
 ; can_ack — overlay of the TX slot. Target shape, 13 words.
-; The cycle model in todo.md owns the final encodings and the gap preload.
+; The cycle model in extras/tests/pc_based/ack_cycle_model.h owns the encodings.
 ; The delay is [30], not [31]: the return jump below adds one cycle, so the
 ; dominant window is exactly 32 cycles (1 bit) wide.
 ;

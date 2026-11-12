@@ -105,7 +105,7 @@ re-synchronization into the RX program:
 - There is no third CAN state machine and no second bit-level receiver
 - The ACK pulse is an image of the TX instruction slot. The SM follows bus
   edges and the CPU only sets a go flag after the CRC matches. See
-  [`ack_generation.md`](ack_generation.md) and [`todo.md`](todo.md)
+  [`ack_generation.md`](ack_generation.md)
 
 Steps 1–3 (schedule, image, backend) are implemented and host-tested; the
 on-target checks are still pending.
@@ -281,7 +281,7 @@ and a small mis-sample is harmless.
 At 1 Mbit/s the ceiling is roughly 6,000–8,000 frames/s depending on frame
 length and stuffing. Raw bit capture is on the order of 100–170 kByte/s.
 
-## API Design (Proposed)
+## API Design
 
 ```c
 // Initialize CAN transceiver
@@ -295,12 +295,13 @@ void can2040_lite_start(struct can2040_lite *cd, uint32_t sys_clock, uint32_t bi
                        int32_t gpio_rx, int32_t gpio_tx);
 
 // Queue a frame for transmission
-int can2040_lite_transmit(struct can2040_lite *cd, struct can2040_lite_msg *msg);
+int can2040_lite_transmit(struct can2040_lite *cd,
+                          const struct can2040_lite_msg *msg);
 
 // Check if transmit slot is available
 int can2040_lite_check_transmit(struct can2040_lite *cd);
 
-// IRQ handler (called from PIO IRQ)
+// IRQ handler (called from the application's PIO IRQ)
 void can2040_lite_pio_irq_handler(struct can2040_lite *cd);
 
 // Get statistics
@@ -310,36 +311,41 @@ void can2040_lite_get_statistics(struct can2040_lite *cd, struct can2040_lite_st
 void can2040_lite_stop(struct can2040_lite *cd);
 ```
 
+`src/can2040.h` aliases the can2040 spellings (`can2040_setup`,
+`CAN2040_NOTIFY_RX`, ...) onto these names for source-compatible callers.
+
 ## Data Structures
 
 ```c
-// Notification types for callback
-enum {
-    CAN2040_LITE_NOTIFY_RX,       // Received frame (from bus)
-    CAN2040_LITE_NOTIFY_TX,       // Transmitted frame (confirmed by ACK)
-    CAN2040_LITE_NOTIFY_TX_NACK,  // Transmitted frame, no ACK received
-    CAN2040_LITE_NOTIFY_TX_ERROR, // Transmitted frame, error detected
-    CAN2040_LITE_NOTIFY_ERROR,    // Internal error (buffer overflow)
-};
+// Notification bits for the callback (values match can2040)
+#define CAN2040_LITE_NOTIFY_RX    (1u << 20)
+#define CAN2040_LITE_NOTIFY_TX    (1u << 21)
+#define CAN2040_LITE_NOTIFY_ERROR (1u << 23)
 
 struct can2040_lite_msg {
-    uint32_t id;           // CAN ID (11-bit or 29-bit)
-    uint32_t dlc;          // Data length code (0-8)
-    uint8_t data[8];       // Payload data
-    uint32_t flags;        // CAN2040_LITE_ID_EFF, CAN2040_LITE_ID_RTR
-    uint32_t crc_error;    // 1 if CRC failed or the frame did not parse
+    uint32_t id;           // CAN ID | CAN2040_LITE_ID_EFF/RTR
+    uint32_t dlc;          // 0..15; 8..15 carry 8 data bytes
+    union {
+        uint8_t data[8];
+        uint32_t data32[2];
+    };
 };
 
 struct can2040_lite_stats {
     uint32_t rx_total;      // Successfully received frames
     uint32_t tx_total;      // Successfully transmitted frames (ACK received)
+    uint32_t tx_attempt;    // Frames accepted by transmit()
+    uint32_t parse_error;   // Bad RX frames and failed transmit attempts
     uint32_t tx_nack;       // Frames with no ACK (readback)
-    uint32_t tx_error;      // Frames with error detected (readback)
+    uint32_t tx_error;      // Frames with an error detected (readback)
     uint32_t crc_errors;    // Received frames with CRC errors
     uint32_t stuff_errors;  // Frames with stuffing violations
     uint32_t bit_errors;    // Received frames with form/bit errors
+    uint32_t rx_overflow;   // Frames dropped because no buffer was available
 };
 ```
+
+The first four statistics fields are the ones a can2040 caller reads.
 
 ## Next Steps (TDD Roadmap)
 

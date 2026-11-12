@@ -109,7 +109,7 @@ The bus remains unaffected by the receiver (no error flags, no arbitration parti
 - ✅ Frame transmission (bit-stuffed)
 - ✅ Readback path (transmitted bits monitored on CAN-RX)
 - ✅ ACK evaluation (from readback)
-- ✅ ACK generation by the TX-slot helper (`ack_generation.md`, `todo.md`);
+- ✅ ACK generation by the TX-slot helper (`ack_generation.md`);
   host-side schedule and cycle model pass, on-target verification pending
 - ✅ Error frame evaluation (from readback)
 
@@ -481,13 +481,14 @@ compliant. It is a classic CAN 2.0B *data-frame* transceiver.
 Limitations include:
 
 - **ACK generation on-target verification is pending** — the TX-slot
-  helper in `ack_generation.md` is implemented and host-tested (`todo.md`)
+  helper in `ack_generation.md` is implemented and host-tested
 - **No error-flag generation** — only error observation (6+ dominant bits)
 - **No fault confinement** — no TEC/REC, Error Active/Passive, or bus-off
 - **No automatic retransmission** — the application retries
 - **No full arbitration participation** — TX aborts on conflict instead of
   competing to win
-- **No RTR support** — remote frames are neither transmitted nor acted upon
+- **No RTR reply** — an RTR is transmitted and a received RTR is delivered.
+  The node does not answer a received RTR with a data frame
 - **No CAN FD** — classic CAN 2.0B only
 - **No programmable bit timing** — fixed 32× oversampling, no SJW/TSEG
 - **No hardware acceptance filters** — software filtering only
@@ -599,7 +600,7 @@ This ensures correctness before hardware-specific code is written.
 - **2026-11-12:** ACK generation decided: edge-locked pulse in a 14-word
   overlay of the TX slot, gated by CRC match. Steps 1–3 (schedule, 13-word
   image, backend) are implemented and host-tested; on-target verification
-  remains. `ack_generation.md`, implementation order in `todo.md`.
+  remains. See `ack_generation.md`.
 
 ### Project Name
 

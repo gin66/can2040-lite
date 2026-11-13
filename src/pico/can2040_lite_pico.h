@@ -25,10 +25,13 @@ int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate);
 int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
                               uint32_t bitrate);
 
-// Re-arm the RX state machine.  The PIO SM polls for SOF; when a frame
-// arrives the application's PIO IRQ handler calls
-// can2040_lite_pio_irq_handler(), which drains this backend through poll().
+// Re-arm the RX state machine.  The PIO SM polls for SOF.
 void can2040_lite_pico_rx_arm(void);
+
+// Fast RX IRQ body: drain the PIO FIFO and run the inline parser only.
+// No events, callbacks, TX matching, timers, or allocation.  Call this from
+// PIOx_IRQ_0.  The normal portable service can then run from the main loop.
+void can2040_lite_pico_rx_irq(void);
 
 // Wait for the next frame to be parsed (sets frame_ready).  Returns 1 on
 // success, 0 on timeout.  Use can2040_lite_pico_rx_get_parsed() to read it.
@@ -73,6 +76,15 @@ void can2040_lite_pico_tx_clear_status(void);
 void can2040_lite_pico_raw_begin(uint32_t *words, uint32_t capacity);
 uint32_t can2040_lite_pico_raw_count(void);
 void can2040_lite_pico_raw_end(void);
+
+// Always-on (when CAN_EDGE_PAIR_TIME_RECORDING is set) raw FIFO ring.  The
+// first instruction after each FIFO read is:
+//     record[head++ & 255] = word;
+// The ring keeps the last 256 words.  rx_record_word() takes an absolute
+// word index; older overwritten indices return 0.  rx_arm() clears it.
+void can2040_lite_pico_rx_record_clear(void);
+uint32_t can2040_lite_pico_rx_record_count(void);
+uint32_t can2040_lite_pico_rx_record_word(uint32_t index);
 
 #ifdef __cplusplus
 }

@@ -18,6 +18,7 @@
 #include "can2040_lite_proto.h"
 #include "can2040_lite.h"
 #include "can_edge_sm.h"
+#include "can_rx_sm.h"
 #include "can_frame_build.h"
 #include "ack_cycle_model.h"
 #include "can_rx_record_fly_micro4.h"
@@ -2744,6 +2745,262 @@ static void test_recorded_fly_micro4(void) {
     TEST_END();
 }
 
+
+// New edge-fed parser: drive synthetic edges from the frame builder and
+// check the decoded ring slot.  Covers the no-edge recessive CRC tail with
+// can_rx_flush(), which is what the Pico quiet-bus timeout uses.
+static void test_rx_sm(void) {
+    printf("\n-- Minimal edge-fed RX parser --\n");
+    TEST_BEGIN("std/ext DLC sweep decodes from edges");
+    for (int ext = 0; ext < 2; ext++) {
+        for (int dlc = 0; dlc <= 8; dlc++) {
+            for (int ack = 0; ack < 2; ack++) {
+                can_frame_t f;
+                uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
+                can_build_info_t info;
+                can_rx_t rx;
+                uint32_t total;
+                uint32_t i;
+                uint16_t t0 = 0x8000u;
+                const uint16_t ticks = 64u;
+                uint8_t prev = 0;
+
+                memset(&f, 0, sizeof(f));
+                f.id = ext ? 0x18febb11u : 0x123u;
+                f.dlc = (uint8_t)dlc;
+                if (ext)
+                    f.flags |= CAN_FRAME_EXTENDED;
+                for (i = 0; i < 8; i++)
+                    f.data[i] = (uint8_t)(0xa0u + i * 3u + dlc);
+
+                total = can_frame_build(&f, VALID_FRAME, ack, bits,
+                                        CAN2040_LITE_MAX_FRAME_BITS, &info);
+                CHECK(total != 0u);
+                can_rx_init(&rx, ticks);
+                can_rx_edge(&rx, t0, 0u);
+                for (i = 1; i < total; i++) {
+                    uint8_t b = bits_get(bits, i);
+
+                    if (b != prev) {
+                        can_rx_edge(&rx, (uint16_t)(t0 - i * ticks), b);
+                        prev = b;
+                        if (rx.sm.state == 120u)
+                            break;
+                    }
+                }
+                if (!can_rx_available(&rx))
+                    can_rx_flush(&rx);
+                CHECK(can_rx_available(&rx));
+                if (can_rx_available(&rx)) {
+                    const can_rx_frame_t *g = can_rx_front(&rx);
+
+                    CHECK(g->id == f.id);
+                    CHECK(g->dlc == f.dlc);
+                    CHECK((g->flags & 1u) ==
+                          (uint8_t)((f.flags & CAN_FRAME_EXTENDED) ? 1u : 0u));
+                    CHECK(memcmp(g->data, f.data, f.dlc) == 0);
+                    can_rx_pop(&rx);
+                }
+            }
+        }
+    }
+    TEST_END();
+}
+
+
+static void test_rx_sm_errors(void) {
+    printf("\n-- Minimal RX parser errors --\n");
+    TEST_BEGIN("CRC, stuff and unsupported RTR are rejected");
+    for (int kind = 0; kind < 3; kind++) {
+        can_frame_t f;
+        frame_validity_t validity = VALID_FRAME;
+        uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
+        can_build_info_t info;
+        can_rx_t rx;
+        uint32_t total;
+        uint32_t i;
+        uint16_t t0 = 0x8000u;
+        const uint16_t ticks = 64u;
+        uint8_t prev = 0;
+
+        memset(&f, 0, sizeof(f));
+        f.id = 0x321u;
+        f.dlc = 8;
+        for (i = 0; i < 8; i++)
+            f.data[i] = (uint8_t)(i + 1u);
+        if (kind == 0)
+            validity = INVALID_CRC;
+        else if (kind == 1)
+            validity = INVALID_STUFF;
+        else
+            f.flags |= CAN_FRAME_RTR;
+
+        total = can_frame_build(&f, validity, 0, bits,
+                                CAN2040_LITE_MAX_FRAME_BITS, &info);
+        CHECK(total != 0u);
+        can_rx_init(&rx, ticks);
+        can_rx_edge(&rx, t0, 0u);
+        for (i = 1; i < total; i++) {
+            uint8_t b = bits_get(bits, i);
+
+            if (b != prev) {
+                can_rx_edge(&rx, (uint16_t)(t0 - i * ticks), b);
+                prev = b;
+                if (rx.sm.state == 0u || rx.sm.state == 120u)
+                    break;
+            }
+        }
+        can_rx_flush(&rx);
+        CHECK(!can_rx_available(&rx));
+        if (kind == 0)
+            CHECK(rx.crc_errors == 1u);
+        else if (kind == 1)
+            CHECK(rx.stuff_errors == 1u);
+        else
+            CHECK(rx.bit_errors == 1u);
+    }
+    TEST_END();
+}
+
+
+static void test_rx_sm_back_to_back(void) {
+    can_frame_t f1, f2;
+    uint8_t b1[CAN2040_LITE_MAX_FRAME_BYTES];
+    uint8_t b2[CAN2040_LITE_MAX_FRAME_BYTES];
+    uint8_t all[CAN2040_LITE_MAX_FRAME_BYTES * 2u];
+    can_build_info_t i1, i2;
+    can_rx_t rx;
+    uint32_t n1, n2, total, i;
+    uint16_t t0 = 0x8000u;
+    const uint16_t ticks = 64u;
+    uint8_t prev = 0;
+
+    printf("\n-- Minimal RX parser back-to-back --\n");
+    TEST_BEGIN("two NACK frames stay in the ring");
+    memset(&f1, 0, sizeof(f1));
+    memset(&f2, 0, sizeof(f2));
+    f1.id = 0x111u;
+    f1.dlc = 2;
+    f1.data[0] = 0xaa;
+    f1.data[1] = 0x55;
+    f2.id = 0x222u;
+    f2.dlc = 3;
+    f2.data[0] = 0x11;
+    f2.data[1] = 0x22;
+    f2.data[2] = 0x33;
+    n1 = can_frame_build(&f1, VALID_FRAME, 0, b1,
+                         CAN2040_LITE_MAX_FRAME_BITS, &i1);
+    n2 = can_frame_build(&f2, VALID_FRAME, 0, b2,
+                         CAN2040_LITE_MAX_FRAME_BITS, &i2);
+    CHECK(n1 != 0u && n2 != 0u);
+    bits_clear(all, sizeof(all) * 8u);
+    for (i = 0; i < n1; i++)
+        bits_put(all, i, bits_get(b1, i));
+    for (i = 0; i < n2; i++)
+        bits_put(all, n1 + i, bits_get(b2, i));
+    total = n1 + n2;
+
+    can_rx_init(&rx, ticks);
+    can_rx_edge(&rx, t0, 0u);
+    for (i = 1; i < total; i++) {
+        uint8_t b = bits_get(all, i);
+
+        if (b != prev) {
+            can_rx_edge(&rx, (uint16_t)(t0 - i * ticks), b);
+            prev = b;
+        }
+    }
+    can_rx_flush(&rx);
+    CHECK(can_rx_available(&rx));
+    if (can_rx_available(&rx)) {
+        const can_rx_frame_t *g = can_rx_front(&rx);
+
+        CHECK(g->id == f1.id && g->dlc == f1.dlc);
+        CHECK(memcmp(g->data, f1.data, f1.dlc) == 0);
+        can_rx_pop(&rx);
+    }
+    CHECK(can_rx_available(&rx));
+    if (can_rx_available(&rx)) {
+        const can_rx_frame_t *g = can_rx_front(&rx);
+
+        CHECK(g->id == f2.id && g->dlc == f2.dlc);
+        CHECK(memcmp(g->data, f2.data, f2.dlc) == 0);
+        can_rx_pop(&rx);
+    }
+    TEST_END();
+}
+
+
+static void drive_rx_bits(can_rx_t *rx, const uint8_t *bits, uint32_t total,
+                          uint16_t t0, uint16_t ticks) {
+    uint8_t prev = 0;
+    uint32_t i;
+
+    can_rx_edge(rx, t0, 0u);
+    for (i = 1; i < total; i++) {
+        uint8_t b = bits_get(bits, i);
+
+        if (b != prev) {
+            can_rx_edge(rx, (uint16_t)(t0 - i * ticks), b);
+            prev = b;
+        }
+    }
+    can_rx_flush(rx);
+}
+
+static void test_rx_sm_tail(void) {
+    static const char *pat_name[PAT_COUNT] = {
+        "dominant CRC end",
+        "1 recessive CRC bit",
+        "2 recessive CRC bits",
+        "3 recessive CRC bits",
+        "4 recessive CRC bits",
+        "5 recessive CRC bits",
+        "5 dominant CRC bits",
+        "ext 4 recessive CRC bits",
+        "RTR 4 recessive CRC bits"
+    };
+    can_frame_t found[PAT_COUNT];
+    uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
+    can_build_info_t info;
+    char name[96];
+    uint32_t pidx;
+
+    printf("\n-- Minimal RX parser CRC tails --\n");
+    find_tail_patterns(found);
+    for (pidx = 0; pidx < PAT_COUNT; pidx++) {
+        can_frame_t f = found[pidx];
+        can_rx_t rx;
+        uint32_t total;
+        uint16_t t0 = 0x8000u;
+        const uint16_t ticks = 64u;
+
+        if (f.flags & 0x80u)
+            f.flags &= (uint8_t)~0x80u;
+        else
+            continue;
+        if (f.flags & CAN_FRAME_RTR)
+            continue;   // RTR is intentionally unsupported by the new parser
+        snprintf(name, sizeof(name), "%s, NACK", pat_name[pidx]);
+        TEST_BEGIN(name);
+        total = can_frame_build(&f, VALID_FRAME, 0, bits,
+                                CAN2040_LITE_MAX_FRAME_BITS, &info);
+        CHECK(total != 0u);
+        can_rx_init(&rx, ticks);
+        drive_rx_bits(&rx, bits, total, t0, ticks);
+        CHECK(can_rx_available(&rx));
+        if (can_rx_available(&rx)) {
+            const can_rx_frame_t *g = can_rx_front(&rx);
+
+            CHECK(g->id == f.id);
+            CHECK(g->dlc == f.dlc);
+            CHECK(memcmp(g->data, f.data, f.dlc) == 0);
+            can_rx_pop(&rx);
+        }
+        TEST_END();
+    }
+}
+
 int main(void) {
     printf("========================================\n");
     printf("CAN2040-Lite PC-based protocol tests\n");
@@ -2764,6 +3021,10 @@ int main(void) {
     test_ack_reloc();
     test_ack_backend_model();
     test_edge_pair();
+    test_rx_sm();
+    test_rx_sm_errors();
+    test_rx_sm_back_to_back();
+    test_rx_sm_tail();
 
     printf("\n========================================\n");
     printf("TOTAL: %d passed, %d failed\n", g_passed, g_failed);

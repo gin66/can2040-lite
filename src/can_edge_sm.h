@@ -64,67 +64,63 @@ static inline uint32_t can_edge_word(uint32_t time31, uint8_t level) {
     return ((time31 & CAN_EDGE_TIME_MASK) << 1) | (uint32_t)(level & 1u);
 }
 
-typedef struct {
-    // Configuration.  Must be at least 1.
-    uint32_t ticks_per_bit;
+// Bit stuffing bounds a run of identical bits to five inside the stuffed
+// region (SOF through CRC).  The edge classifier uses that bound directly: a
+// longer interval is a stuff violation, not a longer legal run.
+#define CAN_EDGE_RUN_MAX_BITS 5u
+#define CAN_EDGE_RUN_OVERFLOW (CAN_EDGE_RUN_MAX_BITS + 1u)
 
-    // Running capture.  mark/accum/level are the bit clock.
-#if CAN_ACK_GENERATION_SUPPORT
-    uint32_t frame_seq;         // incremented at every SOF
-#endif
+typedef struct {
+    // Immutable configuration.  start_frame() never touches these.
+    uint32_t ticks_per_bit;
+    uint32_t run_hi[CAN_EDGE_RUN_MAX_BITS + 1u];
+
+    // Bit clock / edge timing.
     uint32_t mark;              // current quiet-tail bit boundary
     uint32_t edge_mark;         // time of the last bus edge (delta anchor)
     uint32_t run_done;          // bits already emitted since that edge
     uint32_t accum;
+    uint32_t tail_mark;         // down-counter time at the tail bit start
+    uint32_t shift;             // current field / byte shift register
+    uint32_t id;
+
+    // Per-frame parser state.  start_frame() clears only this set.
+    uint16_t crc_calc;
+    uint16_t crc_recv;
+    uint16_t raw_bits;
+    uint16_t stuffed_raw;
+
+    uint8_t data[8];            // written a whole byte at a time; never cleared
     uint8_t level;
     uint8_t in_frame;
-    uint8_t phase;
-    uint8_t need_stuff;
-
-    // Unstuff and field parse.
-    uint32_t run;
+    // One uint8_t encodes field and remaining bits: ST_ID+11..ST_ID+1,
+    // ST_DATA+64..ST_DATA+1, ST_CRC+15..ST_CRC+1, etc.
+    uint8_t state;
+    uint8_t run;                // wire run length (1..5 when stuffed)
     uint8_t last;
-    uint64_t hdr;
-    uint32_t header_len;
-    uint32_t header_bits;
-    uint32_t unstuffed;
-    uint32_t crc_start;
-    uint32_t raw_bits;
-    // Tail bits are sampled at the nominal sample point, not at the bit
-    // boundary, so a dominant ACK pulse that ends early or starts late is
-    // not mistaken for a valid ACK.
-    uint32_t tail_mark;         // down-counter time at the current tail bit start
-    uint8_t tail_sample;        // level at the current tail bit's sample point
-#if CAN_ACK_GENERATION_SUPPORT
-    uint32_t last_edge_raw;     // raw wire index of the bit at the last edge
-#endif
-    uint32_t stuffed_raw;
-#if CAN_ACK_GENERATION_SUPPORT
-    uint32_t crc_raw_start;     // raw wire index of the first CRC bit
-    uint8_t crc_run_start;      // stuffer state entering the CRC field
-    uint8_t crc_last_start;
-    uint8_t crc_started;
-#endif
-    uint8_t header_known;
+    uint8_t tail_sample;
     uint8_t is_ext;
     uint8_t is_rtr;
     uint8_t dlc;
-    uint32_t id;
-    uint8_t data[8];
-    uint16_t crc_calc;
-    uint16_t crc_recv;
-    uint8_t tail_got;
-
-    // Outputs.  Meaningful when the corresponding flag is set.
-    uint8_t crc_match;          // 15 CRC bits are in and match crc_calc
-#if CAN_ACK_GENERATION_SUPPORT
-    uint8_t ack_armed;          // crc_match; ACK slot starts at ack_arm_time
-    uint32_t ack_arm_time;
-#endif
+    uint8_t crc_match;
     uint8_t ack_seen;
-    uint8_t ack;                // 1 = ACK slot was dominant
+    uint8_t ack;
     uint8_t frame_ready;
-    frame_validity_t validity;
+    uint8_t validity;
+
+#if CAN_ACK_GENERATION_SUPPORT
+    uint32_t frame_seq;         // incremented at every SOF
+    uint32_t ack_arm_time;
+    uint16_t last_edge_raw;
+    uint16_t crc_raw_start;
+    uint8_t crc_run_start;
+    uint8_t crc_last_start;
+    uint8_t crc_started;
+    uint8_t ack_armed;
+#endif
+
+    // Published result.  Left untouched by start_frame() so a result the
+    // caller has not consumed yet remains readable across the next SOF.
     can_parsed_t parsed;
 } can_edge_sm_t;
 

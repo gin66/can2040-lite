@@ -263,9 +263,108 @@ static void feed_raw(can_edge_sm_t *sm, uint8_t bit, uint32_t bit_end) {
     }
 }
 
-// Emit whole bits of the current level up to `now`.  The fraction stays
-// in accum.  A frame that ends on the way (IFS done, or an error) leaves
-// the leftover interval unparsed.
+// Classify one edge-to-edge interval as a run of n identical bits by its
+// delta time only.  CAN stuffing guarantees at most five identical bits
+// between edges; longer runs are accepted here so the stuff state machine can
+// report the violation (INVALID_STUFF) rather than a generic form error.
+//
+// The acceptance budget for |elapsed - n*T| is the sum of three independent
+// errors, in ticks:
+//   - bit-clock mismatch: 0.5% of the interval.  ISO 11898-1 bounds the
+//     oscillator tolerance by SJW / (20 * NBT); with SJW = 1 TQ and
+//     NBT = 8 TQ that is 0.625%.  Crystal nodes are far better, so 0.5% is a
+//     conservative cap.
+//   - bus edge asymmetry: T/8.  Dominant is actively driven while recessive
+//     rises through the termination and bus capacitance and the transceiver
+//     comparator, so the two edge delays differ.  The Fly-Micro4 1 Mbit/s
+//     recording measures +0.5 tick (dominant) and -2.6 tick (recessive) at
+//     T = 66, about 4% of a bit; 12.5% covers slower or longer buses.
+//   - capture quantization: 1 tick from the two-cycle PIO counter.
+//
+// Rounding to the nearest n keeps the windows disjoint; the budget only
+// rejects intervals that are not a whole number of bits.  An interval longer
+// than the maximum legal run is classified as a stuffing violation.
+enum {
+    CAN_EDGE_RUN_MAX_BITS = 10,
+    CAN_EDGE_CLOCK_TOL_DIV = 200,   // 0.5% of the interval
+    CAN_EDGE_EDGE_SKEW_DIV = 8      // 1/8 bit of slew/comparator asymmetry
+};
+
+static int run_bits(uint32_t elapsed, uint32_t ticks_per_bit) {
+    uint32_t n = (elapsed + ticks_per_bit / 2u) / ticks_per_bit;
+    uint32_t nominal;
+    uint32_t tol;
+    uint32_t err;
+
+    if (n < 1u)
+        return -1;
+    // Beyond the legal run length any interval is a stuffing violation.  The
+    // stuff state machine fails on the sixth identical bit, so classify it as
+    // the maximum run instead of rejecting the frame as a generic bit error.
+    if (n > (uint32_t)CAN_EDGE_RUN_MAX_BITS)
+        return (int)CAN_EDGE_RUN_MAX_BITS;
+    nominal = n * ticks_per_bit;
+    tol = nominal / CAN_EDGE_CLOCK_TOL_DIV +
+          ticks_per_bit / CAN_EDGE_EDGE_SKEW_DIV + 1u;
+    err = (elapsed > nominal) ? (elapsed - nominal) : (nominal - elapsed);
+    if (err > tol)
+        return -1;
+    return (int)n;
+}
+
+// An edge is a bit-boundary sync point.  In the stuffed region the interval
+// since the previous edge is a whole number of bits, classified by its own
+// delta time.  The phase is re-anchored at every edge, so neither oscillator
+// tolerance nor the dominant/recessive edge skew accumulates across the frame.
+static void advance_edge(can_edge_sm_t *sm, uint32_t now) {
+    uint32_t elapsed;
+    int n;
+    uint32_t k;
+
+    if (!sm->in_frame || sm->ticks_per_bit == 0) {
+        sm->mark = now;
+        sm->edge_mark = now;
+        sm->run_done = 0;
+        sm->accum = 0;
+        return;
+    }
+
+    elapsed = elapsed_ticks(sm->edge_mark, now);
+    n = run_bits(elapsed, sm->ticks_per_bit);
+    if (n < 0) {
+        fail(sm, INVALID_BIT);
+        sm->mark = now;
+        sm->edge_mark = now;
+        sm->run_done = 0;
+        sm->accum = 0;
+        return;
+    }
+
+    // The quiet-tail path may already have emitted the leading bits of this
+    // run while waiting for the next edge.  Emit only the bits that are still
+    // missing, with the last one ending exactly at this edge.
+    {
+        uint32_t done = sm->run_done;
+        if (done > (uint32_t)n)
+            done = (uint32_t)n;
+        for (k = done; k < (uint32_t)n && sm->in_frame; k++) {
+            const uint32_t end =
+                (now + ((uint32_t)n - 1u - k) * sm->ticks_per_bit) &
+                CAN_EDGE_TIME_MASK;
+            feed_raw(sm, sm->level, end);
+        }
+    }
+
+    sm->mark = now;
+    sm->edge_mark = now;
+    sm->run_done = 0;
+    sm->accum = 0;
+}
+
+// Emit whole bits of the current level up to `now`.  The fraction stays in
+// accum.  Used for the quiet tail (delimiter/ACK/EOF), where the nominal bit
+// period free-runs for at most the 10-bit interframe gap.  The stuffed region
+// is driven by advance_edge() so a phase error never accumulates.
 static void advance_to(can_edge_sm_t *sm, uint32_t now) {
     if (!sm->in_frame || sm->ticks_per_bit == 0) {
         sm->mark = now;
@@ -285,6 +384,7 @@ static void advance_to(can_edge_sm_t *sm, uint32_t now) {
         sm->mark = end;
         sm->accum = 0;
         feed_raw(sm, sm->level, end);
+        sm->run_done++;
     }
 
     if (!sm->in_frame) {
@@ -311,6 +411,8 @@ static void start_frame(can_edge_sm_t *sm, uint32_t time) {
 #endif
     sm->ticks_per_bit = ticks;
     sm->mark = time & CAN_EDGE_TIME_MASK;
+    sm->edge_mark = sm->mark;
+    sm->run_done = 0;
     sm->level = 0;
     sm->in_frame = 1;
     sm->phase = PH_STUFF;
@@ -352,7 +454,10 @@ void can_edge_sm_push(can_edge_sm_t *sm, uint32_t word) {
     }
 
     was_in_frame = 1;
-    advance_to(sm, time);
+    if (sm->phase == PH_STUFF)
+        advance_edge(sm, time);
+    else
+        advance_to(sm, time);
     if (sm->in_frame) {
         // Tail bits are judged at the nominal sample point.  An edge that
         // arrives before it defines the level sampled in that bit; an edge

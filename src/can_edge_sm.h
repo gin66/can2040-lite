@@ -17,12 +17,12 @@
 //   bit[0]     = pin level after the edge
 // X counts down.  Elapsed ticks are (earlier - later) mod 2^31.
 //
-// Whole bit times are taken from that gap and the fraction is kept, including
-// across an edge, so the bit count follows the counter.  Bits completed
-// before the edge use the previous level.  ticks_per_bit is in the same
-// units as the 31-bit field (PIO cycles / 2).  These tests use ideal spacing;
-// the four-cycle edge path is two counts short and is the capture driver's
-// constant to add, not part of this machine.
+// In the stuffed region each edge-to-edge gap is a whole number of bits and
+// is classified from its own delta; the phase re-anchors at every edge, so a
+// fixed per-polarity edge delay (slew, comparator) never accumulates.  The
+// quiet tail free-runs at the nominal period for at most the 10-bit
+// delimiter/EOF/IFS gap.  ticks_per_bit is in the same units as the 31-bit
+// field (PIO cycles / 2).
 //
 // Stuffing applies from SOF through the CRC sequence, including the stuff
 // bit inserted when that sequence ends on a 5-run.  It stops there.  The
@@ -72,7 +72,9 @@ typedef struct {
 #if CAN_ACK_GENERATION_SUPPORT
     uint32_t frame_seq;         // incremented at every SOF
 #endif
-    uint32_t mark;
+    uint32_t mark;              // current quiet-tail bit boundary
+    uint32_t edge_mark;         // time of the last bus edge (delta anchor)
+    uint32_t run_done;          // bits already emitted since that edge
     uint32_t accum;
     uint8_t level;
     uint8_t in_frame;
@@ -144,10 +146,10 @@ void can_edge_sm_time(can_edge_sm_t *sm, uint32_t now);
 // before SOF may wrap, but can_edge_sm rebases at that SOF, so a shift of the
 // virtual counter by a multiple of 2^16 does not affect the frame.
 //
-// `bias` is added to every inter-edge distance.  The capture program's edge
-// path skips one counter decrement, so each gap measures one tick short;
-// pass 1 for the pair capture.  A source with an ideal free-running clock
-// passes 0.
+// `bias` is added to every inter-edge distance.  The pair capture samples
+// both edge polarities at the same phase of the two-cycle count grid, so the
+// sampling offset cancels; pass 0.  A source with a known systematic
+// per-edge loss can pass a non-zero correction.
 typedef struct {
     can_edge_sm_t *sm;
     uint32_t time;      // 31-bit down-counter value at the last edge

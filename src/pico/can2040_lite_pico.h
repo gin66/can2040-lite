@@ -65,6 +65,15 @@ int can2040_lite_pico_tx_done_pending(void);
 int can2040_lite_pico_tx_error_pending(void);
 void can2040_lite_pico_tx_clear_status(void);
 
+// Raw FIFO capture for host-side edge analysis.  While enabled, the PIO
+// handler only drains RX FIFO words into the caller's buffer; it does not
+// feed can_edge_sm or generate ACKs.  This keeps up with 1 Mbit/s even on
+// RP2040 because no protocol work happens in the interrupt.  Each word is
+// (fall_timestamp16 << 16) | rise_timestamp16, in arrival order.
+void can2040_lite_pico_raw_begin(uint32_t *words, uint32_t capacity);
+uint32_t can2040_lite_pico_raw_count(void);
+void can2040_lite_pico_raw_end(void);
+
 #ifdef __cplusplus
 }
 #endif

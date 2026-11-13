@@ -38,14 +38,20 @@
 // divider and ticks_per_bit are chosen together to make that count exact.
 static const float tx_clk_mult = 32.0f;
 
-// The pair capture path runs two cycles with no `jmp x--`, so each
-// inter-edge gap measures one tick short.  The pair decoder adds this back.
-static const uint32_t rx_pair_bias = 1;
+// Both edge captures stop at the same point in the two-cycle count grid, so
+// the one-tick sampling offset cancels in the fall-to-rise difference.  The
+// RP2040 capture measures exact 66-tick bit intervals; adding a bias would
+// accumulate one tick per edge and drift across the frame.
+static const uint32_t rx_pair_bias = 0;
 
 // TX is one-shot per CAN message.  The program raises one of these IRQs and
 // parks; software must re-prepare the SM for the next message.
-static const uint CAN_TX_DONE_IRQ = 6;
-static const uint CAN_TX_ERR_IRQ = 7;
+//
+// Only PIO IRQ flags 0..3 can be routed to a system IRQ on RP2040
+// (pio_interrupt_source_t has pis_interrupt4..7 only when PICO_PIO_VERSION > 0,
+// i.e. RP2350).  Use 0 and 1 so the same image runs on both chips.
+static const uint CAN_TX_DONE_IRQ = 0;
+static const uint CAN_TX_ERR_IRQ = 1;
 
 // Joined TX FIFO depth.  One entry is the bit count, and one recessive word
 // is reserved so the OUT that empties the OSR can autopull instead of stalling.
@@ -109,6 +115,12 @@ static can_edge_pair_t edge_pair;
 
 // Flag set by the IRQ handler when a frame is fully parsed.
 static volatile bool frame_ready_flag = false;
+
+// Raw RX FIFO capture mode.  No protocol work runs while this is enabled.
+static uint32_t *raw_words;
+static uint32_t raw_capacity;
+static volatile uint32_t raw_count;
+static volatile bool raw_mode;
 
 // The latest parsed frame (valid when frame_ready_flag is true).
 static can_parsed_t latest_parsed;
@@ -309,8 +321,8 @@ extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
     // Route the program's done and error flags to the same system IRQ as RX.
     // A transmit that finishes during a recessive bus would otherwise never
     // enter the handler.
-    pio_set_irq0_source_enabled(tx_pio, pis_interrupt6, true);
-    pio_set_irq0_source_enabled(tx_pio, pis_interrupt7, true);
+    pio_set_irq0_source_enabled(tx_pio, pis_interrupt0, true);
+    pio_set_irq0_source_enabled(tx_pio, pis_interrupt1, true);
 
     tx_initialized = true;
     tx_active = false;
@@ -565,6 +577,15 @@ static void pico_service_events(void) {
     if (!rx_initialized)
         return;
 
+    if (raw_mode) {
+        while (!pio_sm_is_rx_fifo_empty(rx_pio, rx_sm)) {
+            const uint32_t word = pio_sm_get(rx_pio, rx_sm);
+            if (raw_count < raw_capacity)
+                raw_words[raw_count++] = word;
+        }
+        return;
+    }
+
     // TX flags first: the matching ACK/NACK is in the parsed own frame.
     if (tx_initialized && tx_active && !tx_finished_reported) {
         int err = can2040_lite_pico_tx_error_pending();
@@ -780,6 +801,22 @@ extern "C" uint32_t can2040_lite_pico_rx_bits(uint8_t *bits,
     return n;
 }
 
+extern "C" void can2040_lite_pico_raw_begin(uint32_t *words,
+                                           uint32_t capacity) {
+    raw_words = words;
+    raw_capacity = capacity;
+    raw_count = 0;
+    raw_mode = true;
+}
+
+extern "C" uint32_t can2040_lite_pico_raw_count(void) {
+    return raw_count;
+}
+
+extern "C" void can2040_lite_pico_raw_end(void) {
+    raw_mode = false;
+}
+
 extern "C" void can2040_lite_pico_tx_set_readback_gpio(uint32_t gpio) {
     tx_rx_gpio = gpio;
     pio_gpio_init(tx_pio, gpio);
@@ -849,8 +886,8 @@ static void pico_hw_stop(struct can2040_lite *cd) {
         pio_program_t prog = pio_program_of(can_pio_tx_program());
 
         pio_sm_set_enabled(tx_pio, tx_sm, false);
-        pio_set_irq0_source_enabled(tx_pio, pis_interrupt6, false);
-        pio_set_irq0_source_enabled(tx_pio, pis_interrupt7, false);
+        pio_set_irq0_source_enabled(tx_pio, pis_interrupt0, false);
+        pio_set_irq0_source_enabled(tx_pio, pis_interrupt1, false);
         pio_sm_unclaim(tx_pio, tx_sm);
         pio_remove_program(tx_pio, &prog, tx_offset);
         tx_initialized = false;

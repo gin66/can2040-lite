@@ -20,6 +20,7 @@
 #include "can_edge_sm.h"
 #include "can_frame_build.h"
 #include "ack_cycle_model.h"
+#include "can_rx_record_fly_micro4.h"
 
 // The PIO images are built at runtime by the portable program builder.
 #include "pico/can_pio_program.h"
@@ -1087,6 +1088,87 @@ static void drive_bitclock(can_edge_sm_t *sm, const uint8_t *bits,
     }
 }
 
+// Measured Fly-Micro4 / ESP32 edge timing at 1 Mbit/s: the delta of a run is
+// n*T plus a fixed offset that depends only on polarity, not on n.  Dominant
+// runs are slightly long, recessive runs slightly short; the edge path adds
+// the same fixed cost to every edge.  The decoder must classify each interval
+// from its own delta, so these offsets never accumulate across a frame.
+#define ASYM_DOM_EXTRA 1
+#define ASYM_REC_LOSS  2
+static int s_asym_bad_bit = -1;
+
+static uint32_t asym_edge_time(uint32_t last_time, uint32_t last_bit,
+                               uint32_t bit, uint32_t ticks, uint8_t level) {
+    int32_t delta = (int32_t)((bit - last_bit) * ticks);
+    if (level)
+        delta += ASYM_DOM_EXTRA;
+    else
+        delta -= ASYM_REC_LOSS;
+    if ((int)bit == s_asym_bad_bit)
+        delta -= 8;  // push this interval outside the edge-timing budget
+    return (last_time - (uint32_t)delta) & CAN_EDGE_TIME_MASK;
+}
+
+// Same as drive_span(), but every edge-to-edge delta carries the measured
+// polarity offset.  Only whole frames (from == 0) are used.
+static int drive_span_asym(can_edge_sm_t *sm, const uint8_t *bits,
+                           uint32_t until, uint32_t t0, uint32_t ticks) {
+    uint8_t prev = 1;
+    uint32_t i;
+    uint32_t last_bit = 0;
+    uint32_t last_time = edge_at(t0, ticks, 0);
+    int have_edge = 0;
+    int edges = 0;
+    int saw_frame = sm->in_frame;
+
+    for (i = 0; i < until; i++) {
+        uint8_t bit = bits_get(bits, i);
+        if (saw_frame && !sm->in_frame)
+            break;
+        if (bit != prev) {
+            uint32_t t = have_edge
+                             ? asym_edge_time(last_time, last_bit, i, ticks, bit)
+                             : edge_at(t0, ticks, i);
+            can_edge_sm_push(sm, can_edge_word(t, bit));
+            last_time = t;
+            last_bit = i;
+            have_edge = 1;
+            edges++;
+            saw_frame = 1;
+            if (!sm->in_frame)
+                break;
+        }
+        prev = bit;
+    }
+    if (sm->in_frame) {
+        uint32_t now = have_edge
+                           ? (last_time - (until - last_bit) * ticks) &
+                                 CAN_EDGE_TIME_MASK
+                           : edge_at(t0, ticks, until);
+        can_edge_sm_time(sm, now);
+    }
+    return edges;
+}
+
+static void drive_batch_asym(can_edge_sm_t *sm, const uint8_t *bits,
+                             uint32_t nbits, uint32_t t0, uint32_t ticks) {
+    can_edge_sm_init(sm, ticks);
+    s_asym_bad_bit = -1;
+    drive_span_asym(sm, bits, nbits, t0, ticks);
+}
+
+static void check_agrees_asym(const uint8_t *bits, uint32_t nbits,
+                              uint32_t t0, uint32_t ticks) {
+    can_edge_sm_t batch;
+    can_parsed_t want;
+
+    CHECK(can_frame_decode(bits, nbits, &want) == want.validity);
+    drive_batch_asym(&batch, bits, nbits, t0, ticks);
+    check_parsed(&batch, &want);
+    // The quiet-tail interleave is covered by the recorded hardware capture
+    // test, which calls can_edge_sm_time() between FIFO words.
+}
+
 static void check_agrees(const uint8_t *bits, uint32_t nbits,
                          uint32_t t0, uint32_t ticks) {
     can_edge_sm_t batch;
@@ -1105,14 +1187,16 @@ static void check_agrees(const uint8_t *bits, uint32_t nbits,
 }
 
 // Feed edges as can_rx_pair words: (t[1->0] << 16) | t[0->1], each the low
-// 16 bits of the PIO's two-cycle counter.  *edge_no models the capture path:
-// every edge leaves X one count high (see can_pio_rx_pair_program()), so the
-// k-th timestamp
-// is ideal + k.  The decoder's bias of 1 puts the gap back.  Appends to an
-// existing decoder, so a second frame can follow the first across an idle gap.
+// 16 bits of the PIO's two-cycle counter.  Both edge polarities are sampled
+// at the same phase of the count grid (see can_pio_rx_pair_program()), so
+// every timestamp carries the same constant offset and it cancels in each
+// fall/rise delta; the decoder uses bias 0.  Appends to an existing decoder,
+// so a second frame can follow the first across an idle gap.
+#define PAIR_SAMPLE_OFFSET 1u
+
 static void feed_pairs(can_edge_pair_t *pair, can_edge_sm_t *sm,
                        const uint8_t *bits, uint32_t nbits,
-                       uint32_t t0, uint32_t ticks, uint32_t *edge_no) {
+                       uint32_t t0, uint32_t ticks) {
     uint8_t prev = 1;
     uint32_t hi = 0;
     uint32_t i;
@@ -1124,8 +1208,8 @@ static void feed_pairs(can_edge_pair_t *pair, can_edge_sm_t *sm,
         if (started && !sm->in_frame)
             break;
         if (bit != prev) {
-            uint32_t t = (uint16_t)(edge_at(t0, ticks, i) + *edge_no);
-            (*edge_no)++;
+            uint32_t t =
+                (uint16_t)(edge_at(t0, ticks, i) + PAIR_SAMPLE_OFFSET);
             if (!have_hi) {
                 hi = t;
                 have_hi = 1;
@@ -1145,11 +1229,10 @@ static void feed_pairs(can_edge_pair_t *pair, can_edge_sm_t *sm,
 static void drive_pairs(can_edge_sm_t *sm, const uint8_t *bits, uint32_t nbits,
                         uint32_t t0, uint32_t ticks) {
     can_edge_pair_t pair;
-    uint32_t edge_no = 0;
 
     can_edge_sm_init(sm, ticks);
-    can_edge_pair_init(&pair, sm, t0, 1);
-    feed_pairs(&pair, sm, bits, nbits, t0, ticks, &edge_no);
+    can_edge_pair_init(&pair, sm, t0, 0);
+    feed_pairs(&pair, sm, bits, nbits, t0, ticks);
     if (sm->in_frame)
         can_edge_sm_time(sm, (pair.time - 16u * ticks) & CAN_EDGE_TIME_MASK);
 }
@@ -1398,6 +1481,97 @@ static void test_edge_sm(void) {
                             CAN2040_LITE_MAX_FRAME_BITS, &info);
     CHECK(nbits != 0);
     check_agrees(bits, nbits, EDGE_T0, EDGE_TICKS);
+    TEST_END();
+
+    // Fly-Micro4 measured timing: each edge-to-edge delta is n*T plus a fixed
+    // polarity offset.  This is not a bit-period error, so a decoder that
+    // carries one phase accumulator drifts; one that classifies each edge
+    // interval and re-anchors does not.
+    // Asymmetric edge timing is the RX/CRC milestone.  A dominant ACK slot
+    // changes the tail edge pattern; that belongs to the ACK step and is not
+    // part of this recording (the receiver was RX-only and sent no ACK).
+    for (i = 0; i <= 8; i++) {
+        snprintf(name, sizeof(name),
+                 "asymmetric edges, std dlc %u NACK", (unsigned)i);
+        TEST_BEGIN(name);
+        fill_std(&frame, 0x123, (uint8_t)i, payload);
+        nbits = can_frame_build(&frame, VALID_FRAME, 0, bits,
+                                CAN2040_LITE_MAX_FRAME_BITS, &info);
+        CHECK(nbits != 0);
+        check_agrees_asym(bits, nbits, EDGE_T0, EDGE_TICKS);
+        TEST_END();
+    }
+
+    TEST_BEGIN("asymmetric edges, extended frame NACK");
+    memset(&frame, 0, sizeof(frame));
+    frame.id = 0x18febb11u;
+    frame.dlc = 8;
+    frame.flags = CAN_FRAME_EXTENDED;
+    memcpy(frame.data, payload, 8);
+    nbits = can_frame_build(&frame, VALID_FRAME, 0, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    check_agrees_asym(bits, nbits, EDGE_T0, EDGE_TICKS);
+    TEST_END();
+
+    TEST_BEGIN("asymmetric edges, RTR frame");
+    memset(&frame, 0, sizeof(frame));
+    frame.id = 0x456;
+    frame.dlc = 2;
+    frame.flags = CAN_FRAME_RTR;
+    nbits = can_frame_build(&frame, VALID_FRAME, 0, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    check_agrees_asym(bits, nbits, EDGE_T0, EDGE_TICKS);
+    TEST_END();
+
+    TEST_BEGIN("run delta outside the edge-timing budget is a bit error");
+    fill_std(&frame, 0x123, 8, payload);
+    nbits = can_frame_build(&frame, VALID_FRAME, 1, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    {
+        // Find a one-bit recessive run and corrupt just that interval.
+        uint32_t bad = CAN_BITS_ERROR;
+        int level = 1;
+        uint32_t run = 0;
+        for (i = 0; i < info.stuffed_bits; i++) {
+            uint8_t b = bits_get(bits, i);
+            if (b == level) {
+                run++;
+            } else {
+                if (level == 1 && run == 1) {
+                    bad = i;  // this falling edge ends a 1-bit recessive run
+                    break;
+                }
+                level = b;
+                run = 1;
+            }
+        }
+        CHECK(bad != CAN_BITS_ERROR);
+        can_edge_sm_init(&sm, EDGE_TICKS);
+        s_asym_bad_bit = (int)bad;
+        drive_span_asym(&sm, bits, nbits, EDGE_T0, EDGE_TICKS);
+        s_asym_bad_bit = -1;
+        CHECK(sm.frame_ready);
+        CHECK(sm.validity == INVALID_BIT);
+    }
+    TEST_END();
+
+    // A run just over five bits must still classify as such with the measured
+    // edge skew.  Rounding it down to five would silently drop the sixth bit,
+    // so the violation would surface later as a CRC error, not INVALID_STUFF.
+    TEST_BEGIN("six-bit run with measured edge skew is a stuff error");
+    fill_std(&frame, 0x7ff, 8, payload);
+    nbits = can_frame_build(&frame, INVALID_STUFF, 0, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    CHECK(max_run(bits, info.stuffed_bits) > 5);
+    can_edge_sm_init(&sm, EDGE_TICKS);
+    s_asym_bad_bit = -1;
+    drive_span_asym(&sm, bits, nbits, EDGE_T0, EDGE_TICKS);
+    CHECK(sm.frame_ready);
+    CHECK(sm.validity == INVALID_STUFF);
     TEST_END();
 
     for (i = 0; i < PAT_COUNT; i++) {
@@ -2393,11 +2567,10 @@ static void test_edge_pair(void) {
         can_edge_pair_t pair;
         uint32_t t0 = 0x80000u;
         uint32_t t1;
-        uint32_t edge_no = 0;
 
         can_edge_sm_init(&sm, EDGE_TICKS);
-        can_edge_pair_init(&pair, &sm, t0, 1);
-        feed_pairs(&pair, &sm, bits, nbits, t0, EDGE_TICKS, &edge_no);
+        can_edge_pair_init(&pair, &sm, t0, 0);
+        feed_pairs(&pair, &sm, bits, nbits, t0, EDGE_TICKS);
         CHECK(sm.in_frame);
         can_edge_sm_time(&sm, (pair.time - 16u * EDGE_TICKS) &
                               CAN_EDGE_TIME_MASK);
@@ -2407,7 +2580,7 @@ static void test_edge_pair(void) {
 
         // More than 2^16 ticks later, so the 16-bit idle delta wraps.
         t1 = (t0 - (nbits + 3000u) * EDGE_TICKS) & CAN_EDGE_TIME_MASK;
-        feed_pairs(&pair, &sm, bits2, n2, t1, EDGE_TICKS, &edge_no);
+        feed_pairs(&pair, &sm, bits2, n2, t1, EDGE_TICKS);
         CHECK(sm.in_frame);
         can_edge_sm_time(&sm, (pair.time - 16u * EDGE_TICKS) &
                               CAN_EDGE_TIME_MASK);
@@ -2431,7 +2604,6 @@ static void test_edge_pair(void) {
         can_edge_pair_t pair;
         can_edge_sm_t replay;
         uint32_t t0 = EDGE_T0;
-        uint32_t edge_no = 0;
         uint32_t count;
         uint32_t i;
         uint32_t ntrans = 0;
@@ -2439,9 +2611,9 @@ static void test_edge_pair(void) {
         uint8_t prev = 1;
 
         can_edge_sm_init(&sm, EDGE_TICKS);
-        can_edge_pair_init(&pair, &sm, t0, 1);
+        can_edge_pair_init(&pair, &sm, t0, 0);
         can_edge_pair_record_clear();
-        feed_pairs(&pair, &sm, bits, nbits, t0, EDGE_TICKS, &edge_no);
+        feed_pairs(&pair, &sm, bits, nbits, t0, EDGE_TICKS);
         CHECK(sm.in_frame);
         can_edge_sm_time(&sm, (pair.time - 16u * EDGE_TICKS) &
                               CAN_EDGE_TIME_MASK);
@@ -2470,10 +2642,11 @@ static void test_edge_pair(void) {
             CHECK(r->fall_time == edge_at(t0, EDGE_TICKS, fall_bit));
             CHECK(r->rise_time == edge_at(t0, EDGE_TICKS, rise_bit));
             CHECK((r->word >> 16) ==
-                  (uint16_t)(edge_at(t0, EDGE_TICKS, fall_bit) + 2u * i));
+                  (uint16_t)(edge_at(t0, EDGE_TICKS, fall_bit) +
+                             PAIR_SAMPLE_OFFSET));
             CHECK((uint16_t)r->word ==
                   (uint16_t)(edge_at(t0, EDGE_TICKS, rise_bit) +
-                             2u * i + 1u));
+                             PAIR_SAMPLE_OFFSET));
         }
 
         // The same log must drive a fresh parser to the same result.
@@ -2499,15 +2672,14 @@ static void test_edge_pair(void) {
     {
         can_edge_pair_t pair;
         uint32_t t0 = EDGE_T0;
-        uint32_t edge_no = 0;
         uint32_t ack_index = info.stuffed_bits + 1u;
         uint32_t found = 0;
         uint32_t i;
 
         can_edge_sm_init(&sm, EDGE_TICKS);
-        can_edge_pair_init(&pair, &sm, t0, 1);
+        can_edge_pair_init(&pair, &sm, t0, 0);
         can_edge_pair_record_clear();
-        feed_pairs(&pair, &sm, bits, nbits, t0, EDGE_TICKS, &edge_no);
+        feed_pairs(&pair, &sm, bits, nbits, t0, EDGE_TICKS);
 
         for (i = 0; i < can_edge_pair_record_count(); i++) {
             const can_edge_pair_record_t *r = can_edge_pair_record_get(i);
@@ -2521,6 +2693,55 @@ static void test_edge_pair(void) {
     }
     TEST_END();
 #endif // CAN_EDGE_PAIR_TIME_RECORDING
+}
+
+// Replay the raw Fly-Micro4 RX FIFO recording through the production edge
+// decoder.  Between words, advance the quiet tail only up to one tick before
+// the next recorded edge, matching the Pico service's behind-real-time
+// estimate.  The recording starts at a SOF and holds three complete frames.
+static void test_recorded_fly_micro4(void) {
+    can_edge_sm_t sm;
+    can_edge_pair_t pair;
+    static const uint8_t expected[3][8] = {
+        {0x1e,0x1f,0x20,0x21,0x22,0x23,0x24,0x25},
+        {0x1f,0x20,0x21,0x22,0x23,0x24,0x25,0x26},
+        {0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27},
+    };
+    static const uint16_t expected_crc[3] = {0x7B32, 0x72B8, 0x30DA};
+    const uint32_t *words = can_rx_record_fly_micro4_1m;
+    const uint32_t n = sizeof(can_rx_record_fly_micro4_1m) /
+                       sizeof(can_rx_record_fly_micro4_1m[0]);
+    uint32_t got = 0;
+    uint32_t i;
+
+    printf("\n-- Recorded Fly-Micro4 RX edges --\n");
+    TEST_BEGIN("recorded 1 Mbit RX edges decode three frames");
+    can_edge_sm_init(&sm, CAN_RX_RECORD_FLY_MICRO4_TICKS_PER_BIT);
+    can_edge_pair_init(&pair, &sm, 0, 0);
+    for (i = 0; i < n; i++) {
+        can_edge_pair_push(&pair, words[i]);
+        if (i + 1u < n && sm.in_frame) {
+            const uint32_t next_fall16 = (words[i + 1u] >> 16) & 0xffffu;
+            const uint32_t d = (uint16_t)(pair.last - next_fall16);
+            const uint32_t next_fall =
+                (pair.time - d) & CAN_EDGE_TIME_MASK;
+            can_edge_sm_time(&sm, (next_fall + 1u) & CAN_EDGE_TIME_MASK);
+        }
+        while (sm.frame_ready) {
+            if (sm.validity == VALID_FRAME &&
+                sm.parsed.id == 0x123u &&
+                sm.parsed.dlc == 8u &&
+                sm.parsed.crc == sm.parsed.crc_calc &&
+                got < 3u) {
+                CHECK(memcmp(sm.parsed.data, expected[got], 8) == 0);
+                CHECK(sm.parsed.crc == expected_crc[got]);
+                got++;
+            }
+            sm.frame_ready = 0;
+        }
+    }
+    CHECK(got == 3u);
+    TEST_END();
 }
 
 int main(void) {
@@ -2537,6 +2758,7 @@ int main(void) {
     test_api_skeleton();
     test_api_queue();
     test_edge_sm();
+    test_recorded_fly_micro4();
     test_ack_plan();
     test_ack_cycle_model();
     test_ack_reloc();

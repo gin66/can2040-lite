@@ -76,8 +76,9 @@ static void add(can_pio_program_t *p, uint16_t insn) {
 // edge samples X[15:0] into the ISR; autopush at 32 bits emits one word:
 //   word[31:16] = X[15:0] at the 1->0 edge
 //   word[15:0]  = X[15:0] at the following 0->1 edge
-// The edge path is two cycles with no `jmp x--`, so every captured edge
-// leaves X one count high; the host decoder adds a fixed +1 tick per edge.
+// Both captures sample X at the same phase of the two-cycle count grid, so
+// the constant sampling offset cancels in every fall/rise delta; the host
+// decoder uses bias 0.
 static void build_rx_pair(can_pio_program_t *p) {
     memset(p, 0, sizeof(*p));
     // X was 0: wrap to 0xFFFFFFFF and fall through into `high`.
@@ -120,14 +121,14 @@ static void build_tx(can_pio_program_t *p) {
     add(p, enc_mov(PIO_DST_PINS, PIO_SRC_X));
     // Y == 0: the bit after the CRC.  Drive it and stop.
     add(p, enc_jmp(PIO_COND_YDEC, 9, 0));
-    add(p, enc_irq(6));
+    add(p, enc_irq(0));
     add(p, enc_jmp(PIO_COND_ALWAYS, 12, 0));
     // more: cycles 2..21.  X == 0 means dominant, so never sample.
     add(p, enc_jmp(PIO_COND_NOT_X, 13, 19));
     // Cycle 22 sample, then cycles 23..30.
     add(p, enc_jmp(PIO_COND_PIN, 4, 8));
     // Conflict falls through.  Not part of the bit timing.
-    add(p, enc_irq(7));
+    add(p, enc_irq(1));
     // park: stay here until software re-inits for the next message.
     add(p, enc_jmp(PIO_COND_ALWAYS, 12, 0));
     // dom: dominant bit, cycles 22..30, no sample.

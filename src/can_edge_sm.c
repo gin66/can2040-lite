@@ -109,10 +109,14 @@ static void finish_header(can_edge_sm_t *sm) {
     sm->crc_start = sm->header_bits + (sm->is_rtr ? 0u : (uint32_t)sm->dlc * 8u);
 }
 
-// Stuffing has ended.  raw_bits includes the last stuffed bit.
-static void enter_delim(can_edge_sm_t *sm) {
+// Stuffing has ended.  raw_bits includes the last stuffed bit.  The tail
+// starts at bit_end; tail_sample defaults to the level at that boundary and
+// is refreshed by any edge that arrives before the sample point.
+static void enter_delim(can_edge_sm_t *sm, uint32_t bit_end) {
     sm->phase = PH_DELIM;
     sm->stuffed_raw = sm->raw_bits;
+    sm->tail_mark = bit_end;
+    sm->tail_sample = sm->level;
 }
 
 static void accept_unstuffed(can_edge_sm_t *sm, uint8_t bit, uint32_t bit_end) {
@@ -176,7 +180,7 @@ static void accept_unstuffed(can_edge_sm_t *sm, uint8_t bit, uint32_t bit_end) {
     if (sm->run == 5)
         sm->need_stuff = 1;
     else
-        enter_delim(sm);
+        enter_delim(sm, bit_end);
 }
 
 static void feed_raw(can_edge_sm_t *sm, uint8_t bit, uint32_t bit_end) {
@@ -199,7 +203,7 @@ static void feed_raw(can_edge_sm_t *sm, uint8_t bit, uint32_t bit_end) {
             sm->last = bit;
             if (sm->need_stuff) {
                 sm->need_stuff = 0;
-                enter_delim(sm);
+                enter_delim(sm, bit_end);
             }
             return;
         }
@@ -207,21 +211,25 @@ static void feed_raw(can_edge_sm_t *sm, uint8_t bit, uint32_t bit_end) {
         return;
 
     case PH_DELIM:
-        if (!bit) {
+        if (!sm->tail_sample) {
             fail(sm, INVALID_BIT);
             return;
         }
         sm->phase = PH_ACK;
+        sm->tail_mark = bit_end;
+        sm->tail_sample = sm->level;
         return;
 
     case PH_ACK:
-        sm->ack = (uint8_t)!bit;
+        sm->ack = (uint8_t)!sm->tail_sample;
         sm->ack_seen = 1;
         sm->phase = PH_ACKDEL;
+        sm->tail_mark = bit_end;
+        sm->tail_sample = sm->level;
         return;
 
     case PH_ACKDEL:
-        if (!bit) {
+        if (!sm->tail_sample) {
             fail(sm, INVALID_BIT);
             return;
         }
@@ -346,6 +354,18 @@ void can_edge_sm_push(can_edge_sm_t *sm, uint32_t word) {
     was_in_frame = 1;
     advance_to(sm, time);
     if (sm->in_frame) {
+        // Tail bits are judged at the nominal sample point.  An edge that
+        // arrives before it defines the level sampled in that bit; an edge
+        // after it belongs to the next bit (advance_to() may already have
+        // moved tail_mark to `time`).
+        if (sm->phase == PH_DELIM || sm->phase == PH_ACK ||
+            sm->phase == PH_ACKDEL) {
+            uint32_t off = elapsed_ticks(sm->tail_mark, time);
+            uint32_t sample = (sm->ticks_per_bit * 7u) / 8u;
+
+            if (off <= sample)
+                sm->tail_sample = new_level;
+        }
 #if CAN_ACK_GENERATION_SUPPORT
         sm->last_edge_raw = sm->raw_bits;
 #endif
@@ -386,9 +406,63 @@ void can_edge_pair_init(can_edge_pair_t *pair, can_edge_sm_t *sm,
     pair->have_last = 0;
 }
 
+#if CAN_EDGE_PAIR_TIME_RECORDING
+#if CAN_EDGE_PAIR_RECORD_CAPACITY < 1
+#error "CAN_EDGE_PAIR_RECORD_CAPACITY must be at least 1"
+#endif
+
+static can_edge_pair_record_t pair_records[CAN_EDGE_PAIR_RECORD_CAPACITY];
+static volatile uint32_t pair_record_count;
+static volatile uint32_t pair_record_dropped;
+
+void can_edge_pair_record_clear(void) {
+    pair_record_count = 0;
+    pair_record_dropped = 0;
+}
+
+uint32_t can_edge_pair_record_count(void) {
+    return pair_record_count;
+}
+
+uint32_t can_edge_pair_record_dropped(void) {
+    return pair_record_dropped;
+}
+
+const can_edge_pair_record_t *can_edge_pair_record_get(uint32_t index) {
+    if (index >= pair_record_count)
+        return NULL;
+    return &pair_records[index];
+}
+
+static void pair_record(uint32_t word, uint32_t fall_time,
+                        uint32_t rise_time) {
+    uint32_t i = pair_record_count;
+
+    if (i >= CAN_EDGE_PAIR_RECORD_CAPACITY) {
+        pair_record_dropped++;
+        return;
+    }
+    pair_records[i].word = word;
+    pair_records[i].fall_time = fall_time & CAN_EDGE_TIME_MASK;
+    pair_records[i].rise_time = rise_time & CAN_EDGE_TIME_MASK;
+    __sync_synchronize();
+    pair_record_count = i + 1u;
+}
+#endif // CAN_EDGE_PAIR_TIME_RECORDING
+
 void can_edge_pair_push(can_edge_pair_t *pair, uint32_t word) {
+#if CAN_EDGE_PAIR_TIME_RECORDING
+    uint32_t fall_time;
+#endif
+
     pair_push(pair, (uint16_t)(word >> 16), 0);
+#if CAN_EDGE_PAIR_TIME_RECORDING
+    fall_time = pair->time;
+#endif
     pair_push(pair, (uint16_t)word, 1);
+#if CAN_EDGE_PAIR_TIME_RECORDING
+    pair_record(word, fall_time, pair->time);
+#endif
 }
 
 #if CAN_ACK_GENERATION_SUPPORT

@@ -35,6 +35,12 @@
 // (after a pending stuff bit, if the CRC ended on a 5-run, and after the
 // CRC delimiter).  ack is the slot once ack_seen is set: 1 = dominant.
 //
+// The CRC delimiter, ACK slot, and ACK delimiter are sampled at the nominal
+// 7/8 bit point, not at the bit boundary.  A dominant pulse must therefore
+// still be present at the sample point: an ACK that ends early or starts too
+// late is reported as a NACK, and one that reaches into either delimiter
+// sample is a form error.
+//
 // Results stay readable until the caller clears frame_ready or calls
 // can_edge_sm_init().  A new SOF starts the next frame but does not discard
 // a result that has not been consumed yet.
@@ -82,6 +88,11 @@ typedef struct {
     uint32_t unstuffed;
     uint32_t crc_start;
     uint32_t raw_bits;
+    // Tail bits are sampled at the nominal sample point, not at the bit
+    // boundary, so a dominant ACK pulse that ends early or starts late is
+    // not mistaken for a valid ACK.
+    uint32_t tail_mark;         // down-counter time at the current tail bit start
+    uint8_t tail_sample;        // level at the current tail bit's sample point
 #if CAN_ACK_GENERATION_SUPPORT
     uint32_t last_edge_raw;     // raw wire index of the bit at the last edge
 #endif
@@ -148,6 +159,29 @@ typedef struct {
 void can_edge_pair_init(can_edge_pair_t *pair, can_edge_sm_t *sm,
                         uint32_t now, uint32_t bias);
 void can_edge_pair_push(can_edge_pair_t *pair, uint32_t word);
+
+#if CAN_EDGE_PAIR_TIME_RECORDING
+// Capture log for CAN_EDGE_PAIR_TIME_RECORDING.  Every FIFO word consumed by
+// can_edge_pair_push() is appended until the log fills; later words are
+// counted in the dropped total and not stored.  can2040_lite_pico_rx_arm()
+// clears the log, so an armed frame starts at its first edge.
+//
+// `word` is the raw FIFO entry.  `fall_time`/`rise_time` are the reconstructed
+// 31-bit down-counter values of its 1->0 and 0->1 edges with the pair bias
+// already applied; they are in the same domain as can_edge_sm_push().  A
+// consumer can therefore rebuild the exact edge timeline and check, for
+// example, where a generated ACK pulse sits relative to the ACK slot.
+typedef struct {
+    uint32_t word;
+    uint32_t fall_time;
+    uint32_t rise_time;
+} can_edge_pair_record_t;
+
+void can_edge_pair_record_clear(void);
+uint32_t can_edge_pair_record_count(void);
+uint32_t can_edge_pair_record_dropped(void);
+const can_edge_pair_record_t *can_edge_pair_record_get(uint32_t index);
+#endif // CAN_EDGE_PAIR_TIME_RECORDING
 
 #if CAN_ACK_GENERATION_SUPPORT
 // ACK schedule for the expected CRC field.  Pure: no PIO types, no state.

@@ -629,6 +629,9 @@ extern "C" void can2040_lite_pico_rx_arm(void) {
     irq_set_enabled(rx_irq_num, false);
     can_edge_sm_init(&edge_sm, rx_ticks_per_bit);
     can_edge_pair_init(&edge_pair, &edge_sm, 0, rx_pair_bias);
+#if CAN_EDGE_PAIR_TIME_RECORDING
+    can_edge_pair_record_clear();
+#endif
     rx_last_us = time_us_32();
     frame_ready_flag = false;
     ev_head = 0;

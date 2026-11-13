@@ -35,8 +35,9 @@ cannot share one SM without stalling one direction while the other runs.
 
 CAN2040-Lite is **not a full CAN node**. It is a lightweight data-frame
 transceiver. ACK generation is an edge-locked pulse on the TX state machine
-(`docs/ack_generation.md`); the host-side schedule and cycle model pass,
-while the on-target check needs the RP2350 and a logic analyzer. It
+(`docs/ack_generation.md`); the host-side schedule and cycle model pass, and
+the on-target check can use the opt-in RX edge-pair capture log instead of a
+logic analyzer (see `CAN_EDGE_PAIR_TIME_RECORDING` below). It
 deliberately omits the protocol mechanisms that require
 real-time error participation:
 
@@ -63,10 +64,31 @@ error confinement. CAN2040-Lite now drives ACKs on its own; that helper's
 on-target verification is pending.
 
 Current implementation notes (not protocol requirements): the target backend
-services the RX FIFO from its not-empty IRQ, statistics capture RX/TX totals,
-and frames are not timestamped. The ACK helper swaps the TX instruction image;
-its schedule and cycle model are host-tested, and on-target verification is
-pending.
+services the RX FIFO from its not-empty IRQ, and statistics capture RX/TX
+totals. Frames are not timestamped, but `-DCAN_EDGE_PAIR_TIME_RECORDING=1`
+keeps every RX FIFO edge pair with its reconstructed 31-bit fall/rise times,
+so the receiver itself records a logic-analyzer-style trace (including the
+position of a generated ACK pulse). The RX parser samples the ACK slot at
+7/8 T, so an ACK that ends early or starts late is reported as a NACK, not
+accepted at the bit boundary. The ACK helper swaps the TX instruction
+image; its schedule and cycle model are host-tested, and on-target
+verification is pending.
+
+## RX capture debug interface
+
+`-DCAN_EDGE_PAIR_TIME_RECORDING=1` (or `pio run -e rpipico2_record`) enables
+a RAM-only edge-pair log in `can_edge_sm`; the firmware does **not** stream it
+anywhere. `can2040_lite_pico_rx_arm()` clears the log, and once the frame is
+complete the application reads it from `src/can_edge_sm.h`:
+
+- `can_edge_pair_record_count()` — stored entries
+- `can_edge_pair_record_get(index)` — `word`, `fall_time`, `rise_time`
+- `can_edge_pair_record_dropped()` — entries lost after the log filled
+
+The dump is application policy: iterate the entries and print, store, or
+upload them over whatever transport the application uses. Read them after the
+frame completes and before the next `rx_arm()` clears them. The log holds
+`CAN_EDGE_PAIR_RECORD_CAPACITY` (default 256) entries.
 
 ## Project: suspended-spheres
 
@@ -131,10 +153,11 @@ Direct host builds (equivalent to what the Makefiles do):
 ```bash
 # PC-based host tests (production src/ + host-only frame builder)
 cc -O2 -std=c11 -Wall -Wextra -Werror \
+   -DCAN_EDGE_PAIR_TIME_RECORDING=1 \
    -Isrc -Iextras/tests/common \
    -o extras/tests/pc_based/can_test_units \
    extras/tests/pc_based/can_test_units.c \
-   src/*.c extras/tests/common/*.c
+   src/*.c src/pico/can_pio_program.c extras/tests/common/*.c
 
 # Frame generator CLI
 cc -O2 -std=c11 -Wall -Wextra -Werror \
@@ -241,6 +264,9 @@ Options:
       feeding the ISR state machine.  Not tested on hardware.
 - [x] TX/RX loopback with ACK and NACK readback
 - [x] Saleae verification at 125k, 500k and 1M; back-to-back frames (18-bit gap)
+- [x] Opt-in RX edge-pair capture log (`CAN_EDGE_PAIR_TIME_RECORDING`) that
+      records every FIFO word with reconstructed edge times; host tests replay
+      it and locate the ACK pulse in its slot
 
 ### Planned
 - [ ] ACK helper on-target verification and go-window measurement

@@ -3,7 +3,12 @@
 **Status:** Draft 0.5 — Phases 0–3 complete; PIO loopback/Saleae verified at
 125k/500k/1M (2026-11-08). ACK helper steps 1–3 (schedule, PIO image,
 backend) are implemented and host-tested; on-target and go-window checks
-remain. Arbitration abort, error injection, and real-bus integration remain.
+remain. `-DCAN_EDGE_PAIR_TIME_RECORDING=1` records every RX FIFO edge pair
+with reconstructed times, so ACK placement can be checked from the serial
+harness without a logic analyzer. The RX parser samples the ACK slot at
+7/8 T, so early and late ACK pulses are host-tested as NACK or form error.
+Arbitration abort, error injection, and
+real-bus integration remain.
 **Scope:** Audit corrections, test-generator rewrite, host unit tests, PIO
 validation, integration testing.
 **License:** GPL-3.0-only (derived from can2040). See `LICENSE`.

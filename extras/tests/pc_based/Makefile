@@ -15,6 +15,10 @@ COMMON_DIR ?= ../common
 
 CPPFLAGS += -I$(SRC_DIR) -I$(COMMON_DIR)
 
+# The host suite builds with the opt-in edge-pair capture log enabled so its
+# recording and replay paths are covered.  Production builds default it off.
+CPPFLAGS += -DCAN_EDGE_PAIR_TIME_RECORDING=1
+
 PROTO_SRCS   := $(wildcard $(SRC_DIR)/*.c)
 PIO_SRCS     := $(SRC_DIR)/pico/can_pio_program.c
 SUPPORT_SRCS := $(wildcard $(COMMON_DIR)/*.c)

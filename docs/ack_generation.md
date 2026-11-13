@@ -2,9 +2,14 @@
 
 Status: **implemented and host-tested; on-target verification pending.** The
 schedule, the `can_ack` PIO image (13 words), and the Pico backend are in
-the tree. The analyzer cases and the go-window measurement need hardware.
-The parser still observes the slot (`can_edge_sm.ack_seen` / `ack`) as
-before.
+the tree. The go-window measurement still needs hardware, but the analyzer
+cases do not: build with `-DCAN_EDGE_PAIR_TIME_RECORDING=1` and the RX FIFO
+keeps every edge pair with reconstructed fall/rise times
+(`can_edge_pair_record_*`), so the recorded timeline shows the generated ACK
+pulse relative to the ACK slot. The parser samples the CRC delimiter, ACK
+slot, and ACK delimiter at the nominal 7/8 bit point, so a pulse that ends
+early or starts late reads as a NACK and one that reaches a delimiter sample
+is a form error.
 
 Two firmware gaps are still open. Arming fires when the plan is `ok` and
 the pad level matches; it does not recompute `from_bit` after the pad has

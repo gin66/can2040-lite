@@ -1154,6 +1154,36 @@ static void drive_pairs(can_edge_sm_t *sm, const uint8_t *bits, uint32_t nbits,
         can_edge_sm_time(sm, (pair.time - 16u * ticks) & CAN_EDGE_TIME_MASK);
 }
 
+// Drive a valid frame but replace the ACK slot with a dominant pulse at
+// custom offsets from the slot start.  A negative start offset places the
+// falling edge in the CRC delimiter.  `end_off` is measured from the slot
+// start as well, so a 1-bit pulse is start+ticks .. start+ticks+ticks.
+static void drive_ack_pulse(can_edge_sm_t *sm, const uint8_t *bits,
+                            uint32_t nbits, uint32_t t0, uint32_t ticks,
+                            uint32_t ack_index, int32_t start_off,
+                            uint32_t end_off) {
+    uint8_t prev = 1;
+    uint32_t i;
+    uint32_t slot_time = edge_at(t0, ticks, ack_index);
+    uint32_t fall;
+
+    can_edge_sm_init(sm, ticks);
+    for (i = 0; i < ack_index; i++) {
+        uint8_t bit = bits_get(bits, i);
+        if (bit != prev)
+            can_edge_sm_push(sm, can_edge_word(edge_at(t0, ticks, i), bit));
+        prev = bit;
+    }
+    if (start_off >= 0)
+        fall = (slot_time - (uint32_t)start_off) & CAN_EDGE_TIME_MASK;
+    else
+        fall = (slot_time + (uint32_t)(-start_off)) & CAN_EDGE_TIME_MASK;
+    can_edge_sm_push(sm, can_edge_word(fall, 0));
+    can_edge_sm_push(sm, can_edge_word(
+        (slot_time - end_off) & CAN_EDGE_TIME_MASK, 1));
+    can_edge_sm_time(sm, edge_at(t0, ticks, nbits));
+}
+
 // Stop on the 15th CRC bit, check that ACK is armed before the slot,
 // then finish.  A recessive ACK is consumed only by can_edge_sm_time().
 static void check_ack_arm(const can_frame_t *frame, int ack) {
@@ -1614,6 +1644,79 @@ static void test_edge_sm(void) {
     CHECK(!sm.in_frame);
     CHECK(!sm.frame_ready);
     CHECK(sm.raw_bits == 0);
+    TEST_END();
+
+    // The nominal bit sample point is 7/8 T.  A dominant ACK pulse only
+    // acknowledges the frame if it is present there; unlike a boundary
+    // sample, this rejects a pulse that ends early or starts late.
+    TEST_BEGIN("ACK pulse: correct inset timing is acknowledged");
+    fill_std(&frame, 0x123, 8, payload);
+    nbits = can_frame_build(&frame, VALID_FRAME, 1, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    drive_ack_pulse(&sm, bits, nbits, EDGE_T0, EDGE_TICKS,
+                    info.stuffed_bits + 1u, (int32_t)(EDGE_TICKS / 4u),
+                    EDGE_TICKS + EDGE_TICKS / 4u);
+    CHECK(sm.frame_ready);
+    CHECK(sm.validity == VALID_FRAME);
+    CHECK(sm.crc_match);
+    CHECK(sm.ack_seen);
+    CHECK(sm.ack == 1);
+    TEST_END();
+
+    TEST_BEGIN("ACK pulse ending before the sample point is not an ACK");
+    fill_std(&frame, 0x123, 8, payload);
+    nbits = can_frame_build(&frame, VALID_FRAME, 1, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    drive_ack_pulse(&sm, bits, nbits, EDGE_T0, EDGE_TICKS,
+                    info.stuffed_bits + 1u, 0, EDGE_TICKS / 2u);
+    CHECK(sm.frame_ready);
+    CHECK(sm.validity == VALID_FRAME);
+    CHECK(sm.crc_match);
+    CHECK(sm.ack_seen);
+    CHECK(sm.ack == 0);
+    TEST_END();
+
+    TEST_BEGIN("ACK pulse starting after the sample point is not an ACK");
+    fill_std(&frame, 0x123, 8, payload);
+    nbits = can_frame_build(&frame, VALID_FRAME, 1, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    drive_ack_pulse(&sm, bits, nbits, EDGE_T0, EDGE_TICKS,
+                    info.stuffed_bits + 1u,
+                    (int32_t)((EDGE_TICKS * 15u) / 16u),
+                    (EDGE_TICKS * 3u) / 2u);
+    CHECK(sm.frame_ready);
+    CHECK(sm.validity == VALID_FRAME);
+    CHECK(sm.crc_match);
+    CHECK(sm.ack_seen);
+    CHECK(sm.ack == 0);
+    TEST_END();
+
+    TEST_BEGIN("ACK pulse in the CRC delimiter is a form error");
+    fill_std(&frame, 0x123, 8, payload);
+    nbits = can_frame_build(&frame, VALID_FRAME, 1, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    drive_ack_pulse(&sm, bits, nbits, EDGE_T0, EDGE_TICKS,
+                    info.stuffed_bits + 1u, -(int32_t)(EDGE_TICKS / 2u),
+                    EDGE_TICKS / 2u);
+    CHECK(sm.frame_ready);
+    CHECK(sm.validity == INVALID_BIT);
+    TEST_END();
+
+    TEST_BEGIN("ACK pulse crossing the ACK delimiter sample is a form error");
+    fill_std(&frame, 0x123, 8, payload);
+    nbits = can_frame_build(&frame, VALID_FRAME, 1, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    drive_ack_pulse(&sm, bits, nbits, EDGE_T0, EDGE_TICKS,
+                    info.stuffed_bits + 1u,
+                    (int32_t)((EDGE_TICKS * 15u) / 16u),
+                    (EDGE_TICKS * 15u) / 16u + EDGE_TICKS);
+    CHECK(sm.frame_ready);
+    CHECK(sm.validity == INVALID_BIT);
     TEST_END();
 }
 
@@ -2316,6 +2419,108 @@ static void test_edge_pair(void) {
         CHECK(memcmp(sm.parsed.data, want.data, 1) == 0);
     }
     TEST_END();
+
+#if CAN_EDGE_PAIR_TIME_RECORDING
+    TEST_BEGIN("capture log keeps every pair and replays the frame");
+    fill_std(&frame, 0x123, 8, payload);
+    nbits = can_frame_build(&frame, VALID_FRAME, 1, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    CHECK(can_frame_decode(bits, nbits, &want) == VALID_FRAME);
+    {
+        can_edge_pair_t pair;
+        can_edge_sm_t replay;
+        uint32_t t0 = EDGE_T0;
+        uint32_t edge_no = 0;
+        uint32_t count;
+        uint32_t i;
+        uint32_t ntrans = 0;
+        uint32_t transitions[CAN2040_LITE_MAX_FRAME_BITS];
+        uint8_t prev = 1;
+
+        can_edge_sm_init(&sm, EDGE_TICKS);
+        can_edge_pair_init(&pair, &sm, t0, 1);
+        can_edge_pair_record_clear();
+        feed_pairs(&pair, &sm, bits, nbits, t0, EDGE_TICKS, &edge_no);
+        CHECK(sm.in_frame);
+        can_edge_sm_time(&sm, (pair.time - 16u * EDGE_TICKS) &
+                              CAN_EDGE_TIME_MASK);
+        CHECK(sm.frame_ready);
+        check_parsed(&sm, &want);
+
+        count = can_edge_pair_record_count();
+        CHECK(count > 0);
+        CHECK(can_edge_pair_record_dropped() == 0);
+        CHECK(can_edge_pair_record_get(count) == NULL);
+
+        // Recorded times must equal the ideal edge positions the feeder used.
+        for (i = 0; i < nbits; i++) {
+            uint8_t bit = bits_get(bits, i);
+            if (bit == prev)
+                continue;
+            prev = bit;
+            transitions[ntrans++] = i;
+        }
+        CHECK(ntrans == 2u * count);
+        for (i = 0; i < count; i++) {
+            const can_edge_pair_record_t *r = can_edge_pair_record_get(i);
+            uint32_t fall_bit = transitions[2u * i];
+            uint32_t rise_bit = transitions[2u * i + 1u];
+
+            CHECK(r->fall_time == edge_at(t0, EDGE_TICKS, fall_bit));
+            CHECK(r->rise_time == edge_at(t0, EDGE_TICKS, rise_bit));
+            CHECK((r->word >> 16) ==
+                  (uint16_t)(edge_at(t0, EDGE_TICKS, fall_bit) + 2u * i));
+            CHECK((uint16_t)r->word ==
+                  (uint16_t)(edge_at(t0, EDGE_TICKS, rise_bit) +
+                             2u * i + 1u));
+        }
+
+        // The same log must drive a fresh parser to the same result.
+        can_edge_sm_init(&replay, EDGE_TICKS);
+        for (i = 0; i < count; i++) {
+            const can_edge_pair_record_t *r = can_edge_pair_record_get(i);
+            can_edge_sm_push(&replay, can_edge_word(r->fall_time, 0));
+            can_edge_sm_push(&replay, can_edge_word(r->rise_time, 1));
+        }
+        can_edge_sm_time(&replay,
+                         (can_edge_pair_record_get(count - 1u)->rise_time -
+                          16u * EDGE_TICKS) & CAN_EDGE_TIME_MASK);
+        CHECK(replay.frame_ready);
+        check_parsed(&replay, &want);
+    }
+    TEST_END();
+
+    TEST_BEGIN("capture log locates the ACK pulse in its slot");
+    fill_std(&frame, 0x123, 8, payload);
+    nbits = can_frame_build(&frame, VALID_FRAME, 1, bits,
+                            CAN2040_LITE_MAX_FRAME_BITS, &info);
+    CHECK(nbits != 0);
+    {
+        can_edge_pair_t pair;
+        uint32_t t0 = EDGE_T0;
+        uint32_t edge_no = 0;
+        uint32_t ack_index = info.stuffed_bits + 1u;
+        uint32_t found = 0;
+        uint32_t i;
+
+        can_edge_sm_init(&sm, EDGE_TICKS);
+        can_edge_pair_init(&pair, &sm, t0, 1);
+        can_edge_pair_record_clear();
+        feed_pairs(&pair, &sm, bits, nbits, t0, EDGE_TICKS, &edge_no);
+
+        for (i = 0; i < can_edge_pair_record_count(); i++) {
+            const can_edge_pair_record_t *r = can_edge_pair_record_get(i);
+            if (r->fall_time != edge_at(t0, EDGE_TICKS, ack_index))
+                continue;
+            found++;
+            CHECK(r->rise_time == edge_at(t0, EDGE_TICKS, ack_index + 1u));
+            CHECK(bits_get(bits, ack_index) == 0);
+        }
+        CHECK(found == 1u);
+    }
+    TEST_END();
+#endif // CAN_EDGE_PAIR_TIME_RECORDING
 }
 
 int main(void) {

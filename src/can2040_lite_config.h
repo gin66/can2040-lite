@@ -11,4 +11,17 @@
 #define CAN_ACK_GENERATION_SUPPORT 1
 #endif
 
+// Opt-in capture log.  When set, the edge-pair decoder keeps every FIFO word
+// it consumes, so a received frame can be inspected without a logic analyzer.
+// fall_time/rise_time are reconstructed in can_edge_sm's 31-bit counter
+// domain, which is enough to check edge placement including the ACK pulse.
+// Off by default; the log stops when it reaches CAN_EDGE_PAIR_RECORD_CAPACITY.
+#ifndef CAN_EDGE_PAIR_TIME_RECORDING
+#define CAN_EDGE_PAIR_TIME_RECORDING 0
+#endif
+
+#ifndef CAN_EDGE_PAIR_RECORD_CAPACITY
+#define CAN_EDGE_PAIR_RECORD_CAPACITY 256
+#endif
+
 #endif // CAN2040_LITE_CONFIG_H

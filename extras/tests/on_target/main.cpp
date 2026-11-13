@@ -17,6 +17,7 @@
 #include "can2040.h"
 #include "can2040_lite_pico.h"
 #include "can2040_lite_proto.h"
+#include "can_edge_sm.h"
 #include "can_frame_build.h"
 
 struct frame_vector {
@@ -252,6 +253,27 @@ static bool loopback_case(const char *name, int ack) {
         ok = ok && (p.id == f.id) && (p.dlc == 8) && (p.ack == 0);
         ok = ok && (memcmp(p.data, loop_data, 8) == 0);
     }
+
+#if CAN_EDGE_PAIR_TIME_RECORDING
+    // The RX FIFO log doubles as a logic analyzer: every edge pair of the
+    // transmitted frame must be present, and fall/rise times stay usable.
+    {
+        uint32_t transitions = 0;
+        uint32_t records = can_edge_pair_record_count();
+        uint8_t prev = 1;
+
+        for (uint32_t i = 0; i < tx_n; i++) {
+            uint8_t bit = bits_get(tx_bits, i);
+            if (bit != prev)
+                transitions++;
+            prev = bit;
+        }
+        ok = ok && (records == transitions / 2u);
+        ok = ok && (can_edge_pair_record_dropped() == 0);
+        Serial.printf("    capture log: %u pairs, %u expected\n",
+                      (unsigned)records, (unsigned)(transitions / 2u));
+    }
+#endif
 
     Serial.printf("  %-18s expected %-13s got %-13s %s\n",
                   name, "VALID/NACK",

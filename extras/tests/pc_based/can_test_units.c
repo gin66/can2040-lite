@@ -905,22 +905,26 @@ static void test_api_queue(void) {
     CHECK(st.tx_total == 0);
     TEST_END();
 
-    TEST_BEGIN("two RX results before the callback report overflow");
+    TEST_BEGIN("two RX results are both delivered");
     start_for_test(&cd, 1);
     memset(&frame, 0, sizeof(frame));
     frame.id = 0x111;
     frame.dlc = 1;
+    frame.data[0] = 0x11;
     fake_push_rx_frame(&frame, VALID_FRAME, 0);
     frame.id = 0x222;
+    frame.data[0] = 0x22;
     fake_push_rx_frame(&frame, VALID_FRAME, 0);
     can2040_lite_pio_irq_handler(&cd);
     can2040_lite_get_statistics(&cd, &st);
     CHECK(cb_count == 2);
-    CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_ERROR);
-    CHECK(cb_msg[0].id == 0);
+    CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_RX);
+    CHECK(cb_msg[0].id == 0x111);
+    CHECK(cb_msg[0].data[0] == 0x11);
     CHECK(cb_notify[1] == CAN2040_LITE_NOTIFY_RX);
     CHECK(cb_msg[1].id == 0x222);
-    CHECK(st.rx_overflow == 1);
+    CHECK(cb_msg[1].data[0] == 0x22);
+    CHECK(st.rx_overflow == 0);
     CHECK(st.rx_total == 2);
     TEST_END();
 

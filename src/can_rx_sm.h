@@ -12,8 +12,9 @@
 //   3. protocol state machine: one uint8_t state, shift and CRC
 //
 // The state machine writes decoded fields directly into a ring slot.  The
-// ring is 8 slots; the producer advances rx_idx, the consumer advances
-// tx_idx.  Invalid frames never advance rx_idx.
+// ring is 32 slots and keeps one empty, so 31 frames fit.  The producer
+// advances rx_idx, the consumer advances tx_idx.  Invalid frames never
+// advance rx_idx.
 
 #ifndef CAN_RX_SM_H
 #define CAN_RX_SM_H
@@ -26,7 +27,7 @@
 extern "C" {
 #endif
 
-#define CAN_RX_SLOTS 16u
+#define CAN_RX_SLOTS 32u
 #define CAN_RX_SLOT_MASK (CAN_RX_SLOTS - 1u)
 
 // Decoded frame.  Field order is chosen for alignment:

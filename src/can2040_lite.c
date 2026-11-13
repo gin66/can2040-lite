@@ -264,8 +264,6 @@ void can2040_lite_pio_irq_handler(struct can2040_lite *cd) {
 
 void can2040_lite_pio_service(struct can2040_lite *cd) {
     struct can2040_lite_event ev;
-    struct can2040_lite_msg pending;
-    int have_pending = 0;
 
     if (!cd || !cd->started || !g_hw || !g_hw->poll)
         return;
@@ -319,18 +317,11 @@ void can2040_lite_pio_service(struct can2040_lite *cd) {
                     deliver(cd, CAN2040_LITE_NOTIFY_TX, &cd->tx_done_msg);
                 tx_kick(cd);
             } else {
-                if (have_pending) {
-                    // The previous result was overwritten before its callback
-                    // could run.  Report the loss and keep the newer frame.
-                    struct can2040_lite_msg zero;
-                    memset(&zero, 0, sizeof(zero));
-                    save = can2040_lite_critical_enter();
-                    cd->stats.rx_overflow++;
-                    can2040_lite_critical_exit(save);
-                    deliver(cd, CAN2040_LITE_NOTIFY_ERROR, &zero);
-                }
-                msg_from_parsed(&ev.rx, &pending);
-                have_pending = 1;
+                // One callback per frame.  msg stays valid until it returns.
+                struct can2040_lite_msg msg;
+
+                msg_from_parsed(&ev.rx, &msg);
+                deliver(cd, CAN2040_LITE_NOTIFY_RX, &msg);
             }
             continue;
         }
@@ -347,9 +338,6 @@ void can2040_lite_pio_service(struct can2040_lite *cd) {
             can2040_lite_critical_exit(save);
         }
     }
-
-    if (have_pending)
-        deliver(cd, CAN2040_LITE_NOTIFY_RX, &pending);
 }
 
 void can2040_lite_get_statistics(struct can2040_lite *cd,

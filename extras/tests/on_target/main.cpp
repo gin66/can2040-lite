@@ -130,8 +130,7 @@ static void can2040_app_cb(struct can2040 *cd, uint32_t notify,
 }
 
 static void can2040_pio_irq(void) {
-    // RX-only fast path.  Event/TX/callback work runs from the main loop.
-    can2040_lite_pico_rx_irq();
+    can2040_pio_irq_handler(&cbus);
 }
 
 // Application entry point, matching the can2040 documented startup sequence.
@@ -164,7 +163,7 @@ static void run_api_smoke() {
     // arrives with a second node.  Stop once the result is in either way.
     start = millis();
     while (millis() - start < 50u) {
-        can2040_pio_irq_handler(&cbus);   // main-loop service
+        can2040_pio_service(&cbus);   // main-loop service
         can2040_get_statistics(&cbus, &st);
         if (public_tx_notify || st.tx_nack || st.tx_error ||
             st.tx_attempt > st.tx_total)

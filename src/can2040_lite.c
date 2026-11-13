@@ -252,6 +252,17 @@ static void deliver(struct can2040_lite *cd, uint32_t notify,
 }
 
 void can2040_lite_pio_irq_handler(struct can2040_lite *cd) {
+    if (!cd || !cd->started || !g_hw)
+        return;
+    if (g_hw->irq) {
+        g_hw->irq(cd);
+        return;
+    }
+    // Legacy host backend: no separate RX-only IRQ body.
+    can2040_lite_pio_service(cd);
+}
+
+void can2040_lite_pio_service(struct can2040_lite *cd) {
     struct can2040_lite_event ev;
     struct can2040_lite_msg pending;
     int have_pending = 0;

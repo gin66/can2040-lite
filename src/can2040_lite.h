@@ -107,6 +107,7 @@ struct can2040_lite_hw {
     int (*start)(struct can2040_lite *cd, uint32_t sys_clock,
                  uint32_t bitrate, int32_t gpio_rx, int32_t gpio_tx);
     void (*stop)(struct can2040_lite *cd);
+    void (*irq)(struct can2040_lite *cd);                  // RX-only ISR body
     int (*tx_frame)(const uint8_t *bits, uint32_t nbits);  // 0 = SM accepted
     int (*poll)(struct can2040_lite_event *ev);            // 1 = event stored
 };
@@ -135,8 +136,13 @@ int can2040_lite_transmit(struct can2040_lite *cd,
 // Returns non-zero when a transmit slot is available.
 int can2040_lite_check_transmit(struct can2040_lite *cd);
 
-// PIO IRQ handler (called from the application's PIO IRQ).
+// PIO IRQ handler (called from the application's PIO IRQ).  This only runs
+// the backend RX parser; event/callback/TX work is can2040_lite_pio_service().
 void can2040_lite_pio_irq_handler(struct can2040_lite *cd);
+
+// Main-loop service: ring -> events, TX flags, CRC-tail deadline, callbacks.
+// Call this from the application's main loop/tick.
+void can2040_lite_pio_service(struct can2040_lite *cd);
 
 // Copy the current statistics.
 void can2040_lite_get_statistics(struct can2040_lite *cd,

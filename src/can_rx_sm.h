@@ -26,7 +26,7 @@
 extern "C" {
 #endif
 
-#define CAN_RX_SLOTS 8u
+#define CAN_RX_SLOTS 16u
 #define CAN_RX_SLOT_MASK (CAN_RX_SLOTS - 1u)
 
 // Decoded frame.  Field order is chosen for alignment:
@@ -62,9 +62,13 @@ typedef struct {
 } can_rx_sm_t;
 
 typedef struct {
-    // Configuration.  run_hi[n] is the accepted upper delta for an n-bit run.
+    // Configuration.  A run of n bits is accepted when
+    // run_lo[n] <= delta <= run_hi[n].  Both bounds are fixed at init so the
+    // edge path is only compares.
     uint16_t ticks_per_bit;
     uint16_t run_hi[6];
+    uint32_t run_lo[6];
+    uint32_t ack_guard;
 
     // Edge/run layer.
     uint16_t prev_time16;

@@ -24,6 +24,12 @@
 #define CAN_EDGE_PAIR_RECORD_CAPACITY 256
 #endif
 
+// Debug-only raw FIFO capture.  Off by default so the RX IRQ hot path has no
+// raw_mode branch.
+#ifndef CAN_PICO_RAW_CAPTURE
+#define CAN_PICO_RAW_CAPTURE 0
+#endif
+
 // PIO interrupt flags used by the one-shot TX program for done and error.
 // These are PIO IRQ *flag* numbers, not system IRQ numbers; the application
 // still installs PIOx_IRQ_0.  RP2040 can route only flags 0..3 to the system

@@ -25,6 +25,8 @@ static void run_windows_init(can_rx_t *rx) {
         uint32_t hi = nominal + tol;
 
         rx->run_hi[n] = (uint16_t)(hi > 0xffffu ? 0xffffu : hi);
+        // Same lower edge the old per-edge expression used: 2*n*T - hi.
+        rx->run_lo[n] = 2u * (uint32_t)n * t - rx->run_hi[n];
     }
 }
 
@@ -91,5 +93,6 @@ void can_rx_init(can_rx_t *rx, uint32_t ticks_per_bit) {
 #endif
     rx->ticks_per_bit = (uint16_t)ticks_per_bit;
     run_windows_init(rx);
+    rx->ack_guard = (uint32_t)CAN_RX_ACK_GUARD_BITS * rx->ticks_per_bit;
     can_rx_reset(rx);
 }

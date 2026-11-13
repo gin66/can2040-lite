@@ -122,6 +122,10 @@ static struct can2040_lite *backend_cd;
 static uint32_t rx_last_activity_us;
 static uint32_t rx_us_per_bit;
 static volatile bool rx_activity_flag;
+static uint32_t rx_rep_crc;
+static uint32_t rx_rep_stuff;
+static uint32_t rx_rep_bit;
+static uint32_t rx_rep_overflow;
 
 #if CAN_EDGE_PAIR_TIME_RECORDING
 #define CAN_PICO_RAW_RECORD_WORDS 256u
@@ -256,6 +260,7 @@ extern "C" int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
                                   (uint8_t)(rx_clkdiv_256 & 0xffu));
     sm_config_set_fifo_join(&rx_cfg, PIO_FIFO_JOIN_RX); // 8-deep joined RX
     can_rx_init(&rx, rx_ticks_per_bit);
+    rx_rep_crc = rx_rep_stuff = rx_rep_bit = rx_rep_overflow = 0;
     rx_us_per_bit = bitrate ? (1000000u / bitrate) : 1u;
     if (rx_us_per_bit == 0u)
         rx_us_per_bit = 1u;
@@ -365,13 +370,16 @@ extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
     return 0;
 }
 
-static bool push_event(const struct can2040_lite_event *ev) {
+static struct can2040_lite_event *claim_event(void) {
     uint next = (ev_tail + 1u) % (uint)(sizeof(ev_ring) / sizeof(ev_ring[0]));
+
     if (next == ev_head)
-        return false; // ring full: leave the frame queued
-    ev_ring[ev_tail] = *ev;
-    ev_tail = next;
-    return true;
+        return NULL;
+    return &ev_ring[ev_tail];
+}
+
+static void publish_event(void) {
+    ev_tail = (ev_tail + 1u) % (uint)(sizeof(ev_ring) / sizeof(ev_ring[0]));
 }
 
 static int pop_event(struct can2040_lite_event *ev) {
@@ -396,48 +404,45 @@ static void rx_convert(const can_rx_frame_t *f, can_parsed_t *p) {
     p->total_bits = 0;
 }
 
-static void rx_note_event(can_rx_event_t e) {
+static void rx_sync_stats(void) {
     struct can2040_lite_stats *st;
+    uint32_t crc, stuff, bit, overflow;
+    uint32_t save, d;
 
     if (!backend_cd)
         return;
+    save = save_and_disable_interrupts();
+    crc = rx.crc_errors;
+    stuff = rx.stuff_errors;
+    bit = rx.bit_errors;
+    overflow = rx.overflow;
+    restore_interrupts(save);
+
     st = &backend_cd->stats;
-    switch (e) {
-    case CAN_RX_STUFF_ERROR:
-        st->stuff_errors++;
-        st->parse_error++;
-        break;
-    case CAN_RX_BIT_ERROR:
-        st->bit_errors++;
-        st->parse_error++;
-        break;
-    case CAN_RX_CRC_ERROR:
-        st->crc_errors++;
-        st->parse_error++;
-        break;
-    case CAN_RX_OVERFLOW:
-        st->rx_overflow++;
-        break;
-    default:
-        break;
-    }
+    d = crc - rx_rep_crc;
+    if (d) { st->crc_errors += d; st->parse_error += d; rx_rep_crc = crc; }
+    d = stuff - rx_rep_stuff;
+    if (d) { st->stuff_errors += d; st->parse_error += d; rx_rep_stuff = stuff; }
+    d = bit - rx_rep_bit;
+    if (d) { st->bit_errors += d; st->parse_error += d; rx_rep_bit = bit; }
+    d = overflow - rx_rep_overflow;
+    if (d) { st->rx_overflow += d; rx_rep_overflow = overflow; }
 }
 
 // Portable path: convert ring slots to events.  The direct Pico API keeps
 // the ring for itself.
 static void rx_drain_events(void) {
-    struct can2040_lite_event ev;
-    can_parsed_t p;
-
     if (!backend_cd)
         return;
     while (can_rx_available(&rx)) {
-        rx_convert(can_rx_front(&rx), &p);
-        ev.kind = 2;
-        ev.tx_error = 0;
-        ev.rx = p;
-        if (!push_event(&ev))
+        struct can2040_lite_event *slot = claim_event();
+
+        if (!slot)
             return;
+        slot->kind = 2;
+        slot->tx_error = 0;
+        rx_convert(can_rx_front(&rx), &slot->rx);
+        publish_event();
         can_rx_pop(&rx);
     }
 }
@@ -455,7 +460,7 @@ static void rx_crc_tail_timeout(void) {
     wait_us = ((uint32_t)rem + 2u) * rx_us_per_bit;
     if ((uint32_t)(micros() - rx_last_activity_us) < wait_us)
         return;
-    rx_note_event(can_rx_flush(&rx));
+    (void)can_rx_flush(&rx);
 }
 
 // Copy one image into the fixed TX instruction slot.  The caller has already
@@ -655,11 +660,9 @@ static void ack_service(void) {
 
 // Fast RX IRQ: FIFO drain + inline parser only.
 extern "C" void can2040_lite_pico_rx_irq(void) {
-    bool drained = false;
+    uint32_t n;
 
-    if (!rx_initialized)
-        return;
-
+#if CAN_PICO_RAW_CAPTURE
     if (raw_mode) {
         while (!pio_sm_is_rx_fifo_empty(rx_pio, rx_sm)) {
             const uint32_t word = pio_sm_get(rx_pio, rx_sm);
@@ -668,44 +671,48 @@ extern "C" void can2040_lite_pico_rx_irq(void) {
         }
         return;
     }
+#endif
 
-    while (!pio_sm_is_rx_fifo_empty(rx_pio, rx_sm)) {
+    // One FLEVEL read, then that many FIFO pops.  A word that arrives after
+    // the snapshot keeps the not-empty IRQ asserted, so it is not lost.
+    n = pio_sm_get_rx_fifo_level(rx_pio, rx_sm);
+    if (n == 0u)
+        return;
+    do {
         const uint32_t word = pio_sm_get(rx_pio, rx_sm);
-        can_rx_event_t e;
 
 #if CAN_EDGE_PAIR_TIME_RECORDING
         rx_raw_record[rx_raw_record_head & CAN_PICO_RAW_RECORD_MASK] = word;
         rx_raw_record_head++;
 #endif
-        drained = true;
-        e = can_rx_pair_inline(&rx, word);
-        if (e > CAN_RX_FRAME)
-            rx_note_event(e);
-    }
-    if (drained)
-        rx_activity_flag = true;
+        (void)can_rx_pair_inline(&rx, word);
+    } while (--n);
+    rx_activity_flag = true;
 }
 
 // Main-loop/portable service.  The fast RX IRQ owns the FIFO and parser;
 // this function only handles TX flags, the quiet CRC tail, and ring->event
 // conversion.
 static void pico_service_events(void) {
-    struct can2040_lite_event ev;
-
     if (!rx_initialized)
         return;
+#if CAN_PICO_RAW_CAPTURE
     if (raw_mode)
         return;
+#endif
 
     // TX flags first: the matching ACK/NACK is in the parsed own frame.
     if (tx_initialized && tx_active && !tx_finished_reported) {
         int err = can2040_lite_pico_tx_error_pending();
         int done = can2040_lite_pico_tx_done_pending();
         if (err || done) {
-            memset(&ev, 0, sizeof(ev));
-            ev.kind = 1;
-            ev.tx_error = err ? 1 : 0;
-            (void)push_event(&ev);
+            struct can2040_lite_event *slot = claim_event();
+
+            if (slot) {
+                slot->kind = 1;
+                slot->tx_error = err ? 1 : 0;
+                publish_event();
+            }
             can2040_lite_pico_tx_clear_status();
             tx_finished_reported = true;
 #if CAN_ACK_GENERATION_SUPPORT
@@ -722,9 +729,17 @@ static void pico_service_events(void) {
         rx_activity_flag = false;
         rx_last_activity_us = micros();
     } else {
-        rx_crc_tail_timeout();
+        uint8_t s = rx.sm.state;
+
+        // Idle and post-CRC waits have no recessive tail.  Skip the check.
+        if (s >= ST_CRC_BASE && s <= ST_CRC_LAST)
+            rx_crc_tail_timeout();
     }
-    rx_drain_events();
+    if (rx.crc_errors != rx_rep_crc || rx.stuff_errors != rx_rep_stuff ||
+        rx.bit_errors != rx_rep_bit || rx.overflow != rx_rep_overflow)
+        rx_sync_stats();
+    if (rx.rx_idx != rx.tx_idx)
+        rx_drain_events();
 }
 
 static int pico_poll(struct can2040_lite_event *ev) {
@@ -1025,8 +1040,14 @@ static void pico_hw_stop(struct can2040_lite *cd) {
     ev_tail = 0;
 }
 
+static void pico_rx_irq(struct can2040_lite *cd) {
+    (void)cd;
+    can2040_lite_pico_rx_irq();
+}
+
 static const struct can2040_lite_hw pico_hw = {
-    pico_hw_start, pico_hw_stop, can2040_lite_pico_tx_frame, pico_poll
+    pico_hw_start, pico_hw_stop, pico_rx_irq,
+    can2040_lite_pico_tx_frame, pico_poll
 };
 
 // Strong definitions replace the weak host hooks in can2040_lite.c.

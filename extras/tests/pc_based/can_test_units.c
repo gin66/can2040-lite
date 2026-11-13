@@ -550,7 +550,7 @@ static int fake_hw_poll(struct can2040_lite_event *ev) {
 }
 
 static const struct can2040_lite_hw fake_hw = {
-    fake_hw_start, fake_hw_stop, fake_hw_tx_frame, fake_hw_poll
+    fake_hw_start, fake_hw_stop, NULL, fake_hw_tx_frame, fake_hw_poll
 };
 
 static void fake_reset(void) {

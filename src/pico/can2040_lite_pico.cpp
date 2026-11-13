@@ -44,14 +44,18 @@ static const float tx_clk_mult = 32.0f;
 // accumulate one tick per edge and drift across the frame.
 static const uint32_t rx_pair_bias = 0;
 
-// TX is one-shot per CAN message.  The program raises one of these IRQs and
-// parks; software must re-prepare the SM for the next message.
-//
-// Only PIO IRQ flags 0..3 can be routed to a system IRQ on RP2040
-// (pio_interrupt_source_t has pis_interrupt4..7 only when PICO_PIO_VERSION > 0,
-// i.e. RP2350).  Use 0 and 1 so the same image runs on both chips.
-static const uint CAN_TX_DONE_IRQ = 0;
-static const uint CAN_TX_ERR_IRQ = 1;
+// TX is one-shot per CAN message.  The program raises one of the configured
+// flags and parks; software must re-prepare the SM for the next message.
+// The flag numbers live in can2040_lite_config.h so the runtime program
+// builder and this backend cannot disagree.  RP2040 can route only flags
+// 0..3 to the system IRQ; RP2350 has 0..7.
+static inline pio_interrupt_source_t tx_irq_source(uint flag) {
+    return (pio_interrupt_source_t)((uint)pis_interrupt0 + flag);
+}
+#if defined(PICO_PIO_VERSION) && PICO_PIO_VERSION == 0
+static_assert(CAN_PIO_TX_DONE_IRQ <= 3u && CAN_PIO_TX_ERR_IRQ <= 3u,
+              "RP2040 can route only PIO IRQ flags 0..3");
+#endif
 
 // Joined TX FIFO depth.  One entry is the bit count, and one recessive word
 // is reserved so the OUT that empties the OSR can autopull instead of stalling.
@@ -96,11 +100,14 @@ static bool tx_initialized;
 // this node is not transmitting.  It follows the RX pad and fires only after
 // the receive parser allows it.
 #if CAN_ACK_GENERATION_SUPPORT
-static bool ack_image_loaded;
+static bool ack_image_loaded;     // TX slot currently holds the ACK image
+static bool ack_helper_ok;        // helper is enabled and following the pad
 static bool ack_arm_outstanding;
 static bool ack_allow_sent;
 static bool ack_frame_handled;
+static bool ack_arm_pending;      // plan ready, waiting for the pad level
 static uint32_t ack_frame_seq;
+static uint32_t ack_plan_from;    // raw CRC bit index the plan was built at
 static can_ack_plan_t ack_plan;
 #endif
 static bool tx_active;
@@ -148,6 +155,28 @@ static void ack_start_follow(void);
 static void ack_abort_for_tx(void);
 #endif
 static void pico_service_events(void);
+
+// Both the ACK helper and the one-shot TX launcher run from the RX ISR (the
+// portable handler calls tx_frame() after a completed frame).  Never wait on
+// the PIO without a bound: a stalled EXEC or a full FIFO must fail the
+// operation, not the interrupt.
+static bool pio_put_nb(uint32_t word) {
+    if (pio_sm_is_tx_fifo_full(tx_pio, tx_sm))
+        return false;
+    pio_sm_put(tx_pio, tx_sm, word);
+    return true;
+}
+
+static bool pio_exec_bounded(uint32_t instr) {
+    uint spins = 0;
+
+    pio_sm_exec(tx_pio, tx_sm, instr);
+    while (pio_sm_is_exec_stalled(tx_pio, tx_sm)) {
+        if (++spins > 8u)
+            return false;
+    }
+    return true;
+}
 
 static float clkdiv_for(uint32_t bitrate, float mult) {
     return (float)clock_get_hz(clk_sys) / (mult * (float)bitrate);
@@ -275,8 +304,8 @@ extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
     }
     tx_offset = (uint)off;
     tx_gpio = gpio;
-    pio_interrupt_clear(tx_pio, CAN_TX_DONE_IRQ);
-    pio_interrupt_clear(tx_pio, CAN_TX_ERR_IRQ);
+    pio_interrupt_clear(tx_pio, CAN_PIO_TX_DONE_IRQ);
+    pio_interrupt_clear(tx_pio, CAN_PIO_TX_ERR_IRQ);
 
     tx_cfg = pio_get_default_sm_config();
     sm_config_set_wrap(&tx_cfg, tx_offset + prog->wrap_target,
@@ -321,8 +350,8 @@ extern "C" int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
     // Route the program's done and error flags to the same system IRQ as RX.
     // A transmit that finishes during a recessive bus would otherwise never
     // enter the handler.
-    pio_set_irq0_source_enabled(tx_pio, pis_interrupt0, true);
-    pio_set_irq0_source_enabled(tx_pio, pis_interrupt1, true);
+    pio_set_irq0_source_enabled(tx_pio, tx_irq_source(CAN_PIO_TX_DONE_IRQ), true);
+    pio_set_irq0_source_enabled(tx_pio, tx_irq_source(CAN_PIO_TX_ERR_IRQ), true);
 
     tx_initialized = true;
     tx_active = false;
@@ -394,16 +423,19 @@ static void ack_copy_image(const uint16_t *insns, uint len) {
 
 // Restart the helper in follow mode at the RX pad's current level.  Used at
 // init, after rx re-arm, and once this node's own transmit has passed its ACK
-// slot.
+// slot.  Leaves the SM halted and ack_helper_ok false on failure; ack_service()
+// retries.
 static void ack_start_follow(void) {
     uint32_t save;
     uint32_t pc;
     uint8_t level;
+    bool ok;
 
     if (!tx_initialized)
         return;
     save = save_and_disable_interrupts();
     pio_sm_set_enabled(tx_pio, tx_sm, false);
+    ack_helper_ok = false;
     if (!ack_image_loaded) {
         const can_pio_program_t *ack = can_pio_ack_program();
 
@@ -418,16 +450,20 @@ static void ack_start_follow(void) {
     pio_sm_clear_fifos(tx_pio, tx_sm);
 
     // Follow with X = 0xFFFFFFFF and Y = 0.
-    pio_sm_put_blocking(tx_pio, tx_sm, 0xffffffffu);
-    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_pull(false, true));
-    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_out(pio_x, 32));
-    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_set(pio_y, 0));
+    ok = pio_put_nb(0xffffffffu) &&
+         pio_exec_bounded(pio_encode_pull(false, false)) &&
+         pio_exec_bounded(pio_encode_out(pio_x, 32)) &&
+         pio_exec_bounded(pio_encode_set(pio_y, 0));
 
     ack_arm_outstanding = false;
     ack_allow_sent = false;
+    ack_arm_pending = false;
     ack_frame_handled = false;
     ack_frame_seq = edge_sm.frame_seq;
-    pio_sm_set_enabled(tx_pio, tx_sm, true);
+    if (ok) {
+        pio_sm_set_enabled(tx_pio, tx_sm, true);
+        ack_helper_ok = true;
+    }
     restore_interrupts(save);
 }
 
@@ -442,36 +478,35 @@ static void ack_abort_for_tx(void) {
     if (ack_image_loaded) {
         const can_pio_program_t *tx = can_pio_tx_program();
 
-        pio_sm_exec_wait_blocking(tx_pio, tx_sm,
-                                  pio_encode_set(pio_pins, 1));
+        (void)pio_exec_bounded(pio_encode_set(pio_pins, 1));
         pio_sm_set_enabled(tx_pio, tx_sm, false);
         ack_copy_image(tx->code, tx->length);
         ack_image_loaded = false;
     }
+    ack_helper_ok = false;
     ack_arm_outstanding = false;
     ack_allow_sent = false;
+    ack_arm_pending = false;
     restore_interrupts(save);
 }
 
-static uint32_t ack_bit_us(void) {
-    uint64_t us = (uint64_t)rx_ticks_per_bit * 2u * rx_clkdiv_256 * 1000000ull;
-    us /= (uint64_t)rx_sys_hz * 256ull;
-    return us ? (uint32_t)us : 1u;
-}
-
-// Preload the gap in the OSR, the edge count in X, and clear Y.
-static void ack_arm(const can_ack_plan_t *plan) {
+// Preload the gap in the OSR, the edge count in X, and clear Y.  Every step
+// is non-blocking; a failure leaves Y = 0 so the frame is NACKed.
+static bool ack_arm(const can_ack_plan_t *plan) {
     uint32_t gap = plan->gap_bits * ACK_CYCLES_PER_BIT +
                    ACK_GAP_OFFSET_CYCLES;
 
     pio_sm_clear_fifos(tx_pio, tx_sm);
-    pio_sm_put_blocking(tx_pio, tx_sm, gap);
-    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_pull(false, false));
-    pio_sm_exec_wait_blocking(tx_pio, tx_sm,
-                              pio_encode_set(pio_x, (uint8_t)(plan->edges - 1u)));
-    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_set(pio_y, 0));
+    if (!pio_put_nb(gap) ||
+        !pio_exec_bounded(pio_encode_pull(false, false)) ||
+        !pio_exec_bounded(pio_encode_set(pio_x, (uint8_t)(plan->edges - 1u))) ||
+        !pio_exec_bounded(pio_encode_set(pio_y, 0))) {
+        (void)pio_exec_bounded(pio_encode_set(pio_y, 0));
+        return false;
+    }
     ack_arm_outstanding = true;
     ack_allow_sent = false;
+    return true;
 }
 
 // Set Y only while the pulse instruction is still ahead.  A late allow in the
@@ -482,23 +517,26 @@ static void ack_allow(void) {
     // setting Y can still allow this slot.
     if (!can_ack_allow_pc(tx_pio->sm[tx_sm].addr, tx_offset))
         return;
-    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_set(pio_y, 1));
-    ack_allow_sent = true;
+    if (pio_exec_bounded(pio_encode_set(pio_y, 1)))
+        ack_allow_sent = true;
 }
 
 // Called after every pair push (and after a quiet-tail advance).  It computes
-// the plan once per frame at the CRC start, arms the helper, and lets it fire
-// only when the receive parser reports a CRC match.
+// the plan once per frame at the CRC start, arms the helper when the pad is on
+// the planned level, and lets it fire only when the parser reports a CRC
+// match.  If the pad leaves that level before the arm succeeds, an edge was
+// missed and the frame is left NACKed rather than armed with a stale count.
 static void ack_on_push(void) {
     uint32_t rel;
     uint8_t pad;
 
-    if (!tx_initialized || !ack_image_loaded || tx_active)
+    if (!tx_initialized || !ack_helper_ok || tx_active)
         return;
 
     if (edge_sm.frame_seq != ack_frame_seq) {
         ack_frame_seq = edge_sm.frame_seq;
         ack_frame_handled = false;
+        ack_arm_pending = false;
         ack_arm_outstanding = false;
         ack_allow_sent = false;
     }
@@ -510,24 +548,22 @@ static void ack_on_push(void) {
                   : 0u;
         ack_plan = can_ack_plan(edge_sm.crc_calc, edge_sm.crc_run_start,
                                 edge_sm.crc_last_start, rel);
+        ack_plan_from = rel;
+        ack_arm_pending = ack_plan.ok != 0;
+    }
+
+    if (ack_arm_pending && !ack_arm_outstanding) {
+        rel = (edge_sm.last_edge_raw >= edge_sm.crc_raw_start)
+                  ? edge_sm.last_edge_raw - edge_sm.crc_raw_start
+                  : 0u;
         pad = gpio_get(tx_rx_gpio) ? 1u : 0u;
-        if (ack_plan.ok && pad == ack_plan.level) {
-            ack_arm(&ack_plan);
-        } else if (ack_plan.ok) {
-            // The first CRC edge may be about to arrive.  Spin for at most
-            // two bit times; if the pad reaches the planned level, the
-            // helper has already followed that edge and the remaining edge
-            // count is the plan's.
-            uint32_t limit = 2u * ack_bit_us();
-            uint32_t start = time_us_32();
-            uint8_t old = pad;
-            while ((gpio_get(tx_rx_gpio) ? 1u : 0u) == old &&
-                   (uint32_t)(time_us_32() - start) < limit)
-                ;
-            pad = gpio_get(tx_rx_gpio) ? 1u : 0u;
-            if (pad == ack_plan.level)
-                ack_arm(&ack_plan);
-        }
+        // The arm is only valid while the parser is still at the plan's edge
+        // position.  A new edge invalidates the X count, so NACK instead of
+        // risking a pulse at the wrong point in the frame.
+        if (!edge_sm.in_frame || rel != ack_plan_from || pad != ack_plan.level)
+            ack_arm_pending = false;
+        else
+            ack_arm_pending = !ack_arm(&ack_plan);
     }
 
     if (edge_sm.in_frame && edge_sm.crc_match && ack_arm_outstanding &&
@@ -535,9 +571,9 @@ static void ack_on_push(void) {
         ack_allow();
 
     if (edge_sm.validity == INVALID_CRC || edge_sm.validity == INVALID_STUFF) {
+        ack_arm_pending = false;
         if (ack_arm_outstanding) {
-            pio_sm_exec_wait_blocking(tx_pio, tx_sm,
-                                      pio_encode_set(pio_y, 0));
+            (void)pio_exec_bounded(pio_encode_set(pio_y, 0));
             ack_arm_outstanding = false;
         }
     }
@@ -561,9 +597,11 @@ static void ack_service(void) {
         return;
     }
 
-    if (ack_image_loaded &&
-        can_ack_release_pc(tx_pio->sm[tx_sm].addr, tx_offset) &&
-        can_edge_sm_past_ack_slot(&edge_sm))
+    // Retry a failed restart, and otherwise reload only after the helper has
+    // driven its pulse and the parser is past the ACK slot.
+    if (!ack_helper_ok ||
+        (can_ack_release_pc(tx_pio->sm[tx_sm].addr, tx_offset) &&
+         can_edge_sm_past_ack_slot(&edge_sm)))
         ack_start_follow();
 }
 #endif // CAN_ACK_GENERATION_SUPPORT
@@ -828,16 +866,16 @@ extern "C" void can2040_lite_pico_tx_set_readback_gpio(uint32_t gpio) {
 }
 
 extern "C" int can2040_lite_pico_tx_done_pending(void) {
-    return pio_interrupt_get(tx_pio, CAN_TX_DONE_IRQ) ? 1 : 0;
+    return pio_interrupt_get(tx_pio, CAN_PIO_TX_DONE_IRQ) ? 1 : 0;
 }
 
 extern "C" int can2040_lite_pico_tx_error_pending(void) {
-    return pio_interrupt_get(tx_pio, CAN_TX_ERR_IRQ) ? 1 : 0;
+    return pio_interrupt_get(tx_pio, CAN_PIO_TX_ERR_IRQ) ? 1 : 0;
 }
 
 extern "C" void can2040_lite_pico_tx_clear_status(void) {
-    pio_interrupt_clear(tx_pio, CAN_TX_DONE_IRQ);
-    pio_interrupt_clear(tx_pio, CAN_TX_ERR_IRQ);
+    pio_interrupt_clear(tx_pio, CAN_PIO_TX_DONE_IRQ);
+    pio_interrupt_clear(tx_pio, CAN_PIO_TX_ERR_IRQ);
 }
 
 // Backend entry point for the public startup sequence.  The application
@@ -886,8 +924,8 @@ static void pico_hw_stop(struct can2040_lite *cd) {
         pio_program_t prog = pio_program_of(can_pio_tx_program());
 
         pio_sm_set_enabled(tx_pio, tx_sm, false);
-        pio_set_irq0_source_enabled(tx_pio, pis_interrupt0, false);
-        pio_set_irq0_source_enabled(tx_pio, pis_interrupt1, false);
+        pio_set_irq0_source_enabled(tx_pio, tx_irq_source(CAN_PIO_TX_DONE_IRQ), false);
+        pio_set_irq0_source_enabled(tx_pio, tx_irq_source(CAN_PIO_TX_ERR_IRQ), false);
         pio_sm_unclaim(tx_pio, tx_sm);
         pio_remove_program(tx_pio, &prog, tx_offset);
         tx_initialized = false;
@@ -942,6 +980,15 @@ extern "C" int can2040_lite_pico_tx_frame(const uint8_t *bits,
 #endif
     tx_finished_reported = false;
 
+    // Leaving the SM disabled and the pad recessive keeps a failed launch
+    // fail-safe; the queue head stays queued for the next tx_kick().
+    auto launch_fail = [&]() {
+        pio_sm_set_enabled(tx_pio, tx_sm, false);
+        pio_sm_set_pins_with_mask(tx_pio, tx_sm, 1u << tx_gpio, 1u << tx_gpio);
+        tx_active = false;
+        return -1;
+    };
+
     // Halt the SM, clear the FIFOs/shift counters and point it at `reload`.
     // Restart leaves the OSR shift count at 32 (empty), so the pull below
     // is not the autopull no-op that a full OSR would be.  X is set by the
@@ -953,7 +1000,8 @@ extern "C" int can2040_lite_pico_tx_frame(const uint8_t *bits,
 
     // jmp y-- falls through on the bit where Y was already 0, so the count
     // loaded here is one less than the number of bits to shift.
-    pio_sm_put_blocking(tx_pio, tx_sm, nbits - 1u);
+    if (!pio_put_nb(nbits - 1u))
+        return launch_fail();
 
     // Raw on-wire bits, MSB-first. Bits past nbits are never shifted.
     for (uint32_t w = 0; w < words; w++) {
@@ -963,17 +1011,20 @@ extern "C" int can2040_lite_pico_tx_frame(const uint8_t *bits,
             uint8_t bit = (pos < nbits) ? bits_get(bits, pos) : 1;
             word = (word << 1) | bit;
         }
-        pio_sm_put_blocking(tx_pio, tx_sm, word);
+        if (!pio_put_nb(word))
+            return launch_fail();
     }
     // The OUT that empties the OSR autopulls. Without a spare word that
     // OUT stalls when nbits is a multiple of 32, and DONE never runs.
-    pio_sm_put_blocking(tx_pio, tx_sm, 0xffffffffu);
+    if (!pio_put_nb(0xffffffffu))
+        return launch_fail();
 
     // Move the count into Y and autopull the first message word, so the SOF
     // bit has no stall and every bit stays exactly 32 cycles.
-    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_pull(false, true));
-    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_mov(pio_y, pio_osr));
-    pio_sm_exec_wait_blocking(tx_pio, tx_sm, pio_encode_out(pio_null, 32));
+    if (!pio_exec_bounded(pio_encode_pull(false, true)) ||
+        !pio_exec_bounded(pio_encode_mov(pio_y, pio_osr)) ||
+        !pio_exec_bounded(pio_encode_out(pio_null, 32)))
+        return launch_fail();
 
     can2040_lite_pico_tx_clear_status();
     pio_sm_set_enabled(tx_pio, tx_sm, true);

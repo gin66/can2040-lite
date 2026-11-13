@@ -121,14 +121,14 @@ static void build_tx(can_pio_program_t *p) {
     add(p, enc_mov(PIO_DST_PINS, PIO_SRC_X));
     // Y == 0: the bit after the CRC.  Drive it and stop.
     add(p, enc_jmp(PIO_COND_YDEC, 9, 0));
-    add(p, enc_irq(0));
+    add(p, enc_irq(CAN_PIO_TX_DONE_IRQ));
     add(p, enc_jmp(PIO_COND_ALWAYS, 12, 0));
     // more: cycles 2..21.  X == 0 means dominant, so never sample.
     add(p, enc_jmp(PIO_COND_NOT_X, 13, 19));
     // Cycle 22 sample, then cycles 23..30.
     add(p, enc_jmp(PIO_COND_PIN, 4, 8));
     // Conflict falls through.  Not part of the bit timing.
-    add(p, enc_irq(1));
+    add(p, enc_irq(CAN_PIO_TX_ERR_IRQ));
     // park: stay here until software re-inits for the next message.
     add(p, enc_jmp(PIO_COND_ALWAYS, 12, 0));
     // dom: dominant bit, cycles 22..30, no sample.

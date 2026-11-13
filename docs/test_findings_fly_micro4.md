@@ -34,9 +34,9 @@ Hardware/software used:
 - Host test suite: `TOTAL: 137 passed, 0 failed`, including the recorded
   three-frame replay, the asymmetric-edge cases and a six-bit-run stuff
   check.
-- ACK generation is **not** working yet. See section 6 for the multi-second
-  interrupt finding. Decoder and tests are done; the ACK path is the next
-  milestone.
+- ACK generation is **not** verified yet. The multi-second ISR block in
+  section 6 is fixed in source: the RX ISR no longer waits on the PIO. The
+  ACK pulse itself still needs hardware validation.
 
 ## 2. IRQ number portability (why 6/7 changed)
 
@@ -46,26 +46,17 @@ compiles on RP2350, where `pio_interrupt_source_t` exposes
 be routed to the system IRQ; `pis_interrupt6` and `pis_interrupt7` do not
 exist and the build fails.
 
-The working change is:
+The change, now centralized:
 
-- `CAN_TX_DONE_IRQ = 0`, `CAN_TX_ERR_IRQ = 1`.
-- PIO image builder uses `enc_irq(0)` / `enc_irq(1)`.
-- IRQ source routing uses `pis_interrupt0` / `pis_interrupt1`.
-- `pio_interrupt_get/clear` use the same constants.
-
-Recommendation for the next agent: put the flag numbers in
-`can2040_lite_config.h` and derive the source enum from them, so the PIO
-program and the CPU-side routing cannot drift:
-
-```c
-#define CAN_PIO_TX_DONE_IRQ 0u
-#define CAN_PIO_TX_ERR_IRQ  1u
-#if CAN_PIO_TX_DONE_IRQ > 3u || CAN_PIO_TX_ERR_IRQ > 3u
-#  if PICO_PIO_VERSION == 0
-#    error "RP2040 can only route PIO IRQ flags 0..3"
-#  endif
-#endif
-```
+- `CAN_PIO_TX_DONE_IRQ` / `CAN_PIO_TX_ERR_IRQ` live in
+  `can2040_lite_config.h`, defaulting to 0 and 1.
+- The runtime PIO image builder emits `enc_irq(CAN_PIO_TX_DONE_IRQ)` /
+  `enc_irq(CAN_PIO_TX_ERR_IRQ)`.
+- The backend derives the source enum from the same values with
+  `tx_irq_source() = pis_interrupt0 + flag`; `pio_interrupt_get/clear` use the
+  macros directly.
+- The header rejects equal flags and, on RP2040, flags above 3; the backend
+  repeats the RP2040 bound as a `static_assert`.
 
 These are PIO IRQ **flag** numbers, not system IRQ numbers. The application
 still installs `PIOx_IRQ_0`; `can2040_lite_pico` only configures the sources.
@@ -240,10 +231,10 @@ On-target bring-up commands used (RX-only image):
 
 ## 6. Super-long IRQ time with ACK generation
 
-Status: **open.** The decoder and test work in this tree does not touch the
-ACK path below; it remains the next milestone.
+Status: **fixed in source, needs hardware re-measure.** The cause below is
+kept for reference.
 
-With ACK generation enabled, the RX ISR can block for **seconds**:
+With ACK generation enabled, the RX ISR could block for **seconds**:
 
 ```
 can dbg (ACK build, RX not held):
@@ -272,26 +263,43 @@ If the TX/ACK SM is disabled, already parked, or the FIFO/OSR condition is
 not ready, `pio_sm_exec_wait_blocking` waits for an instruction that may
 never retire. The RX ISR then never returns; this is fatal at 1 Mbit/s.
 
-Required next step:
+Fix applied (`src/pico/can2040_lite_pico.cpp`):
 
-- Remove every unbounded blocking wait from the RX ISR path. Use non-blocking
-  `pio_sm_exec()` plus a bounded `pio_sm_is_exec_stalled()` poll, or defer
-  ACK arming/allow to a bounded state machine outside the ISR.
-- Keep the fail-safe: no ACK unless the CRC match is verified.
+- `pio_put_nb()` replaces every `pio_sm_put_blocking()`; a full FIFO fails
+  the operation instead of spinning.
+- `pio_exec_bounded()` issues `pio_sm_exec()` and polls
+  `pio_sm_is_exec_stalled()` for a fixed eight iterations.  All ACK
+  instructions are non-stalling (`pull noblock`, `OUT` with autopull off,
+  `SET`), so the ordinary path takes zero spins.
+- `ack_start_follow()` preloads X/Y before enabling; on failure it leaves the
+  SM halted and `ack_service()` retries.
+- `ack_arm()` and `ack_allow()` only set Y after a verified arm/CRC match; a
+  failed arm leaves Y = 0, so the frame is NACKed.
+- The 2-bit pad spin in `ack_on_push()` is gone.  Arming is deferred across
+  pushes only while the parser edge position and pad level still match the
+  plan; any edge cancels it with a NACK.
+- `tx_frame()` is also ISR-reachable (via `tx_kick()`), so its puts and
+  execs use the same bounded helpers and leave the pad recessive on failure.
+
+Still to verify on hardware:
+
 - Re-measure `us_max` at 1 Mbit/s with ACK enabled. The RX FIFO only tolerates
   about the time to receive 8 pairs; the ISR budget is a few microseconds,
   not milliseconds.
+- Confirm the deferred-arm path still ACKs every valid frame from the ESP32.
+  A frame that does not arm is deliberately NACKed, never driven late.
 
 ## 7. Open items
 
-1. Replace the ACK blocking waits; verify ACK generation on the Fly-Micro4
-   with the ESP32 (or a second RP2040) as a compliant peer.
-2. Add asymmetric-timing ACK-tail tests after the ACK path is non-blocking.
-3. Verify TX (the current recording is RX-only).
+1. Verify ACK generation on the Fly-Micro4 with the ESP32 (or a second
+   RP2040) as a compliant peer. The blocking ISR waits are fixed in source.
+2. Add asymmetric-timing ACK-tail tests; the ACK path is now non-blocking.
+3. Verify TX (the current recording is RX-only), including the hardened
+   non-blocking launch path in `tx_frame()`.
 4. Re-run the recording with a node that ACKs so the ACK slot and EOF tail
    are real recorded edges, then measure ACK-slot margins.
-5. Decide the final upstream form of the IRQ-number defines and the
-   `lib_archive`/anchor requirement.
+5. Confirm the `lib_archive`/anchor requirement; the IRQ flag defaults are
+   centralized in `can2040_lite_config.h` now.
 6. Restore the ESP32 show-controller image after the bench work; the current
    ESP32 runs `esp32cantx` (TWAI no-ack transmitter).
 

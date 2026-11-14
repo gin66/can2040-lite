@@ -172,6 +172,20 @@ static void run_api_smoke() {
     }
 
     can2040_get_statistics(&cbus, &st);
+
+    // Diagnostic: keep listening briefly and report delivered vs NACKed.
+    start = millis();
+    while (millis() - start < 200u) {
+        can2040_lite_pio_service_for_test_only(&cbus);
+        delay(1);
+    }
+    can2040_get_statistics(&cbus, &st);
+    Serial.printf("  watch: rx=%lu ack_err=%lu tx_total=%lu tx_nack=%lu\n",
+                  (unsigned long)public_rx_notify,
+                  (unsigned long)can2040_lite_pico_rx_ack_errors(),
+                  (unsigned long)st.tx_total,
+                  (unsigned long)st.tx_nack);
+
     ok = ok && (st.tx_attempt == 1);
     can2040_stop(&cbus);
     ok = ok && (can2040_check_transmit(&cbus) == 0);
@@ -454,6 +468,11 @@ static void run_loopback() {
     loopback_case("PIO loopback NACK", 0);
     loopback_two_frames();
     loopback_abort();
+
+    // Stop the periodic Saleae TX and release CAN-TX so another node can
+    // drive the pin; the RX parser keeps listening for the diagnostic.
+    g_tx_total = 0;
+    pinMode(LOOP_GPIO, INPUT);
 }
 #endif // CAN2040_LITE_ENABLE_PIO_LOOPBACK
 
@@ -533,6 +552,14 @@ void loop() {
         while (Serial.available())
             (void)Serial.read();
         run_suite();
+    }
+
+    // Continuous RX diagnostic.
+    static uint32_t last_diag;
+    if (millis() - last_diag >= 1000u) {
+        last_diag = millis();
+        Serial.printf("ack_err=%lu\n",
+                      (unsigned long)can2040_lite_pico_rx_ack_errors());
     }
 #if CAN2040_LITE_ENABLE_PIO_LOOPBACK
     // Keep transmitting for Saleae/TX-timing captures (one message per tick;

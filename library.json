@@ -1,0 +1,8 @@
+{
+  "name": "can2040-lite",
+  "version": "0.0.0+local",
+  "description": "Two-state-machine CAN 2.0B controller for RP2040/RP2350 with edge-locked ACK generation.",
+  "license": "GPL-3.0-only",
+  "frameworks": "arduino",
+  "platforms": "raspberrypi"
+}

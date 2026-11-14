@@ -30,19 +30,34 @@ extern "C" {
 #define CAN_RX_SLOTS 32u
 #define CAN_RX_SLOT_MASK (CAN_RX_SLOTS - 1u)
 
-// Decoded frame.  Field order is chosen for alignment:
-//   id 0..3, data 4..11, dlc 12, flags 13, crc 14..15.
-// Byte order is not the wire order; the parser writes fields as it decodes
-// them.  flags bit 0 is IDE (0 = standard, 1 = extended); RTR is unsupported.
+// Typed receive slot.  The parser writes the raw wire parts; id_part2 bit 0 is
+// IDE (0 = standard, 1 = extended), bit 1 is SRR/RTR.  Data bytes are
+// right-aligned: dlc used bytes occupy data[8-dlc..7].
 typedef struct {
-    uint32_t id;
-    uint8_t data[8];
+    uint8_t id_part1;
+    uint8_t id_part2;
+    uint8_t id_part3;
+    uint8_t id_part4;
+    uint8_t id_part5;
     uint8_t dlc;
-    uint8_t flags;
-    uint16_t crc;
+    uint8_t ack;
+    uint8_t data[8];
 } can_rx_frame_t;
 
-typedef char can_rx_frame_size_check[(sizeof(can_rx_frame_t) == 16u) ? 1 : -1];
+static inline uint32_t can_rx_frame_id(const can_rx_frame_t *f) {
+    uint32_t base = ((uint32_t)f->id_part1 << 3) |
+                    (uint32_t)((f->id_part2 >> 2) & 7u);
+    uint32_t ext = ((uint32_t)f->id_part3 << 10) |
+                   ((uint32_t)f->id_part4 << 2) | (uint32_t)(f->id_part5 & 3u);
+
+    return (f->id_part2 & 1u) ? ((base << 18) | ext) : base;
+}
+
+static inline uint8_t can_rx_frame_flags(const can_rx_frame_t *f) {
+    return (uint8_t)(f->id_part2 & 3u);
+}
+
+typedef char can_rx_frame_size_check[(sizeof(can_rx_frame_t) == 15u) ? 1 : -1];
 
 typedef enum {
     CAN_RX_NONE = 0,
@@ -53,12 +68,9 @@ typedef enum {
     CAN_RX_OVERFLOW = 5
 } can_rx_event_t;
 
-// The only per-frame parser state.  `shift` assembles one data byte; `state`
-// encodes both the field and the bit index within it; `crc_calc` is the
-// CRC-15 register over SOF..data.
+// `crc_calc` is the CRC-15 register over SOF..data.  The parser state and bit
+// position live in can_rx_t as `i`; the data shift register is `shift`.
 typedef struct {
-    uint8_t shift;
-    uint8_t state;
     uint16_t crc_calc;
 } can_rx_sm_t;
 
@@ -73,10 +85,11 @@ typedef struct {
 
     // Edge/run layer.
     uint16_t prev_time16;
-    uint8_t level;
     uint8_t drop_next;
 
     // Parser.
+    uint8_t i;              // 0 = SOF, 1..117 = frame bit, 255 = WAIT
+    uint8_t shift;          // current data byte, written once per 8 bits
     can_rx_sm_t sm;
 
     // Single-producer/single-consumer ring.
@@ -89,6 +102,7 @@ typedef struct {
     uint32_t crc_errors;
     uint32_t stuff_errors;
     uint32_t bit_errors;
+    uint32_t ack_errors;
     uint32_t overflow;
 } can_rx_t;
 
@@ -98,23 +112,10 @@ void can_rx_reset(can_rx_t *rx);
 // One captured edge.  time16 is the low 16 bits of the PIO down-counter,
 // level is the pin level after the edge.  The first falling edge starts a
 // frame; the next edge supplies the first run (which includes SOF).
-can_rx_event_t can_rx_edge(can_rx_t *rx, uint16_t time16, uint8_t level);
+void can_rx_edge(can_rx_t *rx, uint16_t time16, uint8_t level);
 
-// Feed one unstuffed run directly.  Used by tests and by can_rx_edge().
-can_rx_event_t can_rx_feed(can_rx_t *rx, uint8_t level, uint8_t n);
-
-// Number of CRC bits still owed when the parser is in the CRC field at
-// recessive level and all remaining expected CRC bits are recessive.  Returns
-// 0 when no edge-less CRC-tail wait is needed.  This is the exact deadline
-// (in bit times) for completing the last 1..4 bits of a NACKed frame.
-uint8_t can_rx_crc_tail_bits(const can_rx_t *rx);
-
-// Complete a frame whose recessive CRC tail runs into the recessive
-// delimiter with no further edge.  Only valid while the parser is in the CRC
-// field at recessive level; any other quiet state is a stuff error.  Call
-// only when the FIFO is empty and the bus has been quiet for the deadline
-// from can_rx_crc_tail_bits().
-can_rx_event_t can_rx_flush(can_rx_t *rx);
+// One FIFO word: 1->0 timestamp in bits[31:16], 0->1 timestamp in bits[15:0].
+void can_rx_pair(can_rx_t *rx, uint32_t word);
 
 static inline uint8_t can_rx_available(const can_rx_t *rx) {
     return (uint8_t)(rx->tx_idx != rx->rx_idx);

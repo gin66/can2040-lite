@@ -118,10 +118,6 @@ static can_rx_t rx;
 // Set when the portable driver owns the RX path; NULL on the direct/test path.
 static struct can2040_lite *backend_cd;
 
-// Last time a FIFO word was consumed, for the tail flush.
-static uint32_t rx_last_activity_us;
-static uint32_t rx_us_per_bit;
-static volatile bool rx_activity_flag;
 static uint32_t rx_rep_crc;
 static uint32_t rx_rep_stuff;
 static uint32_t rx_rep_bit;
@@ -261,9 +257,6 @@ extern "C" int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
     sm_config_set_fifo_join(&rx_cfg, PIO_FIFO_JOIN_RX); // 8-deep joined RX
     can_rx_init(&rx, rx_ticks_per_bit);
     rx_rep_crc = rx_rep_stuff = rx_rep_bit = rx_rep_overflow = 0;
-    rx_us_per_bit = bitrate ? (1000000u / bitrate) : 1u;
-    if (rx_us_per_bit == 0u)
-        rx_us_per_bit = 1u;
 
     pio_gpio_init(rx_pio, gpio);
     // Leave the pin direction alone: with loopback it is already an output.
@@ -391,14 +384,14 @@ static int pop_event(struct can2040_lite_event *ev) {
 }
 
 static void rx_convert(const can_rx_frame_t *f, can_parsed_t *p) {
-    p->id = f->id;
+    p->id = can_rx_frame_id(f);
     p->dlc = f->dlc;
-    p->is_extended = (uint8_t)(f->flags & 1u);
+    p->is_extended = (uint8_t)(can_rx_frame_flags(f) & 1u);
     p->is_rtr = 0;
-    p->ack = 0;
+    p->ack = f->ack;
     memcpy(p->data, f->data, sizeof(p->data));
-    p->crc = f->crc;
-    p->crc_calc = f->crc;
+    p->crc = 0;
+    p->crc_calc = 0;
     p->validity = VALID_FRAME;
     p->stuffed_bits = 0;
     p->total_bits = 0;
@@ -445,22 +438,6 @@ static void rx_drain_events(void) {
         publish_event();
         can_rx_pop(&rx);
     }
-}
-
-// A final run of 1..4 recessive CRC bits runs straight into the recessive
-// delimiter and has no edge of its own.  The expected CRC tells us exactly
-// how many bits are still owed; wait that long plus a small margin, then
-// finish.  This runs from rx_wait(), not from the per-edge drain.
-static void rx_crc_tail_timeout(void) {
-    uint8_t rem = can_rx_crc_tail_bits(&rx);
-    uint32_t wait_us;
-
-    if (rem == 0u)
-        return;
-    wait_us = ((uint32_t)rem + 2u) * rx_us_per_bit;
-    if ((uint32_t)(micros() - rx_last_activity_us) < wait_us)
-        return;
-    (void)can_rx_flush(&rx);
 }
 
 // Copy one image into the fixed TX instruction slot.  The caller has already
@@ -660,8 +637,6 @@ static void ack_service(void) {
 
 // Fast RX IRQ: FIFO drain + inline parser only.
 extern "C" void can2040_lite_pico_rx_irq(void) {
-    uint32_t n;
-
 #if CAN_PICO_RAW_CAPTURE
     if (raw_mode) {
         while (!pio_sm_is_rx_fifo_empty(rx_pio, rx_sm)) {
@@ -673,21 +648,15 @@ extern "C" void can2040_lite_pico_rx_irq(void) {
     }
 #endif
 
-    // One FLEVEL read, then that many FIFO pops.  A word that arrives after
-    // the snapshot keeps the not-empty IRQ asserted, so it is not lost.
-    n = pio_sm_get_rx_fifo_level(rx_pio, rx_sm);
-    if (n == 0u)
-        return;
-    do {
+    while (!pio_sm_is_rx_fifo_empty(rx_pio, rx_sm)) {
         const uint32_t word = pio_sm_get(rx_pio, rx_sm);
 
 #if CAN_EDGE_PAIR_TIME_RECORDING
         rx_raw_record[rx_raw_record_head & CAN_PICO_RAW_RECORD_MASK] = word;
         rx_raw_record_head++;
 #endif
-        (void)can_rx_pair_inline(&rx, word);
-    } while (--n);
-    rx_activity_flag = true;
+        can_rx_pair_inline(&rx, word);
+    }
 }
 
 // Main-loop/portable service.  The fast RX IRQ owns the FIFO and parser;
@@ -723,18 +692,6 @@ static void pico_service_events(void) {
         }
     }
 
-    // Consume activity from the fast IRQ, or finish a recessive CRC tail
-    // that has no edge of its own.
-    if (rx_activity_flag) {
-        rx_activity_flag = false;
-        rx_last_activity_us = micros();
-    } else {
-        uint8_t s = rx.sm.state;
-
-        // Idle and post-CRC waits have no recessive tail.  Skip the check.
-        if (s >= ST_CRC_BASE && s <= ST_CRC_LAST)
-            rx_crc_tail_timeout();
-    }
     if (rx.crc_errors != rx_rep_crc || rx.stuff_errors != rx_rep_stuff ||
         rx.bit_errors != rx_rep_bit || rx.overflow != rx_rep_overflow)
         rx_sync_stats();
@@ -753,8 +710,6 @@ extern "C" void can2040_lite_pico_rx_arm(void) {
 
     irq_set_enabled(rx_irq_num, false);
     can_rx_reset(&rx);
-    rx_last_activity_us = micros();
-    rx_activity_flag = false;
     latest_parsed_valid = false;
     can2040_lite_pico_rx_record_clear();
     ev_head = 0;

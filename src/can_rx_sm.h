@@ -89,6 +89,7 @@ typedef struct {
 
     // Parser.
     uint8_t i;              // 0 = SOF, 1..117 = frame bit, 255 = WAIT
+    uint8_t rtr;            // remote frame: parse, then drop without delivery
     uint8_t shift;          // current data byte, written once per 8 bits
     can_rx_sm_t sm;
 

@@ -24,6 +24,8 @@ CPPFLAGS += -DCAN2040_LITE_TEST
 PROTO_SRCS   := $(wildcard $(SRC_DIR)/*.c)
 PIO_SRCS     := $(SRC_DIR)/pico/can_pio_program.c
 SUPPORT_SRCS := $(wildcard $(COMMON_DIR)/*.c)
+HEADERS      := $(wildcard $(SRC_DIR)/*.h) $(wildcard $(SRC_DIR)/pico/*.h) \
+                $(wildcard $(COMMON_DIR)/*.h)
 
 BIN := can_test_units
 
@@ -31,7 +33,7 @@ BIN := can_test_units
 
 all: $(BIN)
 
-$(BIN): can_test_units.c $(PROTO_SRCS) $(PIO_SRCS) $(SUPPORT_SRCS)
+$(BIN): can_test_units.c $(PROTO_SRCS) $(PIO_SRCS) $(SUPPORT_SRCS) $(HEADERS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ can_test_units.c \
 		$(PROTO_SRCS) $(PIO_SRCS) $(SUPPORT_SRCS) $(LDFLAGS)
 

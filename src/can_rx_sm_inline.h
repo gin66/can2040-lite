@@ -69,8 +69,8 @@ static inline __attribute__((always_inline)) void can_rx_advance(can_rx_t *rx,
     uint8_t jump = 0;
     uint8_t shift;
 
-    if (i != CAN_BIT_WAIT_FRAME)
-        rx->shift = (uint8_t)((rx->shift << 1) | bit);
+    shift = (uint8_t)((rx->shift << 1) | bit);
+    rx->shift = shift;
 
     if (i < CAN_BIT_CRC_FIRST)
         rx->sm.crc_calc = can_rx_crc_bit(rx->sm.crc_calc, bit);
@@ -78,65 +78,67 @@ static inline __attribute__((always_inline)) void can_rx_advance(can_rx_t *rx,
     // After eight CRC bits the shift holds the first eight expected bits.
     switch (i) {
     case CAN_BIT_ID_BASE_FIRST + 7u:
-        f->id_part1 = rx->shift;
+        f->id_part1 = shift;
         break;
     case CAN_BIT_IDE:
         shift = rx->shift;
         f->id_part2 = shift;
         if ((shift & 1u) == 0u) {
-            if (shift & 2u) {           // standard RTR
-                can_rx_fail_rx(rx, CAN_RX_BIT_ERROR);
-                return;
-            }
+            rx->rtr = (uint8_t)((shift >> 1) & 1u);  // standard RTR
             jump = CAN_IDE_STD_SKIP;
         }
         break;
     case CAN_BIT_RTR_EXT:
-        if (rx->shift & 1u) {           // extended RTR
-            can_rx_fail_rx(rx, CAN_RX_BIT_ERROR);
-            return;
-        }
+        rx->rtr = (uint8_t)(rx->shift & 1u);         // extended RTR
         break;
     case CAN_BIT_ID_EXT_FIRST + 7u:
-        f->id_part3 = rx->shift;
+        f->id_part3 = shift;
         break;
     case CAN_BIT_ID_EXT_LAST - 2u:
-        f->id_part4 = rx->shift;
+        f->id_part4 = shift;
         break;
     case CAN_BIT_ID_EXT_LAST:
-        f->id_part5 = rx->shift;
+        f->id_part5 = shift;
         break;
     case CAN_BIT_DLC_LAST:
-        shift = rx->shift & 0x0fu;
+        shift &= 0x0fu;
         if (shift > CAN_DLC_MAX)
             shift = CAN_DLC_MAX;
         f->dlc = shift;
-        jump = (8 - shift) << 3;
+        jump = rx->rtr ? (8u << 3) : (uint8_t)((8u - shift) << 3);
         break;
     case CAN_BIT_CRC_FIRST + 7u:
-        if (rx->shift != (uint8_t)(rx->sm.crc_calc >> 7)) {
+        if (shift != (uint8_t)(rx->sm.crc_calc >> 7)) {
             can_rx_fail_rx(rx, CAN_RX_CRC_ERROR);
             return;
         }
         break;
     case CAN_BIT_CRC_LAST:
-        if ((rx->shift & 0x7fu) != (rx->sm.crc_calc & 0x7fu)) {
+        if ((shift & 0x7fu) != (rx->sm.crc_calc & 0x7fu)) {
             can_rx_fail_rx(rx, CAN_RX_CRC_ERROR);
             return;
         }
         break;
+    case CAN_BIT_CRC_DELIMITER:
+        // Stuffing stops here; a pending stuff bit was already spent.
+        rx->drop_next = 0;
+        break;
     case CAN_BIT_ACK_SLOT:
         f->ack = (uint8_t)(bit == 0u);
-        if (bit == 0u)
-            can_rx_publish(rx);
-        else
-            rx->ack_errors++;
+        if (!rx->rtr) {
+            if (bit == 0u)
+                can_rx_publish(rx);
+            else
+                rx->ack_errors++;
+        }
+        rx->rtr = 0;
         rx->drop_next = 0;
         rx->i = CAN_BIT_WAIT_FRAME;
         return;
     case CAN_BIT_WAIT_FRAME:
         // drop_next was armed by the run that just started, which includes
         // SOF; do not clear it here.
+        rx->rtr = 0;
         rx->sm.crc_calc = 0;
         rx->write = &rx->frames[rx->rx_idx];
         rx->i = CAN_BIT_ID_BASE_FIRST;
@@ -144,7 +146,7 @@ static inline __attribute__((always_inline)) void can_rx_advance(can_rx_t *rx,
     default:
         if (i >= CAN_BIT_DATA_FIRST && i <= CAN_BIT_DATA_LAST &&
             ((i - CAN_BIT_DATA_FIRST) & 7u) == 7u) {
-            f->data[(i - CAN_BIT_DATA_FIRST) >> 3] = rx->shift;
+            f->data[(i - CAN_BIT_DATA_FIRST) >> 3] = shift;
         }
         break;
     }
@@ -172,9 +174,11 @@ static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
         // No ACK: the tail has no edges, so the run reaching the next SOF is
         // longer than any legal stuffed run.  Drop the frame as a NACK and
         // resync at the SOF.
-        if (level == 1u && rx->i != CAN_BIT_WAIT_FRAME &&
+        if (level == 1u && // redundant: rx->i != CAN_BIT_WAIT_FRAME &&
             rx->i >= CAN_BIT_CRC_TAIL_FIRST) {
-            rx->ack_errors++;
+            if (!rx->rtr)
+                rx->ack_errors++;
+            rx->rtr = 0;
             rx->drop_next = 0;
             rx->i = CAN_BIT_WAIT_FRAME;
             return;
@@ -194,11 +198,6 @@ static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
         rx->drop_next = (uint8_t)(n == 5u);
         if (drop)
             n--;
-        // Stuffing ends at the CRC.  A run that reaches the delimiter must not
-        // arm another stuff bit (it would consume the ACK).
-        if (rx->i != CAN_BIT_WAIT_FRAME &&
-            (uint32_t)rx->i + n > CAN_BIT_CRC_LAST + 1u)
-            rx->drop_next = 0;
     } else if (rx->drop_next) {
         rx->drop_next = 0;
         n--;
@@ -207,7 +206,7 @@ static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
     while (n-- > 0) {
         can_rx_advance(rx, level);
         if (rx->i == CAN_BIT_WAIT_FRAME)
-            return;
+            break;
     }
 }
 

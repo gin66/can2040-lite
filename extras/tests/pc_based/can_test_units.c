@@ -2883,7 +2883,7 @@ static void test_rx_sm(void) {
 
 static void test_rx_sm_errors(void) {
     printf("\n-- Minimal RX parser errors --\n");
-    TEST_BEGIN("CRC, stuff and unsupported RTR are rejected");
+    TEST_BEGIN("CRC and stuff are rejected; RTR is ignored");
     for (int kind = 0; kind < 3; kind++) {
         can_frame_t f;
         frame_validity_t validity = VALID_FRAME;
@@ -2917,8 +2917,35 @@ static void test_rx_sm_errors(void) {
             CHECK(rx.crc_errors == 1u);
         else if (kind == 1)
             CHECK(rx.stuff_errors == 1u);
-        else
-            CHECK(rx.bit_errors == 1u);
+        else {
+            CHECK(rx.bit_errors == 0u);
+            CHECK(rx.ack_errors == 0u);
+        }
+    }
+
+    // A remote frame is ignored even when another node ACKs it.
+    {
+        can_frame_t f;
+        uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
+        can_build_info_t info;
+        can_rx_t rx;
+        uint32_t total;
+        const uint16_t ticks = 64u;
+
+        memset(&f, 0, sizeof(f));
+        f.id = 0x321u;
+        f.flags = CAN_FRAME_RTR;
+        f.dlc = 8;
+        total = can_frame_build(&f, VALID_FRAME, 1, bits,
+                                CAN2040_LITE_MAX_FRAME_BITS, &info);
+        CHECK(total != 0u);
+        can_rx_init(&rx, ticks);
+        drive_rx_pairs(&rx, bits, total, 0x8000u, ticks);
+        CHECK(!can_rx_available(&rx));
+        CHECK(rx.crc_errors == 0u);
+        CHECK(rx.stuff_errors == 0u);
+        CHECK(rx.bit_errors == 0u);
+        CHECK(rx.ack_errors == 0u);
     }
     TEST_END();
 }
@@ -3104,7 +3131,7 @@ static void test_rx_sm_tail(void) {
         else
             continue;
         if (f.flags & CAN_FRAME_RTR)
-            continue;   // RTR is intentionally unsupported by the new parser
+            continue;   // RTR is ignored by the new parser
         snprintf(name, sizeof(name), "%s, ACK", pat_name[pidx]);
         TEST_BEGIN(name);
         total = can_frame_build(&f, VALID_FRAME, 1, bits,

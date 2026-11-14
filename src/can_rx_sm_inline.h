@@ -20,6 +20,15 @@
 #include "can_bit_layout.h"
 #include "can_rx_sm.h"
 
+// The Pico backend overrides these for a per-bit logic-analyzer probe.  Host
+// builds and targets that do not probe use the empty defaults.
+#ifndef CAN_RX_BIT_PROBE_BEGIN
+#define CAN_RX_BIT_PROBE_BEGIN() ((void)0)
+#endif
+#ifndef CAN_RX_BIT_PROBE_END
+#define CAN_RX_BIT_PROBE_END() ((void)0)
+#endif
+
 #define CAN_RX_ACK_GUARD_BITS 9u
 
 // Shift first.  Bit 14 lands in bit 15, which is the test bit.  The uint16_t
@@ -182,7 +191,9 @@ static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
     }
 
     while (n-- > 0) {
+        CAN_RX_BIT_PROBE_BEGIN();
         can_rx_advance(rx, level);
+        CAN_RX_BIT_PROBE_END();
         if (rx->pos == CAN_BIT_WAIT_FRAME)
             break;
     }

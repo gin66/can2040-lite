@@ -44,4 +44,12 @@
 #endif
 #endif
 
+// Optional per-bit logic-analyzer probe.  The application selects a GPIO from
+// its build flags (-DCAN_RX_BIT_PROBE_PIN=<n>); the Pico backend drives it.
+// The RX parser pulses the pin around every unstuffed bit, so the measured
+// pulse width is the parse time of one bit.  0 disables the probe.
+#ifndef CAN_RX_BIT_PROBE_PIN
+#define CAN_RX_BIT_PROBE_PIN 0
+#endif
+
 #endif // CAN2040_LITE_CONFIG_H

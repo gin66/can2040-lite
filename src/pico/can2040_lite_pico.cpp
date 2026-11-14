@@ -34,6 +34,19 @@
 #include "can2040_lite_proto.h"
 #include "can_edge_sm.h"
 #include "can_rx_sm.h"
+#include "can2040_lite_config.h"
+
+// Optional per-bit logic-analyzer probe.  The application picks the GPIO with
+// -DCAN_RX_BIT_PROBE_PIN=<n>; this backend drives it and the RX parser pulses
+// it around every unstuffed bit.  0 leaves the hooks empty.
+#if CAN_RX_BIT_PROBE_PIN
+#include <hardware/structs/sio.h>
+#define CAN_RX_BIT_PROBE_BEGIN() \
+    (sio_hw->gpio_set = 1u << CAN_RX_BIT_PROBE_PIN)
+#define CAN_RX_BIT_PROBE_END() \
+    (sio_hw->gpio_clr = 1u << CAN_RX_BIT_PROBE_PIN)
+#endif
+
 #include "can_rx_sm_inline.h"
 #include "can_pio_program.h"
 #include "can_pio_reloc.h"
@@ -214,6 +227,12 @@ extern "C" int can2040_lite_pico_rx_init(uint32_t gpio, uint32_t bitrate) {
     pio_program_t pio_prog = pio_program_of(prog);
     int sm;
     int off;
+
+#if CAN_RX_BIT_PROBE_PIN
+    gpio_init(CAN_RX_BIT_PROBE_PIN);
+    gpio_set_dir(CAN_RX_BIT_PROBE_PIN, GPIO_OUT);
+    gpio_put(CAN_RX_BIT_PROBE_PIN, 0);
+#endif
 
     rx_pio = backend_pio;
     sm = pio_claim_unused_sm(rx_pio, false);

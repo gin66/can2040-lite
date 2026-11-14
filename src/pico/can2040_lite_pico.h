@@ -30,23 +30,23 @@ void can2040_lite_pico_rx_arm(void);
 
 // Fast RX IRQ body: drain the PIO FIFO and run the inline parser only.
 // No events, callbacks, TX matching, timers, or allocation.  Call this from
-// PIOx_IRQ_0.  The normal portable service can then run from the main loop.
+// PIOx_IRQ_0.  The normal main-loop service can then run from the main loop.
 void can2040_lite_pico_rx_irq(void);
 
-// Wait for the next frame to be parsed (sets frame_ready).  Returns 1 on
-// success, 0 on timeout.  Use can2040_lite_pico_rx_get_parsed() to read it.
+#ifdef CAN2040_LITE_TEST
+// Test-only blocking wait for the next parsed frame.  Returns 1 on success,
+// 0 on timeout.  Use can2040_lite_pico_rx_get_parsed() to read it.
 int can2040_lite_pico_rx_wait(uint32_t timeout_ms);
+#endif
 
+#ifdef CAN2040_LITE_TEST
 // Return the parsed frame from the edge state machine, or NULL if no
 // complete frame is available.  The caller must call this only after
 // can2040_lite_pico_rx_wait() returns 1.  Subsequent frames overwrite the
 // result.
 const can_parsed_t *can2040_lite_pico_rx_get_parsed(void);
+#endif
 
-// Rebuild the on-wire bit stream from the last parsed frame: stuffed
-// SOF..CRC followed by the unstuffed tail.  Returns the number of bits
-// written.  Use can2040_lite_pico_rx_get_parsed() for the decoded frame.
-uint32_t can2040_lite_pico_rx_bits(uint8_t *bits, uint32_t max_bits);
 
 // One-shot message transmit.  `bits` is SOF through the recessive bit after
 // the CRC (already stuffed), MSB-first.  The SM waits for 11 recessive bit
@@ -59,36 +59,27 @@ uint32_t can2040_lite_pico_rx_bits(uint8_t *bits, uint32_t max_bits);
 // state machine accepted the message, -1 otherwise.
 int can2040_lite_pico_tx_frame(const uint8_t *bits, uint32_t nbits);
 
+#ifdef CAN2040_LITE_TEST
 // Change the readback pin used by the TX SM (e.g. to inject bus faults in a
 // test).  Takes effect for the next message.
 void can2040_lite_pico_tx_set_readback_gpio(uint32_t gpio);
+#endif
 
 // Message-complete and abort flags (latched until cleared or tx_frame()).
 int can2040_lite_pico_tx_done_pending(void);
 int can2040_lite_pico_tx_error_pending(void);
 void can2040_lite_pico_tx_clear_status(void);
 
-// Raw FIFO capture for host-side edge analysis.  While enabled, the PIO
-// handler only drains RX FIFO words into the caller's buffer; it does not
-// feed can_edge_sm or generate ACKs.  This keeps up with 1 Mbit/s even on
-// RP2040 because no protocol work happens in the interrupt.  Each word is
-// (fall_timestamp16 << 16) | rise_timestamp16, in arrival order.
-void can2040_lite_pico_raw_begin(uint32_t *words, uint32_t capacity);
-uint32_t can2040_lite_pico_raw_count(void);
-void can2040_lite_pico_raw_end(void);
-
-// Always-on (when CAN_EDGE_PAIR_TIME_RECORDING is set) raw FIFO ring.  The
-// first instruction after each FIFO read is:
+#ifdef CAN2040_LITE_TEST
+// Test-only raw FIFO ring.  The first instruction after each FIFO read is:
 //     record[head++ & 255] = word;
 // The ring keeps the last 256 words.  rx_record_word() takes an absolute
 // word index; older overwritten indices return 0.  rx_arm() clears it.
 void can2040_lite_pico_rx_record_clear(void);
 uint32_t can2040_lite_pico_rx_record_count(void);
 uint32_t can2040_lite_pico_rx_record_word(uint32_t index);
+#endif
 
-// Frames the parser completed with a recessive ACK slot.  With ACK generation
-// disabled this is the count of received frames this node did not acknowledge.
-uint32_t can2040_lite_pico_rx_ack_errors(void);
 
 #ifdef __cplusplus
 }

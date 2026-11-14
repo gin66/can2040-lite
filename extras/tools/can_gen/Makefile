@@ -10,6 +10,7 @@ SRC_DIR    ?= ../../../src
 COMMON_DIR ?= ../../tests/common
 
 CPPFLAGS += -I$(SRC_DIR) -I$(COMMON_DIR)
+CPPFLAGS += -DCAN2040_LITE_TEST
 
 PROTO_SRCS   := $(wildcard $(SRC_DIR)/*.c)
 SUPPORT_SRCS := $(wildcard $(COMMON_DIR)/*.c)

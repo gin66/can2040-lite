@@ -33,7 +33,7 @@ frames, and the callback reported no errors:
 | app `err` | 0 |
 
 Every frame that entered the parser ring was delivered. The earlier
-single-slot hold in `can2040_lite_pio_service` is gone.
+single-slot hold in `can2040_lite_pio_service_for_test_only` is gone.
 
 A shorter slice of the same run:
 
@@ -53,7 +53,7 @@ or form error and is not a lost valid frame.
 The parser ring is 32 slots. One slot stays empty so the producer and
 consumer can tell full from empty, so 31 frames fit. At 7.9k frames/s that
 is about 4 ms of frames between service calls. The event ring stays 16:
-`can2040_lite_pio_service` empties it on the same call, and a full event
+`can2040_lite_pio_service_for_test_only` empties it on the same call, and a full event
 ring leaves the frame in the parser ring instead of dropping it.
 
 This depth has not been measured again on the bus. The 5.1 µs average

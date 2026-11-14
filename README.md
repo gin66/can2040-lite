@@ -125,7 +125,7 @@ program memory), leaving 4 of the 8 SMs free across the chip.
 
 ## Building and Running
 
-The Makefiles wire the portable production code in `src/` into both the host
+The Makefiles wire the driver core in `src/` into both the host
 tests and the CLI tool, so the PC tests exercise the same protocol core that
 runs on-target.
 

@@ -25,7 +25,6 @@
 #define can2040_stop        can2040_lite_stop
 #define can2040_get_statistics can2040_lite_get_statistics
 #define can2040_pio_irq_handler can2040_lite_pio_irq_handler
-#define can2040_pio_service can2040_lite_pio_service
 #define can2040_check_transmit can2040_lite_check_transmit
 #define can2040_transmit    can2040_lite_transmit
 #define CAN2040_ID_RTR      CAN2040_LITE_ID_RTR

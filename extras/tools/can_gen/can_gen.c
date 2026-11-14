@@ -16,6 +16,28 @@
 #include <getopt.h>
 
 #include "can_frame_build.h"
+#include "can2040_lite_backend.h"
+
+// The tool links the driver core for the frame decoder but never starts it.
+int can2040_lite_backend_start(struct can2040_lite *cd, uint32_t sys_clock,
+                               uint32_t bitrate, int32_t gpio_rx,
+                               int32_t gpio_tx) {
+    (void)cd; (void)sys_clock; (void)bitrate; (void)gpio_rx; (void)gpio_tx;
+    return -1;
+}
+
+void can2040_lite_backend_stop(void) {
+}
+
+int can2040_lite_backend_tx_frame(const uint8_t *bits, uint32_t nbits) {
+    (void)bits; (void)nbits;
+    return -1;
+}
+
+int can2040_lite_backend_poll(struct can2040_lite_event *ev) {
+    (void)ev;
+    return 0;
+}
 
 static const char *validity_name(frame_validity_t v) {
     switch (v) {

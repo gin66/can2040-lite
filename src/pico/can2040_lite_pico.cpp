@@ -14,9 +14,9 @@
 // FIFO-not-empty IRQ.  Each word holds the 16-bit timestamps of a 1->0 edge
 // and the following 0->1 edge; can_edge_pair_push() turns them into per-edge
 // pushes for can_edge_sm.  The application installs the PIO IRQ handler and calls
-// can2040_lite_pio_irq_handler(); this backend exposes the hardware through
-// the portable ops table, whose poll() reports a finished TX and then the
-// parsed frames.  The portable handler owns dispatch and statistics.
+// can2040_lite_pio_irq_handler(), which this backend defines as a direct
+// can2040_lite_pico_rx_irq() call.  The backend poll() reports a finished
+// TX and then the parsed frames for the main-loop message processor.
 
 #include <Arduino.h>
 #include <string.h>
@@ -28,6 +28,8 @@
 #include <hardware/sync.h>
 
 #include "can2040_lite_pico.h"
+#include "can2040_lite_pico_internal.h"
+#include "can2040_lite_backend.h"
 #include "can2040_lite.h"    // full struct can2040_lite definition
 #include "can2040_lite_proto.h"
 #include "can_edge_sm.h"
@@ -98,13 +100,6 @@ static bool tx_initialized;
 #if CAN_ACK_GENERATION_SUPPORT
 static bool ack_image_loaded;     // TX slot currently holds the ACK image
 static bool ack_helper_ok;        // helper is enabled and following the pad
-static bool ack_arm_outstanding;
-static bool ack_allow_sent;
-static bool ack_frame_handled;
-static bool ack_arm_pending;      // plan ready, waiting for the pad level
-static uint32_t ack_frame_seq;
-static uint32_t ack_plan_from;    // raw CRC bit index the plan was built at
-static can_ack_plan_t ack_plan;
 #endif
 static bool tx_active;
 #if CAN_ACK_GENERATION_SUPPORT
@@ -115,7 +110,7 @@ static bool tx_finished_reported;
 // Edge-fed RX parser and 8-slot frame ring.
 static can_rx_t rx;
 
-// Set when the portable driver owns the RX path; NULL on the direct/test path.
+// Set when the driver core owns the RX path; NULL on the direct/test path.
 static struct can2040_lite *backend_cd;
 
 static uint32_t rx_rep_crc;
@@ -130,12 +125,6 @@ static uint32_t rx_raw_record[CAN_PICO_RAW_RECORD_WORDS];
 static volatile uint32_t rx_raw_record_head;
 #endif
 
-// Raw RX FIFO capture mode.  No protocol work runs while this is enabled.
-static uint32_t *raw_words;
-static uint32_t raw_capacity;
-static volatile uint32_t raw_count;
-static volatile bool raw_mode;
-
 // Latest frame converted for the direct RX API.
 static can_parsed_t latest_parsed;
 static bool latest_parsed_valid;
@@ -146,7 +135,7 @@ static uint32_t rx_clkdiv_256;   // PIO divider in 1/256 units
 static uint rx_irq_num;
 static bool rx_initialized;
 
-// Events reported by poll() to the portable handler.  pico_service_events()
+// Events reported by poll() to the driver core.  pico_service_events()
 // fills the ring from the RX FIFO, the quiet tail, and the TX done/error flags.
 static struct can2040_lite_event ev_ring[16];
 static uint ev_head;
@@ -161,7 +150,7 @@ static void ack_abort_for_tx(void);
 static void pico_service_events(void);
 
 // Both the ACK helper and the one-shot TX launcher run from the RX ISR (the
-// portable handler calls tx_frame() after a completed frame).  Never wait on
+// driver core calls tx_frame() after a completed frame).  Never wait on
 // the PIO without a bound: a stalled EXEC or a full FIFO must fail the
 // operation, not the interrupt.
 static bool pio_put_nb(uint32_t word) {
@@ -422,7 +411,7 @@ static void rx_sync_stats(void) {
     if (d) { st->rx_overflow += d; rx_rep_overflow = overflow; }
 }
 
-// Portable path: convert ring slots to events.  The direct Pico API keeps
+// Driver-core path: convert ring slots to events.  The direct Pico API keeps
 // the ring for itself.
 static void rx_drain_events(void) {
     if (!backend_cd)
@@ -484,11 +473,6 @@ static void ack_start_follow(void) {
          pio_exec_bounded(pio_encode_out(pio_x, 32)) &&
          pio_exec_bounded(pio_encode_set(pio_y, 0));
 
-    ack_arm_outstanding = false;
-    ack_allow_sent = false;
-    ack_arm_pending = false;
-    ack_frame_handled = false;
-    ack_frame_seq = edge_sm.frame_seq;
     if (ok) {
         pio_sm_set_enabled(tx_pio, tx_sm, true);
         ack_helper_ok = true;
@@ -513,99 +497,7 @@ static void ack_abort_for_tx(void) {
         ack_image_loaded = false;
     }
     ack_helper_ok = false;
-    ack_arm_outstanding = false;
-    ack_allow_sent = false;
-    ack_arm_pending = false;
     restore_interrupts(save);
-}
-
-// Preload the gap in the OSR, the edge count in X, and clear Y.  Every step
-// is non-blocking; a failure leaves Y = 0 so the frame is NACKed.
-static bool ack_arm(const can_ack_plan_t *plan) {
-    uint32_t gap = plan->gap_bits * ACK_CYCLES_PER_BIT +
-                   ACK_GAP_OFFSET_CYCLES;
-
-    pio_sm_clear_fifos(tx_pio, tx_sm);
-    if (!pio_put_nb(gap) ||
-        !pio_exec_bounded(pio_encode_pull(false, false)) ||
-        !pio_exec_bounded(pio_encode_set(pio_x, (uint8_t)(plan->edges - 1u))) ||
-        !pio_exec_bounded(pio_encode_set(pio_y, 0))) {
-        (void)pio_exec_bounded(pio_encode_set(pio_y, 0));
-        return false;
-    }
-    ack_arm_outstanding = true;
-    ack_allow_sent = false;
-    return true;
-}
-
-// Set Y only while the pulse instruction is still ahead.  A late allow in the
-// gap is harmless; one after set pins is not.
-static void ack_allow(void) {
-    // SMx_ADDR is the absolute instruction address, not the offset within
-    // can_ack.  Release and the dominant drive are past the point where
-    // setting Y can still allow this slot.
-    if (!can_ack_allow_pc(tx_pio->sm[tx_sm].addr, tx_offset))
-        return;
-    if (pio_exec_bounded(pio_encode_set(pio_y, 1)))
-        ack_allow_sent = true;
-}
-
-// Called after every pair push (and after a quiet-tail advance).  It computes
-// the plan once per frame at the CRC start, arms the helper when the pad is on
-// the planned level, and lets it fire only when the parser reports a CRC
-// match.  If the pad leaves that level before the arm succeeds, an edge was
-// missed and the frame is left NACKed rather than armed with a stale count.
-static void ack_on_push(void) {
-    uint32_t rel;
-    uint8_t pad;
-
-    if (!tx_initialized || !ack_helper_ok || tx_active)
-        return;
-
-    if (edge_sm.frame_seq != ack_frame_seq) {
-        ack_frame_seq = edge_sm.frame_seq;
-        ack_frame_handled = false;
-        ack_arm_pending = false;
-        ack_arm_outstanding = false;
-        ack_allow_sent = false;
-    }
-
-    if (edge_sm.in_frame && edge_sm.crc_started && !ack_frame_handled) {
-        ack_frame_handled = true;
-        rel = (edge_sm.last_edge_raw >= edge_sm.crc_raw_start)
-                  ? edge_sm.last_edge_raw - edge_sm.crc_raw_start
-                  : 0u;
-        ack_plan = can_ack_plan(edge_sm.crc_calc, edge_sm.crc_run_start,
-                                edge_sm.crc_last_start, rel);
-        ack_plan_from = rel;
-        ack_arm_pending = ack_plan.ok != 0;
-    }
-
-    if (ack_arm_pending && !ack_arm_outstanding) {
-        rel = (edge_sm.last_edge_raw >= edge_sm.crc_raw_start)
-                  ? edge_sm.last_edge_raw - edge_sm.crc_raw_start
-                  : 0u;
-        pad = gpio_get(tx_rx_gpio) ? 1u : 0u;
-        // The arm is only valid while the parser is still at the plan's edge
-        // position.  A new edge invalidates the X count, so NACK instead of
-        // risking a pulse at the wrong point in the frame.
-        if (!edge_sm.in_frame || rel != ack_plan_from || pad != ack_plan.level)
-            ack_arm_pending = false;
-        else
-            ack_arm_pending = !ack_arm(&ack_plan);
-    }
-
-    if (edge_sm.in_frame && edge_sm.crc_match && ack_arm_outstanding &&
-        !ack_allow_sent)
-        ack_allow();
-
-    if (edge_sm.validity == INVALID_CRC || edge_sm.validity == INVALID_STUFF) {
-        ack_arm_pending = false;
-        if (ack_arm_outstanding) {
-            (void)pio_exec_bounded(pio_encode_set(pio_y, 0));
-            ack_arm_outstanding = false;
-        }
-    }
 }
 
 // Reload the helper after this node's own transmit, or restart the follow
@@ -637,17 +529,6 @@ static void ack_service(void) {
 
 // Fast RX IRQ: FIFO drain + inline parser only.
 extern "C" void can2040_lite_pico_rx_irq(void) {
-#if CAN_PICO_RAW_CAPTURE
-    if (raw_mode) {
-        while (!pio_sm_is_rx_fifo_empty(rx_pio, rx_sm)) {
-            const uint32_t word = pio_sm_get(rx_pio, rx_sm);
-            if (raw_count < raw_capacity)
-                raw_words[raw_count++] = word;
-        }
-        return;
-    }
-#endif
-
     while (!pio_sm_is_rx_fifo_empty(rx_pio, rx_sm)) {
         const uint32_t word = pio_sm_get(rx_pio, rx_sm);
 
@@ -659,16 +540,12 @@ extern "C" void can2040_lite_pico_rx_irq(void) {
     }
 }
 
-// Main-loop/portable service.  The fast RX IRQ owns the FIFO and parser;
+// Main-loop service.  The fast RX IRQ owns the FIFO and parser;
 // this function only handles TX flags, the quiet CRC tail, and ring->event
 // conversion.
 static void pico_service_events(void) {
     if (!rx_initialized)
         return;
-#if CAN_PICO_RAW_CAPTURE
-    if (raw_mode)
-        return;
-#endif
 
     // TX flags first: the matching ACK/NACK is in the parsed own frame.
     if (tx_initialized && tx_active && !tx_finished_reported) {
@@ -704,6 +581,10 @@ static int pico_poll(struct can2040_lite_event *ev) {
     return pop_event(ev);
 }
 
+#ifdef CAN2040_LITE_TEST
+#include "can2040_lite_pico_test.inc"
+#endif
+
 extern "C" void can2040_lite_pico_rx_arm(void) {
     if (!rx_initialized)
         return;
@@ -711,7 +592,9 @@ extern "C" void can2040_lite_pico_rx_arm(void) {
     irq_set_enabled(rx_irq_num, false);
     can_rx_reset(&rx);
     latest_parsed_valid = false;
+#ifdef CAN2040_LITE_TEST
     can2040_lite_pico_rx_record_clear();
+#endif
     ev_head = 0;
     ev_tail = 0;
 
@@ -733,195 +616,6 @@ extern "C" void can2040_lite_pico_rx_arm(void) {
 #endif
 }
 
-extern "C" int can2040_lite_pico_rx_wait(uint32_t timeout_ms) {
-    uint32_t start = millis();
-
-    while (!can_rx_available(&rx)) {
-        if (rx_initialized) {
-            uint32_t save = save_and_disable_interrupts();
-
-            can2040_lite_pico_rx_irq();
-            pico_service_events();
-            restore_interrupts(save);
-        }
-        if (can_rx_available(&rx))
-            break;
-        if (millis() - start > timeout_ms)
-            return 0;
-        delay(1);
-    }
-    return 1;
-}
-
-extern "C" const can_parsed_t *can2040_lite_pico_rx_get_parsed(void) {
-    if (!can_rx_available(&rx))
-        return NULL;
-    __sync_synchronize();
-    rx_convert(can_rx_front(&rx), &latest_parsed);
-    can_rx_pop(&rx);
-    latest_parsed_valid = true;
-    return &latest_parsed;
-}
-
-// Rebuild the on-wire bit stream from the parsed fields.  Stuffing covers
-// SOF through the CRC sequence, including a stuff bit when that sequence
-// ends on a 5-run; the tail after it is not stuffed.
-extern "C" uint32_t can2040_lite_pico_rx_bits(uint8_t *bits,
-                                              uint32_t max_bits) {
-    if (!latest_parsed_valid || !bits)
-        return 0;
-
-    const can_parsed_t *p = &latest_parsed;
-    uint32_t n = 0;
-    uint8_t run = 0, last = 1;  // start recessive
-
-    auto put = [&](uint8_t b) {
-        if (n >= max_bits)
-            return false;
-        bits_put(bits, n++, b);
-        return true;
-    };
-    auto stuff = [&]() {
-        if (run < 5)
-            return true;
-        uint8_t s = (uint8_t)(1u - last);
-        if (!put(s))
-            return false;
-        run = 1;
-        last = s;
-        return true;
-    };
-    auto emit = [&](uint32_t val, uint8_t cnt) {
-        for (uint8_t i = 0; i < cnt; i++) {
-            uint8_t b = (uint8_t)((val >> (cnt - 1u - i)) & 1u);
-            if (!stuff() || !put(b))
-                return false;
-            run = (b == last) ? (uint8_t)(run + 1u) : 1u;
-            last = b;
-        }
-        return true;
-    };
-
-    if (!p->is_extended) {
-        // SOF, ID[10:0], RTR, IDE=0, r0, DLC[3:0]
-        if (!emit(0u, 1))
-            return n;
-        if (!emit(p->id & 0x7ffu, 11))
-            return n;
-        if (!emit(p->is_rtr ? 1u : 0u, 1))
-            return n;
-        if (!emit(0u, 2))
-            return n;
-        if (!emit(p->dlc & 0x0fu, 4))
-            return n;
-    } else {
-        // SOF, base ID[10:0], SRR=1, IDE=1, extended ID[17:0], RTR, r1, r0, DLC
-        if (!emit(0u, 1))
-            return n;
-        if (!emit((p->id >> 18) & 0x7ffu, 11))
-            return n;
-        if (!emit(0x3u, 2))
-            return n;
-        if (!emit(p->id & 0x3ffffu, 18))
-            return n;
-        if (!emit(p->is_rtr ? 1u : 0u, 1))
-            return n;
-        if (!emit(0u, 2))
-            return n;
-        if (!emit(p->dlc & 0x0fu, 4))
-            return n;
-    }
-
-    for (uint32_t di = 0; !p->is_rtr && di < (uint32_t)p->dlc * 8u; di++) {
-        uint8_t b = (uint8_t)((p->data[di >> 3] >> (7u - (di & 7u))) & 1u);
-        if (!stuff() || !put(b))
-            return n;
-        run = (b == last) ? (uint8_t)(run + 1u) : 1u;
-        last = b;
-    }
-
-    for (uint32_t ci = 0; ci < 15u; ci++) {
-        uint8_t b = (uint8_t)((p->crc >> (14u - ci)) & 1u);
-        if (!stuff() || !put(b))
-            return n;
-        run = (b == last) ? (uint8_t)(run + 1u) : 1u;
-        last = b;
-    }
-    if (!stuff())
-        return n;
-
-    if (!put(1u))
-        return n;                       // CRC delimiter
-    if (!put(p->ack ? 0u : 1u))
-        return n;                       // ACK slot (dominant = 0)
-    if (!put(1u))
-        return n;                       // ACK delimiter
-    for (int i = 0; i < 10; i++) {      // EOF (7) + IFS (3)
-        if (!put(1u))
-            return n;
-    }
-    return n;
-}
-
-extern "C" void can2040_lite_pico_raw_begin(uint32_t *words,
-                                           uint32_t capacity) {
-    raw_words = words;
-    raw_capacity = capacity;
-    raw_count = 0;
-    raw_mode = true;
-}
-
-extern "C" uint32_t can2040_lite_pico_raw_count(void) {
-    return raw_count;
-}
-
-extern "C" void can2040_lite_pico_raw_end(void) {
-    raw_mode = false;
-}
-
-extern "C" void can2040_lite_pico_rx_record_clear(void) {
-#if CAN_EDGE_PAIR_TIME_RECORDING
-    rx_raw_record_head = 0;
-#endif
-}
-
-extern "C" uint32_t can2040_lite_pico_rx_record_count(void) {
-#if CAN_EDGE_PAIR_TIME_RECORDING
-    return rx_raw_record_head;
-#else
-    return 0;
-#endif
-}
-
-extern "C" uint32_t can2040_lite_pico_rx_record_word(uint32_t index) {
-#if CAN_EDGE_PAIR_TIME_RECORDING
-    uint32_t head = rx_raw_record_head;
-    uint32_t oldest = head > CAN_PICO_RAW_RECORD_WORDS
-                          ? head - CAN_PICO_RAW_RECORD_WORDS
-                          : 0u;
-
-    if (index < oldest || index >= head)
-        return 0;
-    return rx_raw_record[index & CAN_PICO_RAW_RECORD_MASK];
-#else
-    (void)index;
-    return 0;
-#endif
-}
-
-extern "C" uint32_t can2040_lite_pico_rx_ack_errors(void) {
-    return rx_initialized ? rx.ack_errors : 0u;
-}
-
-extern "C" void can2040_lite_pico_tx_set_readback_gpio(uint32_t gpio) {
-    tx_rx_gpio = gpio;
-    pio_gpio_init(tx_pio, gpio);
-    pio_sm_set_jmp_pin(tx_pio, tx_sm, gpio);
-    sm_config_set_jmp_pin(&tx_cfg, gpio);
-#if CAN_ACK_GENERATION_SUPPORT
-    sm_config_set_jmp_pin(&ack_cfg, gpio);
-#endif
-}
 
 extern "C" int can2040_lite_pico_tx_done_pending(void) {
     return pio_interrupt_get(tx_pio, CAN_PIO_TX_DONE_IRQ) ? 1 : 0;
@@ -965,8 +659,7 @@ static int pico_hw_start(struct can2040_lite *cd, uint32_t sys_clock,
     return 0;
 }
 
-static void pico_hw_stop(struct can2040_lite *cd) {
-    (void)cd;
+static void pico_hw_stop(void) {
     backend_cd = NULL;
     if (rx_initialized) {
         pio_program_t prog = pio_program_of(can_pio_rx_pair_program());
@@ -999,19 +692,31 @@ static void pico_hw_stop(struct can2040_lite *cd) {
     ev_tail = 0;
 }
 
-static void pico_rx_irq(struct can2040_lite *cd) {
+extern "C" void can2040_lite_pio_irq_handler(struct can2040_lite *cd) {
     (void)cd;
     can2040_lite_pico_rx_irq();
 }
 
-static const struct can2040_lite_hw pico_hw = {
-    pico_hw_start, pico_hw_stop, pico_rx_irq,
-    can2040_lite_pico_tx_frame, pico_poll
-};
+// Fixed backend interface.  One CAN interface per MCU, so only start() needs
+// the driver instance (for pio_num and the event/stats mapping).
+extern "C" int can2040_lite_backend_start(struct can2040_lite *cd,
+                                          uint32_t sys_clock,
+                                          uint32_t bitrate, int32_t gpio_rx,
+                                          int32_t gpio_tx) {
+    return pico_hw_start(cd, sys_clock, bitrate, gpio_rx, gpio_tx);
+}
 
-// Strong definitions replace the weak host hooks in can2040_lite.c.
-extern "C" void can2040_lite_hw_attach(void) {
-    can2040_lite_set_hw(&pico_hw);
+extern "C" void can2040_lite_backend_stop(void) {
+    pico_hw_stop();
+}
+
+extern "C" int can2040_lite_backend_tx_frame(const uint8_t *bits,
+                                             uint32_t nbits) {
+    return can2040_lite_pico_tx_frame(bits, nbits);
+}
+
+extern "C" int can2040_lite_backend_poll(struct can2040_lite_event *ev) {
+    return pico_poll(ev);
 }
 
 extern "C" uint32_t can2040_lite_critical_enter(void) {

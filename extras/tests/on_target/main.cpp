@@ -163,7 +163,7 @@ static void run_api_smoke() {
     // arrives with a second node.  Stop once the result is in either way.
     start = millis();
     while (millis() - start < 50u) {
-        can2040_pio_service(&cbus);   // main-loop service
+        can2040_lite_pio_service_for_test_only(&cbus);   // test service pump
         can2040_get_statistics(&cbus, &st);
         if (public_tx_notify || st.tx_nack || st.tx_error ||
             st.tx_attempt > st.tx_total)

@@ -94,35 +94,19 @@ struct can2040_lite {
     void *backend;
 };
 
-// Hardware operations.  The host tests install a fake table; the Pico
-// backend installs the real one.  With no table installed, start() still
-// marks the driver started and transmit() still queues.
 struct can2040_lite_event {
     int kind;                 // 0 = none, 1 = tx finished, 2 = rx frame
     int tx_error;             // tx finished: recessive bit read dominant
     can_parsed_t rx;
 };
 
-struct can2040_lite_hw {
-    int (*start)(struct can2040_lite *cd, uint32_t sys_clock,
-                 uint32_t bitrate, int32_t gpio_rx, int32_t gpio_tx);
-    void (*stop)(struct can2040_lite *cd);
-    void (*irq)(struct can2040_lite *cd);                  // RX-only ISR body
-    int (*tx_frame)(const uint8_t *bits, uint32_t nbits);  // 0 = SM accepted
-    int (*poll)(struct can2040_lite_event *ev);            // 1 = event stored
-};
-
-void can2040_lite_set_hw(const struct can2040_lite_hw *hw);
-
-// Weak hook the Pico backend overrides to register its ops table before the
-// first start().  The host link keeps the empty definition in can2040_lite.c.
-void can2040_lite_hw_attach(void);
-
 // Initialise the driver state.  No hardware is touched until start().
 void can2040_lite_setup(struct can2040_lite *cd, uint32_t pio_num);
 
-// Register the frame/notification callback.
+#ifdef CAN2040_LITE_TEST
+// Test-only callback registration; callback mode is not a production path.
 void can2040_lite_callback_config(struct can2040_lite *cd, can2040_lite_cb cb);
+#endif
 
 // Start the transceiver.  gpio_tx == -1 selects receive-only mode.
 void can2040_lite_start(struct can2040_lite *cd, uint32_t sys_clock,
@@ -136,13 +120,16 @@ int can2040_lite_transmit(struct can2040_lite *cd,
 // Returns non-zero when a transmit slot is available.
 int can2040_lite_check_transmit(struct can2040_lite *cd);
 
-// PIO IRQ handler (called from the application's PIO IRQ).  This only runs
-// the backend RX parser; event/callback/TX work is can2040_lite_pio_service().
+// PIO IRQ handler (called from the application's PIO IRQ).  The target
+// backend provides the real definition with its direct RX-only ISR body.
 void can2040_lite_pio_irq_handler(struct can2040_lite *cd);
 
-// Main-loop service: ring -> events, TX flags, CRC-tail deadline, callbacks.
-// Call this from the application's main loop/tick.
-void can2040_lite_pio_service(struct can2040_lite *cd);
+#ifdef CAN2040_LITE_TEST
+// Test-only callback-mode pump for the poll-only host backend: ring -> events,
+// TX flags, CRC-tail deadline, callbacks.  Production targets run the
+// lightweight PIO IRQ plus the application's CAN message processor instead.
+void can2040_lite_pio_service_for_test_only(struct can2040_lite *cd);
+#endif
 
 // Copy the current statistics.
 void can2040_lite_get_statistics(struct can2040_lite *cd,

@@ -6,7 +6,7 @@
 //
 // can_edge_sm.h — ISR state machine for the edge-timestamp CAN receiver.
 //
-// Portable: no PIO dependency.  The live firmware feeds it from the pair
+// Test-only: no PIO dependency.  The host suite feeds it from the pair
 // capture program through can_edge_pair_push().  This machine is what makes
 // a one-bit ACK possible.  It is not wired to a pin, and it does not drive
 // one.  A node must not ACK a frame it is transmitting; crc_match and the
@@ -47,6 +47,8 @@
 
 #ifndef CAN_EDGE_SM_H
 #define CAN_EDGE_SM_H
+
+#ifdef CAN2040_LITE_TEST
 
 #include <stdint.h>
 
@@ -158,7 +160,7 @@ void can_edge_pair_init(can_edge_pair_t *pair, can_edge_sm_t *sm,
                         uint32_t now, uint32_t bias);
 void can_edge_pair_push(can_edge_pair_t *pair, uint32_t word);
 
-#if CAN_EDGE_PAIR_TIME_RECORDING
+#if defined(CAN2040_LITE_TEST) && CAN_EDGE_PAIR_TIME_RECORDING
 // Capture log for CAN_EDGE_PAIR_TIME_RECORDING.  Every FIFO word consumed by
 // can_edge_pair_push() is appended until the log fills; later words are
 // counted in the dropped total and not stored.  can2040_lite_pico_rx_arm()
@@ -179,7 +181,7 @@ void can_edge_pair_record_clear(void);
 uint32_t can_edge_pair_record_count(void);
 uint32_t can_edge_pair_record_dropped(void);
 const can_edge_pair_record_t *can_edge_pair_record_get(uint32_t index);
-#endif // CAN_EDGE_PAIR_TIME_RECORDING
+#endif // CAN2040_LITE_TEST && CAN_EDGE_PAIR_TIME_RECORDING
 
 #if CAN_ACK_GENERATION_SUPPORT
 // ACK schedule for the expected CRC field.  Pure: no PIO types, no state.
@@ -219,5 +221,7 @@ uint8_t can_edge_sm_past_ack_slot(const can_edge_sm_t *sm);
 #ifdef __cplusplus
 }
 #endif
+
+#endif // CAN2040_LITE_TEST
 
 #endif // CAN_EDGE_SM_H

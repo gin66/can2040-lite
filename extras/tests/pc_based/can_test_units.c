@@ -17,6 +17,7 @@
 
 #include "can2040_lite_proto.h"
 #include "can2040_lite.h"
+#include "can2040_lite_backend.h"
 #include "can_edge_sm.h"
 #include "can_rx_sm.h"
 #include "can_rx_sm_inline.h"
@@ -464,13 +465,15 @@ static void test_build_errors(void) {
 /****************************************************************
  * API skeleton
  ****************************************************************/
+static void fake_reset(void);
+
 static void test_api_skeleton(void) {
     struct can2040_lite cd;
     struct can2040_lite_stats st;
     struct can2040_lite_msg msg;
 
     TEST_BEGIN("API setup/start/transmit/stop");
-    can2040_lite_set_hw(NULL);
+    fake_reset();
     memset(&msg, 0, sizeof(msg));
     can2040_lite_setup(&cd, 0);
     CHECK(can2040_lite_check_transmit(&cd) == 0);
@@ -550,9 +553,23 @@ static int fake_hw_poll(struct can2040_lite_event *ev) {
     return 1;
 }
 
-static const struct can2040_lite_hw fake_hw = {
-    fake_hw_start, fake_hw_stop, NULL, fake_hw_tx_frame, fake_hw_poll
-};
+int can2040_lite_backend_start(struct can2040_lite *cd, uint32_t sys_clock,
+                               uint32_t bitrate, int32_t gpio_rx,
+                               int32_t gpio_tx) {
+    return fake_hw_start(cd, sys_clock, bitrate, gpio_rx, gpio_tx);
+}
+
+void can2040_lite_backend_stop(void) {
+    fake_hw_stop(NULL);
+}
+
+int can2040_lite_backend_tx_frame(const uint8_t *bits, uint32_t nbits) {
+    return fake_hw_tx_frame(bits, nbits);
+}
+
+int can2040_lite_backend_poll(struct can2040_lite_event *ev) {
+    return fake_hw_poll(ev);
+}
 
 static void fake_reset(void) {
     fake_ev_head = 0;
@@ -560,7 +577,6 @@ static void fake_reset(void) {
     fake_tx_count = 0;
     fake_start_count = 0;
     fake_stop_count = 0;
-    can2040_lite_set_hw(&fake_hw);
 }
 
 static void fake_push_event(const struct can2040_lite_event *ev) {
@@ -704,7 +720,7 @@ static void test_api_queue(void) {
     // Complete the first through a matching RX parse with ACK.
     frame_from_msg(&msgs[0], &frame);
     fake_push_rx_frame(&frame, VALID_FRAME, 1);
-    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_pio_service_for_test_only(&cd);
     CHECK(fake_tx_count == 2); // next message started
     CHECK(can2040_lite_check_transmit(&cd) == 1);
     CHECK(can2040_lite_transmit(&cd, &msgs[4]) == 0);
@@ -807,7 +823,7 @@ static void test_api_queue(void) {
     frame_from_msg(&msg, &frame);
     fake_push_rx_frame(&frame, VALID_FRAME, 1);
     CHECK(can2040_lite_transmit(&cd, &msg) == 0); // second queues
-    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_pio_service_for_test_only(&cd);
     CHECK(cb_count == 1);
     CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_TX);
     CHECK(cb_msg[0].id & CAN2040_LITE_ID_EFF);
@@ -819,7 +835,7 @@ static void test_api_queue(void) {
     frame.dlc = 0;
     frame.flags = CAN_FRAME_RTR;
     fake_push_rx_frame(&frame, VALID_FRAME, 0);
-    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_pio_service_for_test_only(&cd);
     CHECK(cb_count == 1);
     CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_RX);
     CHECK((cb_msg[0].id & CAN2040_LITE_ID_RTR) == (1u << 30));
@@ -833,7 +849,7 @@ static void test_api_queue(void) {
     frame.data[0] = 0xde;
     frame.data[1] = 0xad;
     fake_push_rx_frame(&frame, VALID_FRAME, 0);
-    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_pio_service_for_test_only(&cd);
     can2040_lite_get_statistics(&cd, &st);
     CHECK(cb_count == 1);
     CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_RX);
@@ -853,7 +869,7 @@ static void test_api_queue(void) {
     fake_push_rx_frame(&frame, INVALID_CRC, 0);
     fake_push_rx_frame(&frame, INVALID_STUFF, 0);
     fake_push_rx_frame(&frame, INVALID_BIT, 0);
-    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_pio_service_for_test_only(&cd);
     can2040_lite_get_statistics(&cd, &st);
     CHECK(cb_count == 0);
     CHECK(st.parse_error == 3);
@@ -873,7 +889,7 @@ static void test_api_queue(void) {
     CHECK(can2040_lite_transmit(&cd, &msg) == 0);
     frame_from_msg(&msg, &frame);
     fake_push_rx_frame(&frame, VALID_FRAME, 1);
-    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_pio_service_for_test_only(&cd);
     can2040_lite_get_statistics(&cd, &st);
     CHECK(cb_count == 1);
     CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_TX);
@@ -884,7 +900,7 @@ static void test_api_queue(void) {
     start_for_test(&cd, 1);
     CHECK(can2040_lite_transmit(&cd, &msg) == 0);
     fake_push_rx_frame(&frame, VALID_FRAME, 0);
-    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_pio_service_for_test_only(&cd);
     can2040_lite_get_statistics(&cd, &st);
     CHECK(cb_count == 0);
     CHECK(st.tx_nack == 1);
@@ -898,7 +914,7 @@ static void test_api_queue(void) {
     msg.id = 0x222;
     CHECK(can2040_lite_transmit(&cd, &msg) == 0);
     fake_push_tx_done(1);
-    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_pio_service_for_test_only(&cd);
     can2040_lite_get_statistics(&cd, &st);
     CHECK(cb_count == 0);
     CHECK(st.tx_error == 1);
@@ -916,7 +932,7 @@ static void test_api_queue(void) {
     frame.id = 0x222;
     frame.data[0] = 0x22;
     fake_push_rx_frame(&frame, VALID_FRAME, 0);
-    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_pio_service_for_test_only(&cd);
     can2040_lite_get_statistics(&cd, &st);
     CHECK(cb_count == 2);
     CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_RX);
@@ -938,7 +954,7 @@ static void test_api_queue(void) {
     frame_from_msg(&msg, &frame);
     fake_push_rx_frame(&frame, VALID_FRAME, 1);
     cb_reenter = 1;
-    can2040_lite_pio_irq_handler(&cd);
+    can2040_lite_pio_service_for_test_only(&cd);
     CHECK(cb_reenter_result == 0);
     CHECK(cb_reenter_msg_id_after == 0x123);
     CHECK(cb_notify[0] == CAN2040_LITE_NOTIFY_TX);

@@ -30,14 +30,6 @@ static void run_windows_init(can_rx_t *rx) {
     }
 }
 
-void can_rx_edge(can_rx_t *rx, uint16_t time16, uint8_t level) {
-    can_rx_edge_inline(rx, time16, level);
-}
-
-void can_rx_pair(can_rx_t *rx, uint32_t word) {
-    can_rx_pair_inline(rx, word);
-}
-
 void can_rx_reset(can_rx_t *rx) {
     rx->i = CAN_BIT_WAIT_FRAME;
     rx->drop_next = 0;

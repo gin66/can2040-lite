@@ -4,41 +4,22 @@
 // CAN2040-Lite is derived from can2040 (Copyright (C) 2021 Kevin O'Connor),
 // licensed under GPL-3.0-only. See LICENSE for the full license text.
 //
-// can2040_lite.c — Portable public API, transmit queue, and frame packer.
+// can2040_lite.c — RP2040/RP2350 driver core: public API, TX queue, packer.
 //
-// This file has no pico-sdk dependency, so the host tests compile and exercise
-// the same API that the target firmware uses.  Hardware operations go through
-// the ops table installed by the target backend; with no table installed the
-// driver still starts and queues, which is how the host tests run.
+// This file has no pico-sdk dependency so the host tests compile and exercise
+// the same core as the target firmware.  Hardware operations are fixed calls
+// into can2040_lite_backend.h; the target links the Pico backend and the host
+// test binary links its fake backend.
 
 #include <stddef.h>
 #include <string.h>
 
 #include "can2040_lite.h"
+#include "can2040_lite_backend.h"
 
 // One live instance.  A second start() on another object while the first is
 // started leaves the hardware alone.
 static struct can2040_lite *g_started;
-static const struct can2040_lite_hw *g_hw;
-
-// Critical section around queue and statistics updates.  The target backend
-// overrides these with save_and_disable_interrupts()/restore_interrupts().
-// The host tests call the handler directly, so the empty section is enough.
-__attribute__((weak)) uint32_t can2040_lite_critical_enter(void) {
-    return 0;
-}
-
-__attribute__((weak)) void can2040_lite_critical_exit(uint32_t token) {
-    (void)token;
-}
-
-// Weak hook: the Pico backend registers its ops table here.
-__attribute__((weak)) void can2040_lite_hw_attach(void) {
-}
-
-void can2040_lite_set_hw(const struct can2040_lite_hw *hw) {
-    g_hw = hw;
-}
 
 void can2040_lite_setup(struct can2040_lite *cd, uint32_t pio_num) {
     if (!cd)
@@ -49,13 +30,6 @@ void can2040_lite_setup(struct can2040_lite *cd, uint32_t pio_num) {
     cd->gpio_tx = -1;
     if (g_started == cd)
         g_started = NULL;
-}
-
-void can2040_lite_callback_config(struct can2040_lite *cd,
-                                  can2040_lite_cb cb) {
-    if (!cd)
-        return;
-    cd->cb = cb;
 }
 
 static void put_bits(uint8_t *buf, uint32_t *pos, uint32_t value,
@@ -137,35 +111,12 @@ static int msg_is_valid(const struct can2040_lite_msg *msg) {
     return id <= 0x7ffu;
 }
 
-static void tx_advance_locked(struct can2040_lite *cd) {
-    cd->tx_head = (cd->tx_head + 1u) % CAN2040_LITE_TX_QUEUE_LEN;
-    cd->tx_count--;
-    cd->tx_active = 0;
-}
-
-// Hand the queue head to the hardware when the state machine is idle.
-static void tx_kick(struct can2040_lite *cd) {
-    uint32_t slot;
-    uint32_t save;
-
-    if (!cd->started || cd->gpio_tx < 0 || !g_hw || !g_hw->tx_frame)
-        return;
-
-    save = can2040_lite_critical_enter();
-    if (!cd->tx_active && cd->tx_count > 0) {
-        slot = cd->tx_head;
-        if (g_hw->tx_frame(cd->tx_bits[slot], cd->tx_nbits[slot]) == 0)
-            cd->tx_active = 1;
-    }
-    can2040_lite_critical_exit(save);
-}
-
 void can2040_lite_start(struct can2040_lite *cd, uint32_t sys_clock,
                         uint32_t bitrate, int32_t gpio_rx, int32_t gpio_tx) {
+    uint32_t save;
+
     if (!cd)
         return;
-
-    can2040_lite_hw_attach();
 
     if (g_started && g_started != cd && g_started->started)
         return;
@@ -174,13 +125,30 @@ void can2040_lite_start(struct can2040_lite *cd, uint32_t sys_clock,
     cd->bitrate = bitrate;
     cd->gpio_rx = gpio_rx;
     cd->gpio_tx = gpio_tx;
+
+    if (can2040_lite_backend_start(cd, sys_clock, bitrate, gpio_rx, gpio_tx) < 0)
+        return;
+
+    if (gpio_tx < 0) {
+        // Receive-only: drop messages queued by a previous TX session.
+        cd->tx_head = 0;
+        cd->tx_count = 0;
+        cd->tx_active = 0;
+    }
+
     cd->started = 1;
     g_started = cd;
 
-    if (g_hw && g_hw->start)
-        g_hw->start(cd, sys_clock, bitrate, gpio_rx, gpio_tx);
+    // Hand a queue left over from a previous session to the SM.
+    save = can2040_lite_critical_enter();
+    if (!cd->tx_active && cd->tx_count > 0) {
+        uint32_t head = cd->tx_head;
 
-    tx_kick(cd);
+        if (can2040_lite_backend_tx_frame(cd->tx_bits[head],
+                                          cd->tx_nbits[head]) == 0)
+            cd->tx_active = 1;
+    }
+    can2040_lite_critical_exit(save);
 }
 
 int can2040_lite_transmit(struct can2040_lite *cd,
@@ -208,9 +176,14 @@ int can2040_lite_transmit(struct can2040_lite *cd,
     cd->tx_nbits[slot] = nbits;
     cd->tx_count++;
     cd->stats.tx_attempt++;
+    // Hand the head to the SM if it is idle.
+    if (!cd->tx_active) {
+        slot = cd->tx_head;
+        if (can2040_lite_backend_tx_frame(cd->tx_bits[slot],
+                                          cd->tx_nbits[slot]) == 0)
+            cd->tx_active = 1;
+    }
     can2040_lite_critical_exit(save);
-
-    tx_kick(cd);
     return 0;
 }
 
@@ -220,125 +193,8 @@ int can2040_lite_check_transmit(struct can2040_lite *cd) {
     return cd->tx_count < CAN2040_LITE_TX_QUEUE_LEN;
 }
 
-static void msg_from_parsed(const can_parsed_t *p,
-                            struct can2040_lite_msg *msg) {
-    memset(msg, 0, sizeof(*msg));
-    msg->id = p->id;
-    if (p->is_extended)
-        msg->id |= CAN2040_LITE_ID_EFF;
-    if (p->is_rtr)
-        msg->id |= CAN2040_LITE_ID_RTR;
-    msg->dlc = p->dlc;
-    memcpy(msg->data, p->data, sizeof(msg->data));
-}
-
-static int tx_matches(const struct can2040_lite *cd, const can_parsed_t *p) {
-    uint32_t id;
-
-    if (!cd->tx_active || cd->tx_count == 0)
-        return 0;
-    id = p->id;
-    if (p->is_extended)
-        id |= CAN2040_LITE_ID_EFF;
-    if (p->is_rtr)
-        id |= CAN2040_LITE_ID_RTR;
-    return id == cd->tx_msg[cd->tx_head].id;
-}
-
-static void deliver(struct can2040_lite *cd, uint32_t notify,
-                    const struct can2040_lite_msg *msg) {
-    if (cd->cb)
-        cd->cb(cd, notify, (struct can2040_lite_msg *)msg);
-}
-
-void can2040_lite_pio_irq_handler(struct can2040_lite *cd) {
-    if (!cd || !cd->started || !g_hw)
-        return;
-    if (g_hw->irq) {
-        g_hw->irq(cd);
-        return;
-    }
-    // Legacy host backend: no separate RX-only IRQ body.
-    can2040_lite_pio_service(cd);
-}
-
-void can2040_lite_pio_service(struct can2040_lite *cd) {
-    struct can2040_lite_event ev;
-
-    if (!cd || !cd->started || !g_hw || !g_hw->poll)
-        return;
-
-    while (g_hw->poll(&ev)) {
-        if (ev.kind == 1) {
-            // TX shift finished.  Only an error completes the head here; a
-            // clean finish waits for the matching RX parse and its ACK bit.
-            if (ev.tx_error) {
-                uint32_t save = can2040_lite_critical_enter();
-                int complete = cd->tx_active;
-                if (complete) {
-                    cd->tx_done_msg = cd->tx_msg[cd->tx_head];
-                    tx_advance_locked(cd);
-                    cd->stats.tx_error++;
-                    cd->stats.parse_error++;
-                }
-                can2040_lite_critical_exit(save);
-                if (complete)
-                    tx_kick(cd);
-            }
-            continue;
-        }
-
-        if (ev.kind != 2)
-            continue;
-
-        if (ev.rx.validity == VALID_FRAME) {
-            int done_tx = 0;
-            int ack = 0;
-            uint32_t save = can2040_lite_critical_enter();
-
-            if (tx_matches(cd, &ev.rx)) {
-                done_tx = 1;
-                ack = ev.rx.ack;
-                cd->tx_done_msg = cd->tx_msg[cd->tx_head];
-                tx_advance_locked(cd);
-                if (ack)
-                    cd->stats.tx_total++;
-                else {
-                    cd->stats.tx_nack++;
-                    cd->stats.parse_error++;
-                }
-            } else {
-                cd->stats.rx_total++;
-            }
-            can2040_lite_critical_exit(save);
-
-            if (done_tx) {
-                if (ack)
-                    deliver(cd, CAN2040_LITE_NOTIFY_TX, &cd->tx_done_msg);
-                tx_kick(cd);
-            } else {
-                // One callback per frame.  msg stays valid until it returns.
-                struct can2040_lite_msg msg;
-
-                msg_from_parsed(&ev.rx, &msg);
-                deliver(cd, CAN2040_LITE_NOTIFY_RX, &msg);
-            }
-            continue;
-        }
-
-        {
-            uint32_t save = can2040_lite_critical_enter();
-            cd->stats.parse_error++;
-            if (ev.rx.validity == INVALID_CRC)
-                cd->stats.crc_errors++;
-            else if (ev.rx.validity == INVALID_STUFF)
-                cd->stats.stuff_errors++;
-            else
-                cd->stats.bit_errors++;
-            can2040_lite_critical_exit(save);
-        }
-    }
-}
+// The test module is empty unless CAN2040_LITE_TEST is defined.
+#include "can2040_lite_test.inc"
 
 void can2040_lite_get_statistics(struct can2040_lite *cd,
                                  struct can2040_lite_stats *stats) {
@@ -361,6 +217,5 @@ void can2040_lite_stop(struct can2040_lite *cd) {
     if (g_started == cd)
         g_started = NULL;
     can2040_lite_critical_exit(save);
-    if (g_hw && g_hw->stop)
-        g_hw->stop(cd);
+    can2040_lite_backend_stop();
 }

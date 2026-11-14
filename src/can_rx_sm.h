@@ -111,11 +111,7 @@ void can_rx_reset(can_rx_t *rx);
 
 // One captured edge.  time16 is the low 16 bits of the PIO down-counter,
 // level is the pin level after the edge.  The first falling edge starts a
-// frame; the next edge supplies the first run (which includes SOF).
-void can_rx_edge(can_rx_t *rx, uint16_t time16, uint8_t level);
 
-// One FIFO word: 1->0 timestamp in bits[31:16], 0->1 timestamp in bits[15:0].
-void can_rx_pair(can_rx_t *rx, uint32_t word);
 
 static inline uint8_t can_rx_available(const can_rx_t *rx) {
     return (uint8_t)(rx->tx_idx != rx->rx_idx);

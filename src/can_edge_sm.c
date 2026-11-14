@@ -9,7 +9,15 @@
 
 #include <string.h>
 
+#ifdef CAN2040_LITE_TEST
+// Superseded by can_rx_sm_inline.h in the production RX path.  Kept for the
+// host suite and the on-target harness.
+
 #include "can_edge_sm.h"
+
+#if defined(CAN2040_LITE_TEST) && CAN_EDGE_PAIR_TIME_RECORDING
+#include "can_edge_sm_test.inc"
+#endif
 
 // One uint8_t encodes both the protocol field and the bits still owed in it.
 // The active range for a field is base+1 .. base+len, so a bit just does
@@ -635,61 +643,18 @@ void can_edge_pair_init(can_edge_pair_t *pair, can_edge_sm_t *sm,
     pair->have_last = 0;
 }
 
-#if CAN_EDGE_PAIR_TIME_RECORDING
-#if CAN_EDGE_PAIR_RECORD_CAPACITY < 1
-#error "CAN_EDGE_PAIR_RECORD_CAPACITY must be at least 1"
-#endif
-
-static can_edge_pair_record_t pair_records[CAN_EDGE_PAIR_RECORD_CAPACITY];
-static volatile uint32_t pair_record_count;
-static volatile uint32_t pair_record_dropped;
-
-void can_edge_pair_record_clear(void) {
-    pair_record_count = 0;
-    pair_record_dropped = 0;
-}
-
-uint32_t can_edge_pair_record_count(void) {
-    return pair_record_count;
-}
-
-uint32_t can_edge_pair_record_dropped(void) {
-    return pair_record_dropped;
-}
-
-const can_edge_pair_record_t *can_edge_pair_record_get(uint32_t index) {
-    if (index >= pair_record_count)
-        return NULL;
-    return &pair_records[index];
-}
-
-static void pair_record(uint32_t word, uint32_t fall_time,
-                        uint32_t rise_time) {
-    uint32_t i = pair_record_count;
-
-    if (i >= CAN_EDGE_PAIR_RECORD_CAPACITY) {
-        pair_record_dropped++;
-        return;
-    }
-    pair_records[i].word = word;
-    pair_records[i].fall_time = fall_time & CAN_EDGE_TIME_MASK;
-    pair_records[i].rise_time = rise_time & CAN_EDGE_TIME_MASK;
-    __sync_synchronize();
-    pair_record_count = i + 1u;
-}
-#endif // CAN_EDGE_PAIR_TIME_RECORDING
 
 void can_edge_pair_push(can_edge_pair_t *pair, uint32_t word) {
-#if CAN_EDGE_PAIR_TIME_RECORDING
+#if defined(CAN2040_LITE_TEST) && CAN_EDGE_PAIR_TIME_RECORDING
     uint32_t fall_time;
 #endif
 
     pair_push(pair, (uint16_t)(word >> 16), 0);
-#if CAN_EDGE_PAIR_TIME_RECORDING
+#if defined(CAN2040_LITE_TEST) && CAN_EDGE_PAIR_TIME_RECORDING
     fall_time = pair->time;
 #endif
     pair_push(pair, (uint16_t)word, 1);
-#if CAN_EDGE_PAIR_TIME_RECORDING
+#if defined(CAN2040_LITE_TEST) && CAN_EDGE_PAIR_TIME_RECORDING
     pair_record(word, fall_time, pair->time);
 #endif
 }
@@ -763,3 +728,5 @@ can_ack_plan_t can_ack_plan(uint16_t crc, uint8_t run, uint8_t last,
     return plan;
 }
 #endif // CAN_ACK_GENERATION_SUPPORT
+
+#endif // CAN2040_LITE_TEST

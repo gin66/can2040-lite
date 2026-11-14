@@ -54,11 +54,13 @@ void bits_put(uint8_t *buf, uint32_t pos, uint8_t bit);
 void bits_clear(uint8_t *buf, uint32_t nbits);
 
 // CRC-15 (CAN polynomial x^15 + x^14 + x^10 + x^8 + x^7 + x^4 + x^2 + 1,
-// reflected form 0x4599), computed MSB-first.  crc_can15_update()/calc() are
-// the byte-wise reference matching can2040's crc_byte() recurrence.
+// reflected form 0x4599), computed MSB-first.
+uint16_t crc_can15_bits(uint16_t crc, const uint8_t *bits, uint32_t num_bits);
+#ifdef CAN2040_LITE_TEST
+// Byte-wise reference used only by the host suite and can_gen.
 uint16_t crc_can15_update(uint16_t crc, uint8_t data);
 uint16_t crc_can15_calc(const uint8_t *data, uint32_t num_bytes);
-uint16_t crc_can15_bits(uint16_t crc, const uint8_t *bits, uint32_t num_bits);
+#endif
 
 // Bit stuffing / unstuffing.  Both operate on the *stuffed region only*
 // (SOF .. end of CRC sequence); the tail (CRC delimiter, ACK, EOF, IFS) is
@@ -72,6 +74,7 @@ uint16_t crc_can15_bits(uint16_t crc, const uint8_t *bits, uint32_t num_bits);
 // truncated.  Output need not be zeroed.
 uint32_t bit_stuff(const uint8_t *data, uint32_t data_bits,
                    uint8_t *stuffed, uint32_t max_stuffed_bits);
+#ifdef CAN2040_LITE_TEST
 uint32_t bit_unstuff(const uint8_t *stuffed, uint32_t stuffed_bits,
                      uint8_t *unstuffed, uint32_t max_unstuffed_bits);
 
@@ -79,6 +82,7 @@ uint32_t bit_unstuff(const uint8_t *stuffed, uint32_t stuffed_bits,
 // Returns VALID_FRAME, INVALID_CRC, INVALID_STUFF or INVALID_BIT.
 frame_validity_t can_frame_decode(const uint8_t *bits, uint32_t total_bits,
                                   can_parsed_t *out);
+#endif
 
 #ifdef __cplusplus
 }

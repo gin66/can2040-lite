@@ -86,6 +86,10 @@ void can2040_lite_pico_rx_record_clear(void);
 uint32_t can2040_lite_pico_rx_record_count(void);
 uint32_t can2040_lite_pico_rx_record_word(uint32_t index);
 
+// Frames the parser completed with a recessive ACK slot.  With ACK generation
+// disabled this is the count of received frames this node did not acknowledge.
+uint32_t can2040_lite_pico_rx_ack_errors(void);
+
 #ifdef __cplusplus
 }
 #endif

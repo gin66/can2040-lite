@@ -2785,6 +2785,33 @@ static void drive_rx_pairs(can_rx_t *rx, const uint8_t *bits, uint32_t total,
     }
 }
 
+// Drive a complete multi-frame stream, including the edge-less inter-frame
+// run, so the parser must resynchronise on the next SOF.
+static void drive_rx_stream(can_rx_t *rx, const uint8_t *bits, uint32_t total,
+                            uint16_t t0, uint16_t ticks) {
+    uint8_t prev = 1;
+    uint16_t fall = 0;
+    int have_fall = 0;
+    uint32_t i;
+
+    for (i = 0; i < total; i++) {
+        uint8_t b = bits_get(bits, i);
+        uint16_t ts;
+
+        if (b == prev)
+            continue;
+        ts = (uint16_t)(t0 - i * ticks);
+        prev = b;
+        if (b == 0u) {
+            fall = ts;
+            have_fall = 1;
+        } else if (have_fall) {
+            can_rx_pair_inline(rx, ((uint32_t)fall << 16) | ts);
+            have_fall = 0;
+        }
+    }
+}
+
 // New pair-fed parser: drive FIFO words from the frame builder and check the
 // decoded ring slot.
 static void test_rx_sm(void) {
@@ -2935,6 +2962,100 @@ static void test_rx_sm_back_to_back(void) {
 }
 
 
+// Two NACKed frames put one long recessive run between them: the remaining
+// CRC tail, delimiter, ACK slot, delimiter and EOF have no edges, so the
+// parser only sees the run end at the next SOF.  A trailing ACK frame proves
+// the parser resynchronised and still delivers after both quiet tails.
+static void test_rx_sm_no_ack_gap(void) {
+    can_frame_t f[3];
+    uint8_t frame_bits[3][CAN2040_LITE_MAX_FRAME_BYTES];
+    uint8_t all[CAN2040_LITE_MAX_FRAME_BYTES * 4u];
+    can_build_info_t info;
+    can_rx_t rx;
+    uint32_t total = 0u;
+    uint32_t i;
+    uint16_t t0 = 0x8000u;
+    const uint16_t ticks = 64u;
+
+    printf("\n-- Minimal RX parser no-ACK inter-frame gap --\n");
+    TEST_BEGIN("two NACK frames resync across the quiet tail");
+    memset(f, 0, sizeof(f));
+    f[0].id = 0x111u;
+    f[0].dlc = 2u;
+    f[0].data[0] = 0xaau;
+    f[0].data[1] = 0x55u;
+    f[1].id = 0x222u;
+    f[1].dlc = 3u;
+    f[1].data[0] = 0x11u;
+    f[1].data[1] = 0x22u;
+    f[1].data[2] = 0x33u;
+    f[2].id = 0x333u;
+    f[2].dlc = 8u;
+    for (i = 0; i < 8u; i++)
+        f[2].data[i] = (uint8_t)(0x40u + i);
+
+    bits_clear(all, sizeof(all) * 8u);
+    for (i = 0; i < 3u; i++) {
+        uint32_t n = can_frame_build(&f[i], VALID_FRAME, i == 2u,
+                                     frame_bits[i],
+                                     CAN2040_LITE_MAX_FRAME_BITS, &info);
+        uint32_t j;
+
+        CHECK(n != 0u);
+        if (n == 0u)
+            continue;
+        for (j = 0u; j < n; j++)
+            bits_put(all, total + j, bits_get(frame_bits[i], j));
+        total += n;
+    }
+
+    can_rx_init(&rx, ticks);
+    drive_rx_stream(&rx, all, total, t0, ticks);
+
+    CHECK(rx.stuff_errors == 0u);
+    CHECK(rx.bit_errors == 0u);
+    CHECK(rx.crc_errors == 0u);
+    CHECK(rx.ack_errors == 2u);
+    CHECK(can_rx_available(&rx));
+    if (can_rx_available(&rx)) {
+        const can_rx_frame_t *g = can_rx_front(&rx);
+
+        CHECK(can_rx_frame_id(g) == f[2].id);
+        CHECK(g->dlc == f[2].dlc);
+        CHECK(g->ack == 1u);
+        CHECK(memcmp(&g->data[8u - f[2].dlc], f[2].data, f[2].dlc) == 0);
+        can_rx_pop(&rx);
+    }
+    CHECK(!can_rx_available(&rx));
+    TEST_END();
+}
+
+
+// The recorded Fly-Micro4 capture is a real RX-only bus: every frame is
+// NACKed and its tail runs edge-less into the next SOF.  The new parser must
+// consume those tails without reporting stuff errors.
+static void test_recorded_fly_micro4_rx_sm(void) {
+    const uint32_t *words = can_rx_record_fly_micro4_1m;
+    const uint32_t n = sizeof(can_rx_record_fly_micro4_1m) /
+                       sizeof(can_rx_record_fly_micro4_1m[0]);
+    can_rx_t rx;
+    uint32_t i;
+
+    printf("\n-- Recorded Fly-Micro4 RX edges (new parser) --\n");
+    TEST_BEGIN("recorded no-ACK tails resync without stuff errors");
+    can_rx_init(&rx, CAN_RX_RECORD_FLY_MICRO4_TICKS_PER_BIT);
+    for (i = 0; i < n; i++)
+        can_rx_pair_inline(&rx, words[i]);
+
+    CHECK(rx.stuff_errors == 0u);
+    CHECK(rx.bit_errors == 0u);
+    CHECK(rx.crc_errors == 0u);
+    CHECK(rx.ack_errors == 3u);
+    CHECK(!can_rx_available(&rx));
+    TEST_END();
+}
+
+
 static void test_rx_sm_tail(void) {
     static const char *pat_name[PAT_COUNT] = {
         "dominant CRC end",
@@ -3037,6 +3158,8 @@ int main(void) {
     test_rx_sm();
     test_rx_sm_errors();
     test_rx_sm_back_to_back();
+    test_rx_sm_no_ack_gap();
+    test_recorded_fly_micro4_rx_sm();
     test_rx_sm_tail();
     test_rx_crc_guard();
 

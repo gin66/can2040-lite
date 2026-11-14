@@ -151,6 +151,23 @@ static inline __attribute__((always_inline)) void can_rx_advance(can_rx_t *rx,
     rx->i = (uint8_t)(i + 1u + jump);
 }
 
+// A frame with no ACK ends in one long recessive run: the last 1..4 CRC bits,
+// the CRC delimiter, ACK slot, ACK delimiter and EOF have no edges.  Feed the
+// missing bits as recessive so the CRC comparison still runs, the ACK slot
+// counts the NACK, and the parser is back in WAIT_FRAME when the run ends at
+// the next SOF.
+static __attribute__((noinline)) void can_rx_quiet_tail(can_rx_t *rx) {
+    uint8_t guard = CAN_BIT_COUNT;
+
+    // drop_next marks the first bit of this run as the stuffed bit after a
+    // 5-run; it is not an indexed frame bit.
+    rx->drop_next = 0;
+    while (rx->i != CAN_BIT_WAIT_FRAME && guard--)
+        can_rx_advance(rx, 1u);
+    if (rx->i != CAN_BIT_WAIT_FRAME)
+        can_rx_fail_rx(rx, CAN_RX_STUFF_ERROR);
+}
+
 // One run of `level`.  The first dominant bit after idle reaches the
 // CAN_BIT_WAIT_FRAME case in can_rx_advance(), which consumes SOF.
 static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
@@ -169,6 +186,13 @@ static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
         }
     }
     if (n == 0u) {
+        // No ACK: the tail has no edges, so the run reaching the next SOF is
+        // longer than any legal stuffed run.  Finish the frame as a NACK.
+        if (level == 1u && rx->i != CAN_BIT_WAIT_FRAME &&
+            rx->i >= CAN_BIT_CRC_TAIL_FIRST) {
+            can_rx_quiet_tail(rx);
+            return;
+        }
         if ((uint32_t)delta > rx->run_hi[5])
             can_rx_fail_rx(rx, CAN_RX_STUFF_ERROR);
         else

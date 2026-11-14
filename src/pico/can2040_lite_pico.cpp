@@ -909,6 +909,10 @@ extern "C" uint32_t can2040_lite_pico_rx_record_word(uint32_t index) {
 #endif
 }
 
+extern "C" uint32_t can2040_lite_pico_rx_ack_errors(void) {
+    return rx_initialized ? rx.ack_errors : 0u;
+}
+
 extern "C" void can2040_lite_pico_tx_set_readback_gpio(uint32_t gpio) {
     tx_rx_gpio = gpio;
     pio_gpio_init(tx_pio, gpio);

@@ -31,6 +31,9 @@
 #define CAN_BIT_DATA_LAST       101u
 #define CAN_BIT_CRC_FIRST       102u
 #define CAN_BIT_CRC_LAST        116u
+// The edge-less no-ACK tail can start at most four CRC bits before the end:
+// five trailing recessive CRC bits would have forced a dominant stuff bit.
+#define CAN_BIT_CRC_TAIL_FIRST  (CAN_BIT_CRC_LAST - 3u)
 #define CAN_BIT_CRC_DELIMITER   117u
 #define CAN_BIT_ACK_SLOT        118u
 #define CAN_BIT_ACK_DELIMITER   119u

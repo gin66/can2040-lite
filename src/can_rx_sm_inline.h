@@ -35,10 +35,11 @@
 // shift drops that bit on the next step, so the 15-bit mask is only needed
 // when the CRC is stored.
 static inline __attribute__((always_inline)) uint16_t can_rx_crc_bit(uint16_t crc, uint8_t bit) {
+    uint16_t fb;
+
     crc = (uint16_t)(crc << 1);
-    if ((bit == 0u) != ((crc & 0x8000u) == 0u))
-        crc ^= 0x4599u;
-    return crc;
+    fb = (uint16_t)((crc >> 15) ^ bit);
+    return (uint16_t)(crc ^ (0x4599u & (uint16_t)(0u - fb)));
 }
 
 // n identical bits, n >= 1.  Callers never pass 0.
@@ -46,7 +47,6 @@ static inline __attribute__((always_inline)) uint16_t can_rx_crc_bit(uint16_t cr
 static __attribute__((noinline)) void can_rx_fail_rx(can_rx_t *rx,
                                             can_rx_event_t why) {
     rx->pos = CAN_BIT_WAIT_FRAME;
-    rx->crc_start = CAN_RX_CRC_NONE;
     rx->drop_next = 0;
     if (why == CAN_RX_CRC_ERROR)
         rx->crc_errors++;
@@ -70,71 +70,79 @@ static inline __attribute__((always_inline)) can_rx_event_t can_rx_publish(can_r
 }
 
 // One unstuffed wire bit.  `pos` is both the protocol state and the raw slot
-// bit index; IDE/R1 jump it so DLC (36-39), data (40..) and CRC are aligned.
+// bit index.  IDE/R1 jump it onto the shared control field (R0/DLC at 35..39)
+// and DLC jumps it into the right-aligned data region; CRC is at the fixed
+// CAN_BIT_CRC_FIRST field.
+//
+// The field layout lets the hot path skip most tests: every control bit is
+// below CAN_BIT_DATA_FIRST, every data bit is below the fixed CRC field, and
+// every CRC or tail bit is at or above CAN_BIT_CRC_FIRST.  A valid position
+// never exceeds ACK_SLOT, which fits the raw slot, so the store needs no
+// range check.
 static inline __attribute__((always_inline)) void can_rx_advance(can_rx_t *rx,
                                                                 uint8_t bit) {
-    can_rx_frame_t *f = rx->write;
     uint8_t p = rx->pos;
-    uint8_t shift = 0;
+    can_rx_frame_t *f;
+    uint8_t *dest;
 
     if (p == CAN_BIT_WAIT_FRAME) {
         rx->pos = 0;
-        rx->crc_start = CAN_RX_CRC_NONE;
         rx->write->flags = 0;
         rx->sm.crc_calc = 0;
         rx->write = &rx->frames[rx->rx_idx];
         return;
     }
 
-    if (p < CAN_RX_RAW_BYTES * 8u) {
-        uint8_t *dest = &f->raw[p >> 3];
+    f = rx->write;
+    dest = &f->raw[p >> 3];
+    *dest = (uint8_t)((*dest << 1) | bit);
 
-        shift = (uint8_t)((*dest << 1) | bit);
-        *dest = shift;
-    }
-
-    // CRC covers SOF..data.  crc_start is 0 until the DLC has been decoded.
-    if (p < rx->crc_start)
+    // CRC covers SOF..data, which all live below the fixed CRC field.  DLC
+    // jumps the store position so data ends at DATA_LAST and the CRC field is
+    // always at CAN_BIT_CRC_FIRST.
+    if (p < CAN_BIT_CRC_FIRST) {
         rx->sm.crc_calc = can_rx_crc_bit(rx->sm.crc_calc, bit);
 
-    if (p == CAN_BIT_IDE) {
-        f->flags = bit;
-        if (bit == 0u)
-            p = (uint8_t)(p + CAN_IDE_STD_SKIP);
-    } else if (p == CAN_BIT_R1) {
-        p = (uint8_t)(p + (CAN_BIT_R0 - (CAN_BIT_R1 + 1u)));
-    } else if (p == CAN_BIT_DLC_LAST) {
-        uint8_t dlc = (uint8_t)(shift & 0x0fu);
+        if (p < CAN_BIT_DATA_FIRST) {
+            if (p == CAN_BIT_IDE) {
+                f->flags = bit;
+                if (bit == 0u)
+                    p = (uint8_t)(p + CAN_IDE_STD_SKIP);
+            } else if (p == CAN_BIT_R1) {
+                p = (uint8_t)(p + (CAN_BIT_R0 - (CAN_BIT_R1 + 1u)));
+            } else if (p == CAN_BIT_DLC_LAST) {
+                uint8_t dlc = (uint8_t)(*dest & 0x0fu);
 
-        if (dlc > CAN_DLC_MAX)
-            dlc = CAN_DLC_MAX;
-        rx->crc_start = (uint8_t)(CAN_BIT_DATA_FIRST + 8u * dlc);
-    } else if (p == rx->crc_start + 7u) {
-        // The CRC start is byte-aligned; this is its first byte.
+                if (dlc > CAN_DLC_MAX)
+                    dlc = CAN_DLC_MAX;
+                p = (uint8_t)(p + CAN_DATA_SKIP(dlc));
+            }
+        }
+    } else if (p == CAN_BIT_CRC_FIRST + 7u) {
+        // The CRC field is byte-aligned; this is its first byte.
         if (f->raw[p >> 3] != (uint8_t)(rx->sm.crc_calc >> 7)) {
             can_rx_fail_rx(rx, CAN_RX_CRC_ERROR);
             return;
         }
-    } else if (p == rx->crc_start + 14u) {
+    } else if (p == CAN_BIT_CRC_FIRST + 14u) {
         // Last 7 CRC bits are right-aligned in the low bits.
         if ((f->raw[p >> 3] & 0x7fu) != (rx->sm.crc_calc & 0x7fu)) {
             can_rx_fail_rx(rx, CAN_RX_CRC_ERROR);
             return;
         }
-    } else if (p == rx->crc_start + 15u) {
+    } else if (p == CAN_BIT_CRC_FIRST + 15u) {
         // CRC delimiter must be recessive.
         if (bit == 0u) {
             can_rx_fail_rx(rx, CAN_RX_BIT_ERROR);
             return;
         }
         rx->drop_next = 0;
-    } else if (p == rx->crc_start + 16u) {
+    } else if (p == CAN_BIT_CRC_FIRST + 16u) {
         if (bit == 0u)
             can_rx_publish(rx);
         else
             rx->ack_errors++;
         rx->drop_next = 0;
-        rx->crc_start = CAN_RX_CRC_NONE;
         rx->pos = CAN_BIT_WAIT_FRAME;
         return;
     }
@@ -150,23 +158,33 @@ static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
         return;
 
     int tail = (rx->pos != CAN_BIT_WAIT_FRAME &&
-                (uint32_t)rx->pos > (uint32_t)rx->crc_start + 14u);
+                (uint32_t)rx->pos > (uint32_t)CAN_BIT_CRC_FIRST + 14u);
     uint8_t n = 0;
-    for (uint8_t i = 1u; i <= 5u; i++) {
-        if (delta >= rx->run_lo[i] && delta <= rx->run_hi[i]) {
-            n = i;
-            break;
-        }
-    }
+
+    // run_hi[] increases with n and the valid windows do not overlap, so the
+    // first bound that contains delta selects the run.  A separate lower-bound
+    // check then rejects the inter-window gaps and sub-one-bit glitches.
+    if (delta <= rx->run_hi[1])
+        n = 1;
+    else if (delta <= rx->run_hi[2])
+        n = 2;
+    else if (delta <= rx->run_hi[3])
+        n = 3;
+    else if (delta <= rx->run_hi[4])
+        n = 4;
+    else if (delta <= rx->run_hi[5])
+        n = 5;
+    if (n != 0u && (uint32_t)delta < rx->run_lo[n])
+        n = 0;
+
     if (n == 0u) {
         // No ACK: the tail has no edges, so the run reaching the next SOF is
         // longer than any legal stuffed run.  Drop the frame as a NACK and
         // resync at the SOF.
         if (level == 1u && rx->pos != CAN_BIT_WAIT_FRAME &&
-            (uint32_t)rx->pos >= (uint32_t)rx->crc_start + 11u) {
+            (uint32_t)rx->pos >= (uint32_t)CAN_BIT_CRC_FIRST + 11u) {
             rx->ack_errors++;
             rx->drop_next = 0;
-            rx->crc_start = CAN_RX_CRC_NONE;
             rx->pos = CAN_BIT_WAIT_FRAME;
             return;
         }

@@ -5,8 +5,10 @@ transceiver and no CAN controller are involved: the harnesses build CAN
 frames, turn them into the exact unstuffed bit or RX FIFO edge-pair stream
 the receiver would see, and feed them to the portable parser.
 
-This report describes the current `main` parser (pre-ACK-rework). The faster
-ACK-rework measurements are preserved on `wip/ack-generation`; see §5.
+This report describes the current `main` parser. Sections 3 and 4 are the
+pre-optimization baseline; section 8 records the A-B-A optimization pass and
+the new authoritative numbers. The faster ACK-rework measurements are
+preserved on `wip/ack-generation`; see §5.
 
 | | |
 |---|---|
@@ -17,7 +19,7 @@ ACK-rework measurements are preserved on `wip/ack-generation`; see §5.
 | **Counter** | Cortex-M0+ SysTick (`systick_hw->cvr`), 24-bit, processor clock |
 | **Harness 1** | `extras/tests/on_target/rx_bench.cpp` — FIFO words / edges |
 | **Harness 2** | `extras/tests/on_target/rx_bit_bench.cpp` — per unstuffed bit |
-| **Result** | 0 decode failures in both runs |
+| **Result** | 0 decode failures; optimized parser: 48.74 cycles/unstuffed bit, 63.90 cycles/wire bit (see §8) |
 
 The board settings match `../suspended-spheres/rp2040/platformio.ini`. The
 Fly-Micro4 CAN pins (GPIO4/5) are not used. Timed functions are placed in SRAM
@@ -352,6 +354,9 @@ bit  name        mean    range
 
 ## 5. Interpretation
 
+This section interprets the baseline measurements in §3–4; §8 has the
+optimized numbers.
+
 - Benchmark 1: the full FIFO/edge parser consumes **69.50% of one core on
   average** at 1 Mbit/s and **83.22% on the worst frame**. That is consistent
   with `docs/rx_bus_load.md`, where the full RX ISR measured about 70.6% of a
@@ -404,8 +409,117 @@ pio device monitor -e fly_micro4_rx_bit_bench
 Press Enter or `r` in either monitor to rerun. Host tests:
 
 ```sh
-make test          # 177 passed, 0 failed
+make test          # 151 passed, 0 failed
 ```
+
+## 8. Optimization pass — A-B-A (2026-11-14)
+
+The parser hot path was reworked and measured with the same two harnesses on
+the same RP2040 at 133 MHz, `-O2`, `CAN_ACK_GENERATION_SUPPORT=0`. The sequence
+was baseline A1 → optimized B → baseline A2. A1 and A2 produced identical
+numbers (benchmark 1: 7724.36 pair / 7706.07 edge cycles/frame; benchmark 2:
+8464.16 cycles/frame), so the comparison is stable. Every run verified
+**0 decode failures**, and B was measured twice with identical results.
+
+### 8.1 Changes
+
+1. **Fixed CRC field.** Data is right-aligned so it always ends at
+   `CAN_BIT_DATA_LAST` (103) and the CRC field is always stored at
+   `CAN_BIT_CRC_FIRST` (104). At DLC the parser jumps the store position by
+   `CAN_DATA_SKIP(dlc)`, so the next data bit starts at `104 - 8*DLC`. This
+   removes the per-frame `crc_start` byte completely and turns every CRC/tail
+   test into a compile-time constant. The old parser set
+   `crc_start = 40 + 8*DLC`, which only equaled `CAN_BIT_CRC_FIRST` for DLC 8.
+2. The `p < CAN_RX_RAW_BYTES * 8` store guard was removed. A valid position
+   never exceeds `CAN_BIT_ACK_SLOT` (120), so `p >> 3` always indexes the
+   16-byte raw slot. A compile-time check enforces the layout invariant.
+3. The state machine is split by field. Control bits are below
+   `CAN_BIT_DATA_FIRST` (40), data bits are below the fixed CRC field, and
+   CRC/tail bits are at or above `CAN_BIT_CRC_FIRST`. The hot data path skips
+   the control event chain and all CRC/tail tests.
+4. CRC feedback is branchless:
+   `crc = (crc << 1) ^ (0x4599 & -(bit ^ (crc >> 15)))`.
+5. The raw bit is written through `*dest` directly; the separate `shift`
+   temporary is gone.
+6. Run classification tests the increasing `run_hi[]` bounds first and then
+   checks `run_lo[n]` once, instead of scanning both arrays for `n = 1..5`.
+   The valid windows cannot overlap, so this is equivalent.
+
+### 8.2 Benchmark 1 — FIFO words and edges
+
+| Metric | Baseline A | Optimized B | Change |
+|---|---:|---:|---:|
+| cycles / frame (pair) | 7724.36 | **5339.50** | −30.9% |
+| cycles / frame (edge) | 7706.07 | **5339.50** | −30.7% |
+| cycles / word | 383.91 | **265.38** | −30.9% |
+| cycles / edge | 191.50 | **132.69** | −30.7% |
+| cycles / wire bit | 92.44 | **63.90** | −30.9% |
+| cycles / stuffed bit | 109.47 | **75.67** | −30.9% |
+| average load @ 1 Mbit | 69.50% | **48.05%** | −21.5 pts |
+| worst-frame load @ 1 Mbit | 83.22% | **60.37%** | −22.9 pts |
+
+Worst frame is still #97 (`0x6B0`, DLC 7): 80.29 cycles/wire bit, down from
+110.68. Pair and edge totals are identical.
+
+### 8.3 Benchmark 2 — per-bit `can_rx_advance()`
+
+| Metric | Baseline A | Optimized B | Change |
+|---|---:|---:|---:|
+| cycles / frame | 8464.16 | **4874.13** | −42.4% |
+| cycles / unstuffed bit | 84.64 | **48.74** | −42.4% |
+| cycles / wire bit (approx) | 72.31 | **41.64** | −42.4% |
+| parser load @ 1 Mbit | 54.37% | **31.31%** | −23.1 pts |
+| isolated call, corrected p50 | 81 | **46** | −43.2% |
+| isolated call, corrected mean | 78.60 | **46.67** | −40.6% |
+
+New cost by field:
+
+| Field | Baseline mean | Optimized mean |
+|---|---:|---:|
+| SOF | 53.00 | **54.00** |
+| Base ID | 88.94 | **58.00** |
+| Control | 85.41 | **59.67** |
+| DLC | 88.16 | **61.75** |
+| Data | 88.98 | **48.00** |
+| CRC | 64.20 | **38.27** |
+| Tail | 84.00 | **54.50** |
+
+Selected positions: ID10 58, RTR 58, IDE 63, R0 58, DLC0 73, D0 48,
+CRC14 38, CRC7 compare 39, CRC0 compare 41, CRC delimiter 44, ACK slot 65.
+All ID/data positions are flat: the branchless CRC removed the 86–92 spread.
+
+### 8.4 Why the fixed CRC field matters
+
+A probe that steps a standard frame through DLC showed the old field was not
+constant:
+
+```text
+before: DLC 0 crc_start=40   DLC 1=48   ... DLC 7=96   DLC 8=104
+after:  DLC 0 data_start=104 DLC 1=96   ... DLC 7=48   DLC 8=40
+        data_start + 8*DLC == CAN_BIT_CRC_FIRST == 104 for every DLC
+```
+
+After the change, the CRC comparison bytes are always raw[13] and raw[14],
+and the CRC delimiter/ACK positions are always 119/120. DLC only selects the
+jump into the right-aligned data region.
+
+### 8.5 Rejected experiments
+
+- **129-entry dispatch jump table.** The hot data path reaches the common
+  handler with about two range tests and no field compares. A table would add
+  a table load plus an indirect `blx` (pipeline refill on the M0+) to every
+  bit, while special positions are a small minority. It would grow code and
+  is not expected to beat the range-split path, so it was not adopted.
+- **`__builtin_expect(p < CAN_BIT_CRC_FIRST, 1)`.** It moved the CRC update
+  into the fallthrough path and improved benchmark 2 to 4811.00 cycles/frame,
+  but the full parser measured 5385.69 cycles/frame versus 5339.50, so the
+  hint was removed.
+- **Out-of-line CRC-field helper.** Smaller hot path, but the helper landed in
+  flash. Calls from the SRAM-timed parser then produced XIP latency spikes
+  (CRC mean 108 cycles, outliers above 65000), so it was rejected.
+- **Deriving `crc_start = 40 + 8*DLC` per bit.** Measured 5541.38 cycles/frame
+  and 55.41 cycles/bit before the fixed-layout redesign; superseded by making
+  the CRC field constant.
 
 ## Appendix — benchmark 1 histograms (`main`)
 

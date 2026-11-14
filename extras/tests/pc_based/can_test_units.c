@@ -3137,17 +3137,16 @@ static void test_rx_crc_guard(void) {
 
     rx.sm.crc_calc = 0x4abcu;
     uint8_t expect = (uint8_t)(rx.sm.crc_calc >> 7);
+    uint32_t crc_byte = CAN_BIT_CRC_FIRST >> 3;
 
-    rx.crc_start = 8u;
-    rx.pos = 15u;
-    rx.frames[0].raw[1] = (uint8_t)(expect >> 1);
+    rx.pos = CAN_BIT_CRC_FIRST + 7u;
+    rx.frames[0].raw[crc_byte] = (uint8_t)(expect >> 1);
     can_rx_advance(&rx, (uint8_t)(expect & 1u));
-    CHECK(rx.pos == 16u);
+    CHECK(rx.pos == CAN_BIT_CRC_FIRST + 8u);
     CHECK(rx.crc_errors == 0u);
 
-    rx.crc_start = 8u;
-    rx.pos = 15u;
-    rx.frames[0].raw[1] = (uint8_t)((expect >> 1) ^ 1u);
+    rx.pos = CAN_BIT_CRC_FIRST + 7u;
+    rx.frames[0].raw[crc_byte] = (uint8_t)((expect >> 1) ^ 1u);
     can_rx_advance(&rx, (uint8_t)(expect & 1u));
     CHECK(rx.pos == CAN_BIT_WAIT_FRAME);
     CHECK(rx.crc_errors == 1u);

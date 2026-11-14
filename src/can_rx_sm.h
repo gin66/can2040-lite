@@ -32,11 +32,11 @@ extern "C" {
 #define CAN_RX_SLOT_MASK (CAN_RX_SLOTS - 1u)
 
 // Raw receive slot.  At IDE the parser jumps the store position so R0/DLC are
-// at 35/36-39 for both frames; DLC is in byte 4, data starts at byte 5 and is
-// byte-aligned.  `flags` bit 0 is IDE.
+// at 35/36-39 for both frames.  DLC is in byte 4.  Data is right-aligned and
+// always ends at CAN_BIT_DATA_LAST, so the CRC field is always stored at the
+// fixed CAN_BIT_CRC_FIRST position (bytes 13-14); DLC only selects the data
+// start.  `flags` bit 0 is IDE.
 #define CAN_RX_RAW_BYTES 16u
-// crc_start value while the DLC has not been decoded; larger than any bit.
-#define CAN_RX_CRC_NONE     255u
 
 typedef struct {
     uint8_t raw[CAN_RX_RAW_BYTES];
@@ -69,12 +69,16 @@ static inline uint8_t can_rx_frame_dlc(const can_rx_frame_t *f) {
     return (uint8_t)(f->raw[CAN_BIT_DLC_FIRST >> 3] & 0x0fu);
 }
 
-// Right-aligned data: the used bytes are byte-aligned from byte 5.
+// Right-aligned data: the used bytes end at CAN_BIT_DATA_LAST, so the first
+// used byte is (CAN_BIT_CRC_FIRST >> 3) - dlc.
 static inline void can_rx_frame_data(const can_rx_frame_t *f, uint8_t *out) {
     uint8_t dlc = can_rx_frame_dlc(f);
-    uint32_t first = CAN_BIT_DATA_FIRST >> 3;
+    uint32_t first;
     uint32_t b;
 
+    if (dlc > CAN_DLC_MAX)
+        dlc = CAN_DLC_MAX;
+    first = (CAN_BIT_CRC_FIRST >> 3) - dlc;
     for (b = 0; b < 8u; b++)
         out[b] = 0;
     for (b = 0; b < dlc; b++)
@@ -82,6 +86,9 @@ static inline void can_rx_frame_data(const can_rx_frame_t *f, uint8_t *out) {
 }
 
 typedef char can_rx_frame_size_check[(sizeof(can_rx_frame_t) == 17u) ? 1 : -1];
+// The parser stores every bit through ACK_SLOT without a range check.
+typedef char can_rx_raw_fits_check[(CAN_BIT_ACK_SLOT < CAN_RX_RAW_BYTES * 8u) ?
+                                    1 : -1];
 
 typedef enum {
     CAN_RX_NONE = 0,
@@ -112,7 +119,6 @@ typedef struct {
 
     // Parser.
     uint8_t pos;            // unstuffed wire-bit position; 255 = idle
-    uint8_t crc_start;      // wire position where the CRC field starts
     can_rx_sm_t sm;
 
     // Single-producer/single-consumer ring.

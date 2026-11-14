@@ -22,6 +22,7 @@
 #include <stdint.h>
 
 #include "can2040_lite_proto.h"
+#include "can_bit_layout.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,34 +31,57 @@ extern "C" {
 #define CAN_RX_SLOTS 32u
 #define CAN_RX_SLOT_MASK (CAN_RX_SLOTS - 1u)
 
-// Typed receive slot.  The parser writes the raw wire parts; id_part2 bit 0 is
-// IDE (0 = standard, 1 = extended), bit 1 is SRR/RTR.  Data bytes are
-// right-aligned: dlc used bytes occupy data[8-dlc..7].
+// Raw receive slot.  At IDE the parser jumps the store position so R0/DLC are
+// at 35/36-39 for both frames; DLC is in byte 4, data starts at byte 5 and is
+// byte-aligned.  `flags` bit 0 is IDE.
+#define CAN_RX_RAW_BYTES 16u
+// crc_start value while the DLC has not been decoded; larger than any bit.
+#define CAN_RX_CRC_NONE     255u
+
 typedef struct {
-    uint8_t id_part1;
-    uint8_t id_part2;
-    uint8_t id_part3;
-    uint8_t id_part4;
-    uint8_t id_part5;
-    uint8_t dlc;
-    uint8_t ack;
-    uint8_t data[8];
+    uint8_t raw[CAN_RX_RAW_BYTES];
+    uint8_t flags;
 } can_rx_frame_t;
 
-static inline uint32_t can_rx_frame_id(const can_rx_frame_t *f) {
-    uint32_t base = ((uint32_t)f->id_part1 << 3) |
-                    (uint32_t)((f->id_part2 >> 2) & 7u);
-    uint32_t ext = ((uint32_t)f->id_part3 << 10) |
-                   ((uint32_t)f->id_part4 << 2) | (uint32_t)(f->id_part5 & 3u);
+static inline uint8_t can_rx_raw_bit(const can_rx_frame_t *f, uint32_t pos) {
+    return (uint8_t)((f->raw[pos >> 3] >> (7u - (pos & 7u))) & 1u);
+}
 
-    return (f->id_part2 & 1u) ? ((base << 18) | ext) : base;
+static inline uint32_t can_rx_frame_id(const can_rx_frame_t *f) {
+    uint32_t ide = (uint32_t)(f->flags & 1u);
+    uint32_t base = ((uint32_t)f->raw[0] << 3) |
+                    ((uint32_t)(f->raw[1] >> (ide ? 5u : 2u)) & 7u);
+    uint32_t ext = 0;
+    uint32_t i;
+
+    if (!ide)
+        return base;
+    for (i = CAN_BIT_ID_EXT_FIRST; i <= CAN_BIT_ID_EXT_LAST; i++)
+        ext = (ext << 1) | can_rx_raw_bit(f, i);
+    return (base << 18) | ext;
 }
 
 static inline uint8_t can_rx_frame_flags(const can_rx_frame_t *f) {
-    return (uint8_t)(f->id_part2 & 3u);
+    return (uint8_t)(f->flags & 1u);
 }
 
-typedef char can_rx_frame_size_check[(sizeof(can_rx_frame_t) == 15u) ? 1 : -1];
+static inline uint8_t can_rx_frame_dlc(const can_rx_frame_t *f) {
+    return (uint8_t)(f->raw[CAN_BIT_DLC_FIRST >> 3] & 0x0fu);
+}
+
+// Right-aligned data: the used bytes are byte-aligned from byte 5.
+static inline void can_rx_frame_data(const can_rx_frame_t *f, uint8_t *out) {
+    uint8_t dlc = can_rx_frame_dlc(f);
+    uint32_t first = CAN_BIT_DATA_FIRST >> 3;
+    uint32_t b;
+
+    for (b = 0; b < 8u; b++)
+        out[b] = 0;
+    for (b = 0; b < dlc; b++)
+        out[8u - dlc + b] = f->raw[first + b];
+}
+
+typedef char can_rx_frame_size_check[(sizeof(can_rx_frame_t) == 17u) ? 1 : -1];
 
 typedef enum {
     CAN_RX_NONE = 0,
@@ -68,8 +92,7 @@ typedef enum {
     CAN_RX_OVERFLOW = 5
 } can_rx_event_t;
 
-// `crc_calc` is the CRC-15 register over SOF..data.  The parser state and bit
-// position live in can_rx_t as `i`; the data shift register is `shift`.
+// `crc_calc` is the CRC-15 register over SOF..data.
 typedef struct {
     uint16_t crc_calc;
 } can_rx_sm_t;
@@ -88,9 +111,8 @@ typedef struct {
     uint8_t drop_next;
 
     // Parser.
-    uint8_t i;              // 0 = SOF, 1..117 = frame bit, 255 = WAIT
-    uint8_t rtr;            // remote frame: parse, then drop without delivery
-    uint8_t shift;          // current data byte, written once per 8 bits
+    uint8_t pos;            // unstuffed wire-bit position; 255 = idle
+    uint8_t crc_start;      // wire position where the CRC field starts
     can_rx_sm_t sm;
 
     // Single-producer/single-consumer ring.

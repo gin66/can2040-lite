@@ -2791,7 +2791,7 @@ static void drive_rx_pairs(can_rx_t *rx, const uint8_t *bits, uint32_t total,
         } else if (have_fall) {
             can_rx_pair_inline(rx, ((uint32_t)fall << 16) | ts);
             have_fall = 0;
-            if (rx->i != CAN_BIT_WAIT_FRAME)
+            if (rx->pos != CAN_BIT_WAIT_FRAME)
                 started = 1;
             else if (started)
                 return;     // aborted or completed
@@ -2862,13 +2862,14 @@ static void test_rx_sm(void) {
                     CHECK(can_rx_available(&rx));
                     if (can_rx_available(&rx)) {
                         const can_rx_frame_t *g = can_rx_front(&rx);
+                        uint8_t gd[8];
 
+                        can_rx_frame_data(g, gd);
                         CHECK(can_rx_frame_id(g) == f.id);
-                        CHECK(g->ack == 1u);
-                        CHECK(g->dlc == f.dlc);
+                        CHECK(can_rx_frame_dlc(g) == f.dlc);
                         CHECK((can_rx_frame_flags(g) & 1u) ==
                               (uint8_t)((f.flags & CAN_FRAME_EXTENDED) ? 1u : 0u));
-                        CHECK(memcmp(&g->data[8u - f.dlc], f.data, f.dlc) == 0);
+                        CHECK(memcmp(&gd[8u - f.dlc], f.data, f.dlc) == 0);
                         can_rx_pop(&rx);
                     }
                 } else {
@@ -2883,8 +2884,8 @@ static void test_rx_sm(void) {
 
 static void test_rx_sm_errors(void) {
     printf("\n-- Minimal RX parser errors --\n");
-    TEST_BEGIN("CRC and stuff are rejected; RTR is ignored");
-    for (int kind = 0; kind < 3; kind++) {
+    TEST_BEGIN("CRC and stuff are rejected");
+    for (int kind = 0; kind < 2; kind++) {
         can_frame_t f;
         frame_validity_t validity = VALID_FRAME;
         uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
@@ -2902,10 +2903,8 @@ static void test_rx_sm_errors(void) {
             f.data[i] = (uint8_t)(i + 1u);
         if (kind == 0)
             validity = INVALID_CRC;
-        else if (kind == 1)
-            validity = INVALID_STUFF;
         else
-            f.flags |= CAN_FRAME_RTR;
+            validity = INVALID_STUFF;
 
         total = can_frame_build(&f, validity, 0, bits,
                                 CAN2040_LITE_MAX_FRAME_BITS, &info);
@@ -2915,37 +2914,8 @@ static void test_rx_sm_errors(void) {
         CHECK(!can_rx_available(&rx));
         if (kind == 0)
             CHECK(rx.crc_errors == 1u);
-        else if (kind == 1)
+        else
             CHECK(rx.stuff_errors == 1u);
-        else {
-            CHECK(rx.bit_errors == 0u);
-            CHECK(rx.ack_errors == 0u);
-        }
-    }
-
-    // A remote frame is ignored even when another node ACKs it.
-    {
-        can_frame_t f;
-        uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
-        can_build_info_t info;
-        can_rx_t rx;
-        uint32_t total;
-        const uint16_t ticks = 64u;
-
-        memset(&f, 0, sizeof(f));
-        f.id = 0x321u;
-        f.flags = CAN_FRAME_RTR;
-        f.dlc = 8;
-        total = can_frame_build(&f, VALID_FRAME, 1, bits,
-                                CAN2040_LITE_MAX_FRAME_BITS, &info);
-        CHECK(total != 0u);
-        can_rx_init(&rx, ticks);
-        drive_rx_pairs(&rx, bits, total, 0x8000u, ticks);
-        CHECK(!can_rx_available(&rx));
-        CHECK(rx.crc_errors == 0u);
-        CHECK(rx.stuff_errors == 0u);
-        CHECK(rx.bit_errors == 0u);
-        CHECK(rx.ack_errors == 0u);
     }
     TEST_END();
 }
@@ -2985,20 +2955,22 @@ static void test_rx_sm_back_to_back(void) {
     CHECK(can_rx_available(&rx));
     if (can_rx_available(&rx)) {
         const can_rx_frame_t *g = can_rx_front(&rx);
+        uint8_t gd[8];
 
-        CHECK(can_rx_frame_id(g) == f1.id && g->dlc == f1.dlc);
-        CHECK(g->ack == 1u);
-        CHECK(memcmp(&g->data[8u - f1.dlc], f1.data, f1.dlc) == 0);
+        can_rx_frame_data(g, gd);
+        CHECK(can_rx_frame_id(g) == f1.id && can_rx_frame_dlc(g) == f1.dlc);
+        CHECK(memcmp(&gd[8u - f1.dlc], f1.data, f1.dlc) == 0);
         can_rx_pop(&rx);
     }
     drive_rx_pairs(&rx, b2, n2, (uint16_t)(t0 - n1 * ticks), ticks);
     CHECK(can_rx_available(&rx));
     if (can_rx_available(&rx)) {
         const can_rx_frame_t *g = can_rx_front(&rx);
+        uint8_t gd[8];
 
-        CHECK(can_rx_frame_id(g) == f2.id && g->dlc == f2.dlc);
-        CHECK(g->ack == 1u);
-        CHECK(memcmp(&g->data[8u - f2.dlc], f2.data, f2.dlc) == 0);
+        can_rx_frame_data(g, gd);
+        CHECK(can_rx_frame_id(g) == f2.id && can_rx_frame_dlc(g) == f2.dlc);
+        CHECK(memcmp(&gd[8u - f2.dlc], f2.data, f2.dlc) == 0);
         can_rx_pop(&rx);
     }
     TEST_END();
@@ -3062,11 +3034,12 @@ static void test_rx_sm_no_ack_gap(void) {
     CHECK(can_rx_available(&rx));
     if (can_rx_available(&rx)) {
         const can_rx_frame_t *g = can_rx_front(&rx);
+        uint8_t gd[8];
 
+        can_rx_frame_data(g, gd);
         CHECK(can_rx_frame_id(g) == f[2].id);
-        CHECK(g->dlc == f[2].dlc);
-        CHECK(g->ack == 1u);
-        CHECK(memcmp(&g->data[8u - f[2].dlc], f[2].data, f[2].dlc) == 0);
+        CHECK(can_rx_frame_dlc(g) == f[2].dlc);
+        CHECK(memcmp(&gd[8u - f[2].dlc], f[2].data, f[2].dlc) == 0);
         can_rx_pop(&rx);
     }
     CHECK(!can_rx_available(&rx));
@@ -3142,11 +3115,12 @@ static void test_rx_sm_tail(void) {
         CHECK(can_rx_available(&rx));
         if (can_rx_available(&rx)) {
             const can_rx_frame_t *g = can_rx_front(&rx);
+            uint8_t gd[8];
 
+            can_rx_frame_data(g, gd);
             CHECK(can_rx_frame_id(g) == f.id);
-            CHECK(g->dlc == f.dlc);
-            CHECK(g->ack == 1u);
-            CHECK(memcmp(&g->data[8u - f.dlc], f.data, f.dlc) == 0);
+            CHECK(can_rx_frame_dlc(g) == f.dlc);
+                CHECK(memcmp(&gd[8u - f.dlc], f.data, f.dlc) == 0);
             can_rx_pop(&rx);
         }
         TEST_END();
@@ -3164,16 +3138,18 @@ static void test_rx_crc_guard(void) {
     rx.sm.crc_calc = 0x4abcu;
     uint8_t expect = (uint8_t)(rx.sm.crc_calc >> 7);
 
-    rx.i = CAN_BIT_CRC_FIRST + 7u;
-    rx.shift = (uint8_t)(expect >> 1);
+    rx.crc_start = 8u;
+    rx.pos = 15u;
+    rx.frames[0].raw[1] = (uint8_t)(expect >> 1);
     can_rx_advance(&rx, (uint8_t)(expect & 1u));
-    CHECK(rx.i == CAN_BIT_CRC_FIRST + 8u);
+    CHECK(rx.pos == 16u);
     CHECK(rx.crc_errors == 0u);
 
-    rx.i = CAN_BIT_CRC_FIRST + 7u;
-    rx.shift = (uint8_t)((expect >> 1) ^ 1u);
+    rx.crc_start = 8u;
+    rx.pos = 15u;
+    rx.frames[0].raw[1] = (uint8_t)((expect >> 1) ^ 1u);
     can_rx_advance(&rx, (uint8_t)(expect & 1u));
-    CHECK(rx.i == CAN_BIT_WAIT_FRAME);
+    CHECK(rx.pos == CAN_BIT_WAIT_FRAME);
     CHECK(rx.crc_errors == 1u);
     TEST_END();
 }

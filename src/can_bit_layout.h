@@ -24,22 +24,23 @@
 #define CAN_BIT_ID_EXT_LAST     30u
 #define CAN_BIT_RTR_EXT         31u
 #define CAN_BIT_R1              32u
-#define CAN_BIT_R0              33u
-#define CAN_BIT_DLC_FIRST       34u
-#define CAN_BIT_DLC_LAST        37u
-#define CAN_BIT_DATA_FIRST      38u
-#define CAN_BIT_DATA_LAST       101u
-#define CAN_BIT_CRC_FIRST       102u
-#define CAN_BIT_CRC_LAST        116u
+// R0 and DLC start after a two-state gap so DLC ends on a byte boundary.
+#define CAN_BIT_R0              35u
+#define CAN_BIT_DLC_FIRST       36u
+#define CAN_BIT_DLC_LAST        39u
+#define CAN_BIT_DATA_FIRST      40u
+#define CAN_BIT_DATA_LAST       103u
+#define CAN_BIT_CRC_FIRST       104u
+#define CAN_BIT_CRC_LAST        118u
 // The edge-less no-ACK tail can start at most four CRC bits before the end:
 // five trailing recessive CRC bits would have forced a dominant stuff bit.
 #define CAN_BIT_CRC_TAIL_FIRST  (CAN_BIT_CRC_LAST - 3u)
-#define CAN_BIT_CRC_DELIMITER   117u
-#define CAN_BIT_ACK_SLOT        118u
-#define CAN_BIT_ACK_DELIMITER   119u
-#define CAN_BIT_EOF_START       120u
-#define CAN_BIT_EOF_LAST        126u
-#define CAN_BIT_COUNT           127u
+#define CAN_BIT_CRC_DELIMITER   119u
+#define CAN_BIT_ACK_SLOT        120u
+#define CAN_BIT_ACK_DELIMITER   121u
+#define CAN_BIT_EOF_START       122u
+#define CAN_BIT_EOF_LAST        128u
+#define CAN_BIT_COUNT           129u
 
 // Special state: init value and the error/abort value for a bad bit time.
 #define CAN_BIT_WAIT_FRAME      255u
@@ -53,9 +54,13 @@
 #define CAN_CRC_BITS            15u
 #define CAN_DLC_MAX             8u
 
-// Standard frame: skip ext-ID + ext-RTR + r1 at IDE, landing on r0 (i = 33).
-#define CAN_IDE_STD_SKIP        (CAN_ID_EXT_BITS + 1u + 1u)
-#define CAN_IDE_STD_DELTA       (CAN_IDE_STD_SKIP + 1u)
+// Standard frame: skip ext-ID + ext-RTR + r1 at IDE, landing on R0.
+#define CAN_IDE_STD_SKIP        (CAN_BIT_R0 - (CAN_BIT_IDE + 1u))
+
+// Standard-frame wire positions (shared layout minus the IDE skip).
+#define CAN_BIT_STD_R0          (CAN_BIT_R0 - CAN_IDE_STD_SKIP)
+#define CAN_BIT_STD_DLC_FIRST   (CAN_BIT_DLC_FIRST - CAN_IDE_STD_SKIP)
+#define CAN_BIT_STD_DATA_FIRST  (CAN_BIT_DATA_FIRST - CAN_IDE_STD_SKIP)
 
 // Last used data index for `dlc` bytes, and the jump from there to CRC.
 #define CAN_DATA_LAST_IDX(dlc)  (CAN_BIT_DLC_LAST + CAN_BITS_PER_BYTE * (dlc))

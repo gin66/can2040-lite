@@ -374,11 +374,11 @@ static int pop_event(struct can2040_lite_event *ev) {
 
 static void rx_convert(const can_rx_frame_t *f, can_parsed_t *p) {
     p->id = can_rx_frame_id(f);
-    p->dlc = f->dlc;
+    p->dlc = can_rx_frame_dlc(f);
     p->is_extended = (uint8_t)(can_rx_frame_flags(f) & 1u);
     p->is_rtr = 0;
-    p->ack = f->ack;
-    memcpy(p->data, f->data, sizeof(p->data));
+    p->ack = 1;   // only ACKed frames are published
+    can_rx_frame_data(f, p->data);
     p->crc = 0;
     p->crc_calc = 0;
     p->validity = VALID_FRAME;

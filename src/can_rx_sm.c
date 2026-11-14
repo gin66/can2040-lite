@@ -31,9 +31,9 @@ static void run_windows_init(can_rx_t *rx) {
 }
 
 void can_rx_reset(can_rx_t *rx) {
-    rx->i = CAN_BIT_WAIT_FRAME;
+    rx->pos = CAN_BIT_WAIT_FRAME;
+    rx->crc_start = CAN_RX_CRC_NONE;
     rx->drop_next = 0;
-    rx->rtr = 0;
     rx->rx_idx = 0;
     rx->tx_idx = 0;
     rx->write = &rx->frames[0];

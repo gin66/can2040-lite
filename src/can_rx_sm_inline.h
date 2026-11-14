@@ -36,7 +36,8 @@ static inline __attribute__((always_inline)) uint16_t can_rx_crc_bit(uint16_t cr
 // Error path only.  Kept out of line so a fit edge does not pay its stores.
 static __attribute__((noinline)) void can_rx_fail_rx(can_rx_t *rx,
                                             can_rx_event_t why) {
-    rx->i = CAN_BIT_WAIT_FRAME;
+    rx->pos = CAN_BIT_WAIT_FRAME;
+    rx->crc_start = CAN_RX_CRC_NONE;
     rx->drop_next = 0;
     if (why == CAN_RX_CRC_ERROR)
         rx->crc_errors++;
@@ -59,110 +60,88 @@ static inline __attribute__((always_inline)) can_rx_event_t can_rx_publish(can_r
     return CAN_RX_FRAME;
 }
 
-// Advance one unstuffed bit through the shared 11/29-bit layout.  Index 0 is
-// the first base-ID bit; IDE at 12 selects whether the extended-only bits are
-// skipped; the unused data slots are skipped after the last used byte.
+// One unstuffed wire bit.  `pos` is both the protocol state and the raw slot
+// bit index; IDE/R1 jump it so DLC (36-39), data (40..) and CRC are aligned.
 static inline __attribute__((always_inline)) void can_rx_advance(can_rx_t *rx,
                                                                 uint8_t bit) {
     can_rx_frame_t *f = rx->write;
-    uint8_t i = rx->i;
-    uint8_t jump = 0;
-    uint8_t shift;
+    uint8_t p = rx->pos;
+    uint8_t shift = 0;
 
-    shift = (uint8_t)((rx->shift << 1) | bit);
-    rx->shift = shift;
-
-    if (i < CAN_BIT_CRC_FIRST)
-        rx->sm.crc_calc = can_rx_crc_bit(rx->sm.crc_calc, bit);
-
-    // After eight CRC bits the shift holds the first eight expected bits.
-    switch (i) {
-    case CAN_BIT_ID_BASE_FIRST + 7u:
-        f->id_part1 = shift;
-        break;
-    case CAN_BIT_IDE:
-        shift = rx->shift;
-        f->id_part2 = shift;
-        if ((shift & 1u) == 0u) {
-            rx->rtr = (uint8_t)((shift >> 1) & 1u);  // standard RTR
-            jump = CAN_IDE_STD_SKIP;
-        }
-        break;
-    case CAN_BIT_RTR_EXT:
-        rx->rtr = (uint8_t)(rx->shift & 1u);         // extended RTR
-        break;
-    case CAN_BIT_ID_EXT_FIRST + 7u:
-        f->id_part3 = shift;
-        break;
-    case CAN_BIT_ID_EXT_LAST - 2u:
-        f->id_part4 = shift;
-        break;
-    case CAN_BIT_ID_EXT_LAST:
-        f->id_part5 = shift;
-        break;
-    case CAN_BIT_DLC_LAST:
-        shift &= 0x0fu;
-        if (shift > CAN_DLC_MAX)
-            shift = CAN_DLC_MAX;
-        f->dlc = shift;
-        jump = rx->rtr ? (8u << 3) : (uint8_t)((8u - shift) << 3);
-        break;
-    case CAN_BIT_CRC_FIRST + 7u:
-        if (shift != (uint8_t)(rx->sm.crc_calc >> 7)) {
-            can_rx_fail_rx(rx, CAN_RX_CRC_ERROR);
-            return;
-        }
-        break;
-    case CAN_BIT_CRC_LAST:
-        if ((shift & 0x7fu) != (rx->sm.crc_calc & 0x7fu)) {
-            can_rx_fail_rx(rx, CAN_RX_CRC_ERROR);
-            return;
-        }
-        break;
-    case CAN_BIT_CRC_DELIMITER:
-        // Stuffing stops here; a pending stuff bit was already spent.
-        rx->drop_next = 0;
-        break;
-    case CAN_BIT_ACK_SLOT:
-        f->ack = (uint8_t)(bit == 0u);
-        if (!rx->rtr) {
-            if (bit == 0u)
-                can_rx_publish(rx);
-            else
-                rx->ack_errors++;
-        }
-        rx->rtr = 0;
-        rx->drop_next = 0;
-        rx->i = CAN_BIT_WAIT_FRAME;
-        return;
-    case CAN_BIT_WAIT_FRAME:
-        // drop_next was armed by the run that just started, which includes
-        // SOF; do not clear it here.
-        rx->rtr = 0;
+    if (p == CAN_BIT_WAIT_FRAME) {
+        rx->pos = 0;
+        rx->crc_start = CAN_RX_CRC_NONE;
+        rx->write->flags = 0;
         rx->sm.crc_calc = 0;
         rx->write = &rx->frames[rx->rx_idx];
-        rx->i = CAN_BIT_ID_BASE_FIRST;
         return;
-    default:
-        if (i >= CAN_BIT_DATA_FIRST && i <= CAN_BIT_DATA_LAST &&
-            ((i - CAN_BIT_DATA_FIRST) & 7u) == 7u) {
-            f->data[(i - CAN_BIT_DATA_FIRST) >> 3] = shift;
-        }
-        break;
     }
-    rx->i = (uint8_t)(i + 1u + jump);
+
+    if (p < CAN_RX_RAW_BYTES * 8u) {
+        uint8_t *dest = &f->raw[p >> 3];
+
+        shift = (uint8_t)((*dest << 1) | bit);
+        *dest = shift;
+    }
+
+    // CRC covers SOF..data.  crc_start is 0 until the DLC has been decoded.
+    if (p < rx->crc_start)
+        rx->sm.crc_calc = can_rx_crc_bit(rx->sm.crc_calc, bit);
+
+    if (p == CAN_BIT_IDE) {
+        f->flags = bit;
+        if (bit == 0u)
+            p = (uint8_t)(p + CAN_IDE_STD_SKIP);
+    } else if (p == CAN_BIT_R1) {
+        p = (uint8_t)(p + (CAN_BIT_R0 - (CAN_BIT_R1 + 1u)));
+    } else if (p == CAN_BIT_DLC_LAST) {
+        uint8_t dlc = (uint8_t)(shift & 0x0fu);
+
+        if (dlc > CAN_DLC_MAX)
+            dlc = CAN_DLC_MAX;
+        rx->crc_start = (uint8_t)(CAN_BIT_DATA_FIRST + 8u * dlc);
+    } else if (p == rx->crc_start + 7u) {
+        // The CRC start is byte-aligned; this is its first byte.
+        if (f->raw[p >> 3] != (uint8_t)(rx->sm.crc_calc >> 7)) {
+            can_rx_fail_rx(rx, CAN_RX_CRC_ERROR);
+            return;
+        }
+    } else if (p == rx->crc_start + 14u) {
+        // Last 7 CRC bits are right-aligned in the low bits.
+        if ((f->raw[p >> 3] & 0x7fu) != (rx->sm.crc_calc & 0x7fu)) {
+            can_rx_fail_rx(rx, CAN_RX_CRC_ERROR);
+            return;
+        }
+    } else if (p == rx->crc_start + 15u) {
+        // CRC delimiter must be recessive.
+        if (bit == 0u) {
+            can_rx_fail_rx(rx, CAN_RX_BIT_ERROR);
+            return;
+        }
+        rx->drop_next = 0;
+    } else if (p == rx->crc_start + 16u) {
+        if (bit == 0u)
+            can_rx_publish(rx);
+        else
+            rx->ack_errors++;
+        rx->drop_next = 0;
+        rx->crc_start = CAN_RX_CRC_NONE;
+        rx->pos = CAN_BIT_WAIT_FRAME;
+        return;
+    }
+    rx->pos = (uint8_t)(p + 1u);
 }
 
-// One run of `level`.  The first dominant bit after idle reaches the
-// CAN_BIT_WAIT_FRAME case in can_rx_advance(), which consumes SOF.
+// One run of `level`.  The first dominant bit after idle starts a frame.
 static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
                                                                uint8_t level,
                                                                uint16_t delta) {
     // A recessive run while idle is the inter-frame gap, not frame data.
-    if (rx->i == CAN_BIT_WAIT_FRAME && level == 1u)
+    if (rx->pos == CAN_BIT_WAIT_FRAME && level == 1u)
         return;
 
-    int tail = (rx->i != CAN_BIT_WAIT_FRAME && rx->i > CAN_BIT_CRC_LAST);
+    int tail = (rx->pos != CAN_BIT_WAIT_FRAME &&
+                (uint32_t)rx->pos > (uint32_t)rx->crc_start + 14u);
     uint8_t n = 0;
     for (uint8_t i = 1u; i <= 5u; i++) {
         if (delta >= rx->run_lo[i] && delta <= rx->run_hi[i]) {
@@ -174,13 +153,12 @@ static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
         // No ACK: the tail has no edges, so the run reaching the next SOF is
         // longer than any legal stuffed run.  Drop the frame as a NACK and
         // resync at the SOF.
-        if (level == 1u && // redundant: rx->i != CAN_BIT_WAIT_FRAME &&
-            rx->i >= CAN_BIT_CRC_TAIL_FIRST) {
-            if (!rx->rtr)
-                rx->ack_errors++;
-            rx->rtr = 0;
+        if (level == 1u && rx->pos != CAN_BIT_WAIT_FRAME &&
+            (uint32_t)rx->pos >= (uint32_t)rx->crc_start + 11u) {
+            rx->ack_errors++;
             rx->drop_next = 0;
-            rx->i = CAN_BIT_WAIT_FRAME;
+            rx->crc_start = CAN_RX_CRC_NONE;
+            rx->pos = CAN_BIT_WAIT_FRAME;
             return;
         }
         if ((uint32_t)delta > rx->run_hi[5])
@@ -191,7 +169,7 @@ static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
     }
 
     // Stuffing stops at the CRC.  The one bit still owed is the trailing
-    // stuff bit after a 5-run CRC; the delimiter/ACK/EOF are unstuffed.
+    // stuff bit after a 5-run CRC; the delimiter/ACK are unstuffed.
     if (!tail) {
         uint8_t drop = rx->drop_next;
 
@@ -205,7 +183,7 @@ static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
 
     while (n-- > 0) {
         can_rx_advance(rx, level);
-        if (rx->i == CAN_BIT_WAIT_FRAME)
+        if (rx->pos == CAN_BIT_WAIT_FRAME)
             break;
     }
 }

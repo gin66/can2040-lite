@@ -14,6 +14,8 @@ CPPFLAGS += -DCAN2040_LITE_TEST
 
 PROTO_SRCS   := $(wildcard $(SRC_DIR)/*.c)
 SUPPORT_SRCS := $(wildcard $(COMMON_DIR)/*.c)
+HEADERS      := $(wildcard $(SRC_DIR)/*.h) $(wildcard $(SRC_DIR)/pico/*.h) \
+                $(wildcard $(COMMON_DIR)/*.h)
 
 BIN := can_gen
 
@@ -21,7 +23,7 @@ BIN := can_gen
 
 all: $(BIN)
 
-$(BIN): can_gen.c $(PROTO_SRCS) $(SUPPORT_SRCS)
+$(BIN): can_gen.c $(PROTO_SRCS) $(SUPPORT_SRCS) $(HEADERS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ can_gen.c \
 		$(PROTO_SRCS) $(SUPPORT_SRCS) $(LDFLAGS)
 

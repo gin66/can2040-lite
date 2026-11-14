@@ -70,6 +70,10 @@ int can2040_lite_pico_tx_done_pending(void);
 int can2040_lite_pico_tx_error_pending(void);
 void can2040_lite_pico_tx_clear_status(void);
 
+// Frames the parser completed with a recessive ACK slot.  With ACK generation
+// disabled this is the count of received frames this node did not acknowledge.
+uint32_t can2040_lite_pico_rx_ack_errors(void);
+
 #ifdef CAN2040_LITE_TEST
 // Test-only raw FIFO ring.  The first instruction after each FIFO read is:
 //     record[head++ & 255] = word;

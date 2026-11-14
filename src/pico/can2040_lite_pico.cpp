@@ -719,6 +719,10 @@ extern "C" int can2040_lite_backend_poll(struct can2040_lite_event *ev) {
     return pico_poll(ev);
 }
 
+extern "C" uint32_t can2040_lite_pico_rx_ack_errors(void) {
+    return rx.ack_errors;
+}
+
 extern "C" uint32_t can2040_lite_critical_enter(void) {
     return save_and_disable_interrupts();
 }

@@ -27,19 +27,18 @@ cannot share one SM without stalling one direction while the other runs.
 
 - Raspberry Pi Pico (rp2040) or Pico 2 (rp2350)
 - Standard CAN transceiver (e.g., SN65HVD230, TJA1050)
-- At least one other fully CAN-compliant node on the bus (for arbitration
-  and error handling). ACK generation is implemented as the TX-slot helper
-  in `docs/ack_generation.md`; its on-target verification is still pending.
+- At least one other fully CAN-compliant node on the bus (for arbitration,
+  ACK generation, and error handling). Receive-only is the production
+  default; the ACK path is dormant behind `CAN_ACK_GENERATION_SUPPORT`.
 
 ## Restrictions
 
-CAN2040-Lite is **not a full CAN node**. It is a lightweight data-frame
-transceiver. ACK generation is an edge-locked pulse on the TX state machine
-(`docs/ack_generation.md`); the host-side schedule and cycle model pass, and
-the on-target check can use the opt-in RX edge-pair capture log instead of a
-logic analyzer (see `CAN_EDGE_PAIR_TIME_RECORDING` below). It
-deliberately omits the protocol mechanisms that require
-real-time error participation:
+CAN2040-Lite is **not a full CAN node**. It is a lightweight, receive-only
+data-frame transceiver by default. The experimental ACK path is compiled out
+behind `CAN_ACK_GENERATION_SUPPORT`; at high bus occupancy the anchor word can
+be queued behind earlier words, so the fixed wire deadline is missed and the
+node correctly NACKs. It deliberately omits the protocol mechanisms that
+require real-time error participation:
 
 - **No error-flag generation** — it only observes 6+ dominant bits and reports
   the error; it never injects an error flag.
@@ -60,19 +59,17 @@ real-time error participation:
 - **No on-chip transceiver** — an external CAN transceiver is required.
 
 A CAN2040-Lite network must contain **at least one compliant CAN node** for
-error confinement. CAN2040-Lite now drives ACKs on its own; that helper's
-on-target verification is pending.
+arbitration, ACK generation, and error confinement. CAN2040-Lite itself is
+receive-only by default.
 
 Current implementation notes (not protocol requirements): the target backend
 services the RX FIFO from its not-empty IRQ, and statistics capture RX/TX
 totals. Frames are not timestamped, but `-DCAN_EDGE_PAIR_TIME_RECORDING=1`
 keeps every RX FIFO edge pair with its reconstructed 31-bit fall/rise times,
 so the receiver itself records a logic-analyzer-style trace (including the
-position of a generated ACK pulse). The RX parser samples the ACK slot at
-7/8 T, so an ACK that ends early or starts late is reported as a NACK, not
-accepted at the bit boundary. The ACK helper swaps the TX instruction
-image; its schedule and cycle model are host-tested, and on-target
-verification is pending.
+position of an ACK driven by another node). The RX parser samples the ACK
+slot at 7/8 T, so an ACK that ends early or starts late is reported as a
+NACK, not accepted at the bit boundary.
 
 ## RX capture debug interface
 
@@ -196,7 +193,6 @@ can2040-lite/
 │   └── pico/
 │       ├── can2040_lite_pico.cpp/.h  # PIO/DMA backend
 │       ├── can_pio_program.c/.h      # Runtime PIO images (7 + 14 words)
-│       ├── can_pio_reloc.h           # TX/ACK image relocation helpers
 │       └── rx.pio                    # Legacy 32x oversampled RX (7 words)
 └── extras/
     ├── tests/
@@ -269,8 +265,8 @@ Options:
       it and locate the ACK pulse in its slot
 
 ### Planned
-- [ ] ACK helper on-target verification and go-window measurement
-      (`docs/ack_generation.md`)
+- [ ] ACK generation (dormant/experimental behind
+      `CAN_ACK_GENERATION_SUPPORT`; not enabled by default)
 - [ ] Error-frame injection and detection
 - [ ] Real-bus integration with a compliant peer/transceiver
 - [ ] Soak test and release

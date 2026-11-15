@@ -28,9 +28,10 @@ int can2040_lite_pico_tx_init(uint32_t gpio, uint32_t gpio_rx,
 // Re-arm the RX state machine.  The PIO SM polls for SOF.
 void can2040_lite_pico_rx_arm(void);
 
-// Fast RX IRQ body: drain the PIO FIFO and run the inline parser only.
-// No events, callbacks, TX matching, timers, or allocation.  Call this from
-// PIOx_IRQ_0.  The normal main-loop service can then run from the main loop.
+// Fast RX IRQ body: drain the PIO FIFO, run the inline parser, and drive the
+// ACK inset when the parser reaches the last CRC rise.  No events, callbacks,
+// TX matching, or allocation.  Call this from PIOx_IRQ_0.  The normal
+// main-loop service can then run from the main loop on the other core.
 void can2040_lite_pico_rx_irq(void);
 
 #ifdef CAN2040_LITE_TEST
@@ -73,6 +74,22 @@ void can2040_lite_pico_tx_clear_status(void);
 // Frames the parser completed with a recessive ACK slot.  With ACK generation
 // disabled this is the count of received frames this node did not acknowledge.
 uint32_t can2040_lite_pico_rx_ack_errors(void);
+
+// ACK generation counters.  `pulses` counts driven recessive releases;
+// `rx` counts frames published after a recessive ACK delimiter.  The skip
+// counters say why a frame stayed a NACK.  All are zero when ACK generation
+// is compiled out.
+struct can2040_lite_pico_ack_stats {
+    uint32_t pulses;
+    uint32_t rx;
+    uint32_t skip_fifo;
+    uint32_t skip_tx;
+    uint32_t skip_plan;
+    uint32_t skip_late;
+    uint32_t skip_miss;
+    uint32_t overrun;
+};
+void can2040_lite_pico_ack_get_stats(struct can2040_lite_pico_ack_stats *out);
 
 #ifdef CAN2040_LITE_TEST
 // Test-only raw FIFO ring.  The first instruction after each FIFO read is:

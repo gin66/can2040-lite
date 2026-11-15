@@ -21,8 +21,13 @@
 
 #include <stdint.h>
 
+#include "can2040_lite_config.h"
 #include "can2040_lite_proto.h"
 #include "can_bit_layout.h"
+
+#if CAN_ACK_GENERATION_SUPPORT
+#include "can_ack.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -104,7 +109,7 @@ typedef struct {
     uint16_t crc_calc;
 } can_rx_sm_t;
 
-typedef struct {
+typedef struct can_rx_t {
     // Configuration.  A run of n bits is accepted when
     // run_lo[n] <= delta <= run_hi[n].  Both bounds are fixed at init so the
     // edge path is only compares.
@@ -121,6 +126,26 @@ typedef struct {
     uint8_t pos;            // unstuffed wire-bit position; 255 = idle
     can_rx_sm_t sm;
 
+#if CAN_ACK_GENERATION_SUPPORT
+    // Stuffer state at the first CRC data bit, latched once per frame.
+    uint8_t crc_run;        // 1..4 at that bit
+    uint8_t crc_last;       // level of the bit before it
+    uint8_t crc_latched;
+    // Expected stuffed CRC field, computed once at CRC entry.
+    can_ack_wire_t ack_wire;
+    uint8_t ack_active;     // prediction valid for this frame
+    uint8_t ack_abort;      // received CRC prefix diverged from the wire
+    uint8_t ack_wire_pos;   // next expected CRC wire bit
+    uint8_t ack_anchored;   // last-rise word already reached
+    // Tail walker: CRC delimiter, ACK slot, ACK delimiter at 7/8 T.
+    uint8_t ack_pending;    // ACK slot sampled dominant; publish waits
+    uint8_t tail_on;
+    uint8_t tail_stuff;     // the open tail bit is the owed trailing stuff
+    uint8_t tail_sample;    // post-edge level at the sample point
+    uint16_t tail_mark;     // down-counter time of that bit's start
+    void (*ack_hook)(struct can_rx_t *rx); // nullable; host tests only
+#endif
+
     // Single-producer/single-consumer ring.
     can_rx_frame_t frames[CAN_RX_SLOTS];
     can_rx_frame_t *write;
@@ -132,11 +157,22 @@ typedef struct {
     uint32_t stuff_errors;
     uint32_t bit_errors;
     uint32_t ack_errors;
+#if CAN_ACK_GENERATION_SUPPORT
+    uint32_t ack_rx;        // published after a recessive ACK delimiter
+#endif
     uint32_t overflow;
 } can_rx_t;
 
 void can_rx_init(can_rx_t *rx, uint32_t ticks_per_bit);
 void can_rx_reset(can_rx_t *rx);
+
+#if CAN_ACK_GENERATION_SUPPORT
+// Called once per frame from the run that ends at the last 0->1 rise of the
+// expected CRC wire, before that run is parsed.  Weak in can_rx_sm.c; calls
+// rx->ack_hook when set.  The Pico backend provides a strong body that drives
+// the TX pad.
+void can_rx_ack_anchor(can_rx_t *rx);
+#endif
 
 // One captured edge.  time16 is the low 16 bits of the PIO down-counter,
 // level is the pin level after the edge.  The first falling edge starts a

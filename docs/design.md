@@ -6,10 +6,10 @@ Kevin O'Connor. See [`LICENSE`](../LICENSE) for the full license text.
 
 ## Restrictions
 
-CAN2040-Lite is **not a full CAN node**; it is a classic CAN 2.0B data-frame
-transceiver. It does implement ACK generation with the TX-slot helper in
-[`ack_generation.md`](ack_generation.md) (steps 1–3 are in the firmware;
-on-target verification is pending). It deliberately does not implement:
+CAN2040-Lite is **not a full CAN node**; it is a classic CAN 2.0B, receive-only
+data-frame transceiver by default. The experimental ACK path is compiled out
+behind `CAN_ACK_GENERATION_SUPPORT`; see [`ack_generation.md`](ack_generation.md)
+for the design record. It deliberately does not implement:
 
 - error-flag generation — it only observes 6+ dominant bits
 - TEC/REC, Error Active/Passive, or bus-off
@@ -21,9 +21,9 @@ on-target verification is pending). It deliberately does not implement:
 - hardware acceptance filters (software filtering only)
 - an on-chip transceiver (an external CAN transceiver is required)
 
-A compliant node must be present on the bus for error confinement. The
-ACK helper in [`ack_generation.md`](ack_generation.md) is in the firmware;
-its on-target verification is still pending.
+A compliant node must be present on the bus for arbitration, ACK generation,
+and error confinement. CAN2040-Lite itself is receive-only by default; the
+ACK path is dormant/experimental.
 
 ## SM Reduction from can2040
 

@@ -20,6 +20,9 @@ CPPFLAGS += -I$(SRC_DIR) -I$(COMMON_DIR)
 CPPFLAGS += -DCAN_EDGE_PAIR_TIME_RECORDING=1
 # Selects the test-only stubs; target builds take the backend's strong symbols.
 CPPFLAGS += -DCAN2040_LITE_TEST
+# Host tests exercise the dormant ACK path as well; production defaults to
+# receive-only (CAN_ACK_GENERATION_SUPPORT=0 in can2040_lite_config.h).
+CPPFLAGS += -DCAN_ACK_GENERATION_SUPPORT=1
 
 PROTO_SRCS   := $(wildcard $(SRC_DIR)/*.c)
 PIO_SRCS     := $(SRC_DIR)/pico/can_pio_program.c

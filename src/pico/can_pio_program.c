@@ -8,11 +8,9 @@
 
 #include "can_pio_program.h"
 
-// PIO instruction images are assembled here at runtime.  The composition
-// depends on compile-time features (the ACK overlay is only built when
-// CAN_ACK_GENERATION_SUPPORT is set), so this replaces pioasm output with
-// pio_encode-style words.  All images use an origin of 0 for their JMP
-// targets; the TX/ACK overlay is relocated when copied into its slot.
+// PIO instruction images are assembled here at runtime.  This replaces
+// pioasm output with pio_encode-style words.  Both images use an origin of 0
+// for their JMP targets.  The ACK pulse is CPU-timed, not a PIO image.
 
 enum {
     PIO_OP_JMP = 0,
@@ -136,50 +134,10 @@ static void build_tx(can_pio_program_t *p) {
     p->wrap_target = 0;
 }
 
-#if CAN_ACK_GENERATION_SUPPORT
-// ACK helper overlay of the TX instruction slot.  It follows bus edges and
-// fires one inset dominant pulse on the ACK slot after the CPU allows it.
-//   X    edges still to come, minus one; 0xFFFFFFFF while only following
-//   OSR  gap cycles from the terminal edge to the fire check
-//   Y    0 until the received CRC matches; 1 allows the pulse
-// The plan supplies X = edges - 1 and the OSR gap.  The delay is [30], not
-// [31]: the following jmp adds one cycle, so the dominant window is exactly
-// 32 cycles (one bit), from slot+0.25 to slot+1.25.
-static void build_ack(can_pio_program_t *p) {
-    memset(p, 0, sizeof(*p));
-    // release: recessive on every iteration.
-    add(p, enc_set(PIO_DST_PINS, 1, 0));
-    p->wrap_target = 0;
-    p->wrap = 0;
-    // high: entry when the pad is recessive.  Follow while X underflows.
-    add(p, enc_jmp(PIO_COND_PIN, 1, 0));
-    add(p, enc_jmp(PIO_COND_XDEC, 4, 0));
-    add(p, enc_jmp(PIO_COND_ALWAYS, 8, 0));
-    // low: entry when the pad is dominant.  Wait for the rising edge.
-    add(p, enc_jmp(PIO_COND_PIN, 6, 0));
-    add(p, enc_jmp(PIO_COND_ALWAYS, 4, 0));
-    // rose: X expired on a rising edge.
-    add(p, enc_jmp(PIO_COND_XDEC, 1, 0));
-    add(p, enc_jmp(PIO_COND_ALWAYS, 8, 0));
-    // gap: X = gap cycles; autopull is off.
-    add(p, enc_out(PIO_DST_X, 32, 0));
-    add(p, enc_jmp(PIO_COND_XDEC, 9, 0));
-    // Not verified: leave the slot recessive.
-    add(p, enc_jmp(PIO_COND_NOT_Y, 0, 0));
-    // Dominant drive, 31 cycles plus the jmp below = one bit.
-    add(p, enc_set(PIO_DST_PINS, 0, 30));
-    add(p, enc_jmp(PIO_COND_ALWAYS, 0, 0));
-}
-#endif
-
 static can_pio_program_t rx_pair_prog;
 static can_pio_program_t tx_prog;
 static int rx_pair_built;
 static int tx_built;
-#if CAN_ACK_GENERATION_SUPPORT
-static can_pio_program_t ack_prog;
-static int ack_built;
-#endif
 
 const can_pio_program_t *can_pio_rx_pair_program(void) {
     if (!rx_pair_built) {
@@ -196,13 +154,3 @@ const can_pio_program_t *can_pio_tx_program(void) {
     }
     return &tx_prog;
 }
-
-#if CAN_ACK_GENERATION_SUPPORT
-const can_pio_program_t *can_pio_ack_program(void) {
-    if (!ack_built) {
-        build_ack(&ack_prog);
-        ack_built = 1;
-    }
-    return &ack_prog;
-}
-#endif

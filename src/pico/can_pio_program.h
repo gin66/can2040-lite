@@ -12,15 +12,14 @@
 #include "can2040_lite_config.h"
 
 // Runtime-built PIO instruction images.  pioasm output is not used: the
-// running backend assembles these at init so the ACK overlay can be omitted
-// entirely when CAN_ACK_GENERATION_SUPPORT is 0.
+// running backend assembles these at init.  The ACK pulse is CPU-timed, so
+// there is no PIO ACK image.
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// One assembled image.  JMP targets are relative to origin 0; the TX/ACK
-// overlay adds its slot origin when copied into PIO instruction memory.
+// One assembled image.  JMP targets are relative to origin 0.
 typedef struct {
     uint16_t code[32];
     uint8_t length;
@@ -30,16 +29,11 @@ typedef struct {
 
 #define CAN_PIO_RX_PAIR_LENGTH 7u
 #define CAN_PIO_TX_LENGTH 14u
-#define CAN_PIO_ACK_LENGTH 13u
 
 // Edge-pair capture: two edges per FIFO word.
 const can_pio_program_t *can_pio_rx_pair_program(void);
 // One-shot 32-cycle-per-bit message shifter.
 const can_pio_program_t *can_pio_tx_program(void);
-#if CAN_ACK_GENERATION_SUPPORT
-// ACK helper overlay of the TX instruction slot.
-const can_pio_program_t *can_pio_ack_program(void);
-#endif
 
 #ifdef __cplusplus
 }

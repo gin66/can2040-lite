@@ -22,12 +22,10 @@
 #include "can_rx_sm.h"
 #include "can_rx_sm_inline.h"
 #include "can_frame_build.h"
-#include "ack_cycle_model.h"
 #include "can_rx_record_fly_micro4.h"
 
 // The PIO images are built at runtime by the portable program builder.
 #include "pico/can_pio_program.h"
-#include "pico/can_pio_reloc.h"
 
 static int g_passed;
 static int g_failed;
@@ -2132,404 +2130,6 @@ static void test_ack_plan(void) {
     TEST_END();
 }
 
-/****************************************************************
- * ACK cycle model (mirrors can_pio_ack_program())
- ****************************************************************/
-
-static uint32_t ack_gap_cycles(uint32_t gap_bits) {
-    return gap_bits * ACK_MODEL_CYCLES_PER_BIT + ACK_MODEL_GAP_OFFSET;
-}
-
-static void test_ack_cycle_model(void) {
-    ack_model_t m;
-
-    printf("\n-- ACK cycle model --\n");
-
-    TEST_BEGIN("follow: alternating edges, no pulse, X does not expire");
-    {
-        ack_edge_t edges[10];
-        int i;
-        for (i = 0; i < 10; i++) {
-            edges[i].cycle = (i + 1) * 32;
-            edges[i].level = (uint8_t)((i & 1) ? 1 : 0);
-        }
-        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0xffffffffu, 0, 0, 0);
-        ack_model_run(&m, 1, edges, 10, NULL, 0, 400);
-        CHECK(m.pulse_start < 0);
-        CHECK(m.x == 0xffffffffu - 10u);
-    }
-    TEST_END();
-
-    TEST_BEGIN("armed Y=0: recessive through the slot, ends in release");
-    {
-        ack_edge_t edges[1] = {{64, 0}};
-        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0, 0, ack_gap_cycles(1), 0);
-        ack_model_run(&m, 1, edges, 1, NULL, 0, 160);
-        CHECK(m.pulse_start < 0);
-        CHECK(m.pad == 1);
-        CHECK(m.pc == ACK_MODEL_WRAP_TARGET);
-    }
-    TEST_END();
-
-    TEST_BEGIN("armed Y=1, gap 1: dominant slot+0.25..slot+1.25");
-    {
-        ack_edge_t edges[1] = {{64, 0}};
-        uint32_t start = 64u + 32u + 8u;
-        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0, 1, ack_gap_cycles(1), 0);
-        ack_model_run(&m, 1, edges, 1, NULL, 0, 200);
-        CHECK(m.pulse_start == (int)start);
-        CHECK(m.pulse_end == (int)(start + 32u));
-    }
-    TEST_END();
-
-    TEST_BEGIN("armed Y=1, gap 5: same window relative to the slot");
-    {
-        ack_edge_t edges[1] = {{64, 0}};
-        uint32_t start = 64u + 5u * 32u + 8u;
-        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0, 1, ack_gap_cycles(5), 0);
-        ack_model_run(&m, 1, edges, 1, NULL, 0, 300);
-        CHECK(m.pulse_start == (int)start);
-        CHECK(m.pulse_end == (int)(start + 32u));
-    }
-    TEST_END();
-
-    TEST_BEGIN("Y set during the gap still pulses at slot+0.25");
-    {
-        ack_edge_t edges[1] = {{64, 0}};
-        ack_exec_event_t execs[1];
-        uint32_t start = 64u + 32u + 8u;
-        execs[0].cycle = 96;
-        execs[0].exec.kind = ACK_EXEC_SET_Y;
-        execs[0].exec.value = 1;
-        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0, 0, ack_gap_cycles(1), 0);
-        ack_model_run(&m, 1, edges, 1, execs, 1, 200);
-        // The allow steals one gap cycle, so it can arrive one TX cycle
-        // (1/32 bit) late; the inset has 0.3 bit of margin.
-        CHECK(m.pulse_start >= (int)start);
-        CHECK(m.pulse_start <= (int)start + 1);
-        CHECK(m.pulse_end == m.pulse_start + 32);
-    }
-    TEST_END();
-
-    TEST_BEGIN("late exec in release stays recessive");
-    {
-        ack_edge_t edges[1] = {{64, 0}};
-        ack_exec_event_t execs[1];
-        execs[0].cycle = 120;
-        execs[0].exec.kind = ACK_EXEC_SET_Y;
-        execs[0].exec.value = 1;
-        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0, 0, ack_gap_cycles(1), 0);
-        ack_model_run(&m, 1, edges, 1, execs, 1, 160);
-        CHECK(m.pulse_start < 0);
-        CHECK(m.pad == 1);
-    }
-    TEST_END();
-
-    TEST_BEGIN("exec during follow does not drop the next edge");
-    {
-        ack_edge_t edges[2] = {{200, 0}, {232, 1}};
-        ack_exec_event_t execs[2];
-        int cycle;
-        execs[0].cycle = 100;
-        execs[0].exec.kind = ACK_EXEC_SET_X;
-        execs[0].exec.value = 1;
-        execs[1].cycle = 101;
-        execs[1].exec.kind = ACK_EXEC_PULL;
-        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0xffffffffu, 0, 0, 44);
-        for (cycle = 0; cycle <= 235; cycle++) {
-            const ack_exec_t *exec = NULL;
-            int i;
-            uint8_t pin = ack_model_level(edges, 2, 1, cycle);
-            for (i = 0; i < 2; i++)
-                if (execs[i].cycle == cycle)
-                    exec = &execs[i].exec;
-            ack_model_step(&m, cycle, pin, exec);
-            if (cycle == 202)
-                CHECK(m.x == 0); // first edge counted
-        }
-        CHECK(m.pc == 8 || m.pc == 9); // second edge reached gap
-        CHECK(m.x != 0xffffffffu);     // OSR gap was loaded by out x, 32
-    }
-    TEST_END();
-
-    TEST_BEGIN("both entry polarities pulse at the same slot offset");
-    {
-        ack_edge_t high_edges[1] = {{64, 0}};
-        ack_edge_t low_edges[1] = {{64, 1}};
-        uint32_t start = 64u + 32u + 8u;
-
-        ack_model_init(&m, ACK_MODEL_PC_HIGH, 0, 1, ack_gap_cycles(1), 0);
-        ack_model_run(&m, 1, high_edges, 1, NULL, 0, 160);
-        CHECK(m.pulse_start == (int)start);
-        CHECK(m.pulse_end == (int)(start + 32u));
-
-        ack_model_init(&m, ACK_MODEL_PC_LOW, 0, 1, ack_gap_cycles(1), 0);
-        ack_model_run(&m, 0, low_edges, 1, NULL, 0, 160);
-        CHECK(m.pulse_start == (int)start);
-        CHECK(m.pulse_end == (int)(start + 32u));
-    }
-    TEST_END();
-}
-
-/****************************************************************
- * ACK arming model (steps 1-5 of the Pico backend)
- ****************************************************************/
-
-typedef struct {
-    uint32_t seq;
-    uint32_t step;
-    uint32_t arm_step;
-    uint32_t allow_step;
-    uint32_t arm_from;
-    bool handled;
-    bool armed;
-    bool allowed;
-    bool tx_active;
-    can_ack_plan_t plan;
-} ack_logic_t;
-
-static void ack_logic_reset(ack_logic_t *l) {
-    memset(l, 0, sizeof(*l));
-    l->arm_step = UINT32_MAX;
-    l->allow_step = UINT32_MAX;
-}
-
-// Mirrors the backend: compute the plan once at the CRC start, arm when the
-// pad matches the plan, allow only after crc_match, and never arm for a frame
-// this node transmitted.
-static void ack_logic_step(ack_logic_t *l, can_edge_sm_t *sm, uint8_t pad) {
-    l->step++;
-    if (sm->frame_seq != l->seq) {
-        l->seq = sm->frame_seq;
-        l->handled = false;
-        l->armed = false;
-        l->allowed = false;
-    }
-    if (sm->in_frame && sm->crc_started && !l->handled) {
-        uint32_t rel = (sm->last_edge_raw >= sm->crc_raw_start)
-                           ? sm->last_edge_raw - sm->crc_raw_start
-                           : 0u;
-        l->handled = true;
-        l->arm_from = rel;
-        l->plan = can_ack_plan(sm->crc_calc, sm->crc_run_start,
-                               sm->crc_last_start, rel);
-        if (!l->tx_active && l->plan.ok && pad == l->plan.level) {
-            l->armed = true;
-            l->arm_step = l->step;
-        }
-    }
-    if (sm->in_frame && sm->crc_match && l->armed && !l->allowed) {
-        l->allowed = true;
-        l->allow_step = l->step;
-    }
-    if (sm->validity == INVALID_CRC || sm->validity == INVALID_STUFF)
-        l->armed = false;
-}
-
-// Feed one frame bit by bit, advancing a quiet bit clock like the RX path.
-static void drive_frame_ack(can_edge_sm_t *sm, const uint8_t *bits,
-                            uint32_t nbits, uint32_t t0, uint32_t ticks,
-                            ack_logic_t *l, bool tx_active) {
-    uint8_t prev = 1;
-    uint32_t i;
-
-    can_edge_sm_init(sm, ticks);
-    ack_logic_reset(l);
-    l->tx_active = tx_active;
-    for (i = 0; i < nbits; i++) {
-        uint8_t bit = bits_get(bits, i);
-        if (bit != prev) {
-            can_edge_sm_push(sm, can_edge_word(edge_at(t0, ticks, i), bit));
-            ack_logic_step(l, sm, sm->level);
-            if (!sm->in_frame)
-                return;
-        }
-        prev = bit;
-        if (sm->in_frame) {
-            can_edge_sm_time(sm, edge_at(t0, ticks, i + 1u));
-            ack_logic_step(l, sm, sm->level);
-        }
-        if (!sm->in_frame)
-            return;
-    }
-}
-
-static void ack_logic_on_frame(can_frame_t *frame, frame_validity_t validity,
-                               ack_logic_t *l, bool tx_active) {
-    uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
-    can_build_info_t info;
-    can_edge_sm_t sm;
-    uint32_t nbits;
-
-    nbits = can_frame_build(frame, validity, 0, bits,
-                            CAN2040_LITE_MAX_FRAME_BITS, &info);
-    CHECK(nbits != 0);
-    drive_frame_ack(&sm, bits, nbits, EDGE_T0, EDGE_TICKS, l, tx_active);
-}
-
-// A JMP's low 5 bits are the absolute target.  Adding the origin must not
-// spill into the condition or delay fields.
-static void check_relocated(const uint16_t *insns, uint32_t n,
-                            uint32_t origin) {
-    uint32_t i;
-
-    for (i = 0; i < n; i++) {
-        uint16_t in = insns[i];
-        uint16_t got = can_pio_reloc_instr(in, origin);
-
-        if ((in >> 13) == 0) {
-            uint32_t addr = in & 31u;
-            CHECK(addr + origin < 32u);
-            CHECK((got & 31u) == addr + origin);
-            CHECK((got & 0xffe0u) == (in & 0xffe0u));
-        } else {
-            CHECK(got == in);
-        }
-    }
-}
-
-static void test_ack_reloc(void) {
-    const can_pio_program_t *ack = can_pio_ack_program();
-    const can_pio_program_t *tx = can_pio_tx_program();
-    const uint16_t *ack_insns = ack->code;
-    const uint16_t *tx_insns = tx->code;
-    uint32_t ack_n = ack->length;
-    uint32_t tx_n = tx->length;
-    const uint32_t origin = 11; // RX at 25, then TX, in pio_add_program
-    uint32_t rel;
-
-    printf("\n-- ACK image relocation --\n");
-
-    TEST_BEGIN("ack and tx are 13 and 14 words");
-    CHECK(ack_n == 13u);
-    CHECK(tx_n == 14u);
-    TEST_END();
-
-    TEST_BEGIN("origin 0 leaves both images unchanged");
-    check_relocated(ack_insns, ack_n, 0);
-    check_relocated(tx_insns, tx_n, 0);
-    TEST_END();
-
-    TEST_BEGIN("origin 11 relocates JMP targets and keeps other words");
-    check_relocated(ack_insns, ack_n, origin);
-    check_relocated(tx_insns, tx_n, origin);
-    // release (word 0) and the dominant drive (word 11) are the PC checks.
-    CHECK((can_pio_reloc_instr(ack_insns[0], origin) >> 13) != 0);
-    CHECK((can_pio_reloc_instr(ack_insns[12], origin) & 31u) == origin);
-    CHECK((can_pio_reloc_instr(ack_insns[11], origin) >> 13) != 0);
-    TEST_END();
-
-    TEST_BEGIN("allow and release use absolute SMx_ADDR");
-    CHECK(!can_ack_release_pc(0, origin));
-    CHECK(can_ack_release_pc(origin + CAN_ACK_PC_RELEASE, origin));
-    CHECK(!can_ack_allow_pc(origin + CAN_ACK_PC_RELEASE, origin));
-    CHECK(!can_ack_allow_pc(origin - 1u, origin));
-    for (rel = 1; rel < CAN_ACK_PC_SET_PINS; rel++)
-        CHECK(can_ack_allow_pc(origin + rel, origin));
-    for (rel = CAN_ACK_PC_SET_PINS; rel < ack_n; rel++)
-        CHECK(!can_ack_allow_pc(origin + rel, origin));
-    CHECK(CAN_ACK_ENTRY_HIGH == 1u);
-    CHECK(CAN_ACK_ENTRY_LOW == 4u);
-    TEST_END();
-}
-
-static void test_ack_backend_model(void) {
-    can_frame_t found[PAT_COUNT];
-    can_frame_t dom;
-    can_frame_t rec4;
-    can_build_info_t info;
-    can_edge_sm_t sm;
-    ack_logic_t l;
-    bool have_dom;
-    bool have_rec4;
-
-    printf("\n-- ACK arming model --\n");
-    find_tail_patterns(found);
-    have_dom = (found[PAT_DOM_EDGE].flags & 0x80u) != 0;
-    have_rec4 = (found[PAT_REC4].flags & 0x80u) != 0;
-    dom = found[PAT_DOM_EDGE];
-    rec4 = found[PAT_REC4];
-    dom.flags = (uint8_t)(dom.flags & ~0x80u);
-    rec4.flags = (uint8_t)(rec4.flags & ~0x80u);
-
-    TEST_BEGIN("valid frame, dominant last CRC bit, gap 1: arm then allow");
-    if (have_dom) {
-        ack_logic_on_frame(&dom, VALID_FRAME, &l, false);
-        CHECK(l.handled);
-        CHECK(l.armed);
-        CHECK(l.allowed);
-        CHECK(l.plan.gap_bits == 1u);
-        CHECK(l.arm_step < l.allow_step);
-    } else {
-        CHECK(0);
-    }
-    TEST_END();
-
-    TEST_BEGIN("valid frame, 5-bit recessive tail: gap preload");
-    if (have_rec4) {
-        ack_logic_on_frame(&rec4, VALID_FRAME, &l, false);
-        CHECK(l.armed);
-        CHECK(l.allowed);
-        CHECK(l.plan.gap_bits == 5u);
-        CHECK(l.plan.gap_bits * ACK_MODEL_CYCLES_PER_BIT +
-                  ACK_MODEL_GAP_OFFSET == 162u);
-    } else {
-        CHECK(0);
-    }
-    TEST_END();
-
-    TEST_BEGIN("INVALID_CRC and INVALID_STUFF never set Y");
-    {
-        can_frame_t f;
-        fill_std(&f, 0x123, 8, (const uint8_t *)"12345678");
-        ack_logic_on_frame(&f, INVALID_CRC, &l, false);
-        CHECK(!l.allowed);
-        ack_logic_on_frame(&f, INVALID_STUFF, &l, false);
-        CHECK(!l.allowed);
-    }
-    TEST_END();
-
-    TEST_BEGIN("word that already contains the terminal edge does not arm");
-    if (have_dom) {
-        uint8_t frame_bits[CAN2040_LITE_MAX_FRAME_BYTES];
-        uint32_t crc_wire = 0;
-        uint8_t run = 0, last = 0;
-        uint32_t slot;
-        uint32_t nbits;
-
-        nbits = can_frame_build(&dom, VALID_FRAME, 0, frame_bits,
-                                CAN2040_LITE_MAX_FRAME_BITS, &info);
-        CHECK(nbits != 0);
-        CHECK(crc_field_state(frame_bits, &info, &crc_wire, &run, &last) == 0);
-        slot = info.stuffed_bits + 1u - crc_wire;
-        // Drive through the delimiter bit; the terminal edge is inside the
-        // word the model inspects.
-        can_edge_sm_init(&sm, EDGE_TICKS);
-        ack_logic_reset(&l);
-        drive_span(&sm, frame_bits, 0, crc_wire + slot,
-                   EDGE_T0, EDGE_TICKS);
-        ack_logic_step(&l, &sm, sm.level);
-        CHECK(sm.crc_started);
-        CHECK(l.handled);
-        CHECK(!l.plan.ok);
-        CHECK(!l.armed);
-    } else {
-        CHECK(0);
-    }
-    TEST_END();
-
-    TEST_BEGIN("a frame this node transmitted is never armed");
-    if (have_dom) {
-        ack_logic_on_frame(&dom, VALID_FRAME, &l, true);
-        CHECK(l.handled);
-        CHECK(!l.armed);
-        CHECK(!l.allowed);
-    } else {
-        CHECK(0);
-    }
-    TEST_END();
-}
-
 static void test_edge_pair(void) {
     static const uint8_t payload[8] = {
         0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78
@@ -3153,6 +2753,278 @@ static void test_rx_crc_guard(void) {
     TEST_END();
 }
 
+
+
+static void test_rx_ack_inset(void) {
+    static const char *pat_name[PAT_COUNT] = {
+        "dominant CRC end",
+        "1 recessive CRC bit",
+        "2 recessive CRC bits",
+        "3 recessive CRC bits",
+        "4 recessive CRC bits",
+        "5 recessive CRC bits",
+        "5 dominant CRC bits",
+        "ext 4 recessive CRC bits",
+        "RTR 4 recessive CRC bits"
+    };
+    can_frame_t found[PAT_COUNT];
+    uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
+    can_build_info_t info;
+    char name[96];
+    uint32_t pidx;
+
+    printf("\n-- RX inset ACK --\n");
+    find_tail_patterns(found);
+    for (pidx = 0; pidx < PAT_COUNT; pidx++) {
+        can_frame_t f = found[pidx];
+        can_rx_t rx;
+        uint32_t crc_wire;
+        uint8_t run;
+        uint8_t last;
+        can_ack_wire_t w;
+        uint32_t slot;
+        uint16_t t0 = 0x8000u;
+        const uint16_t ticks = 64u;
+        uint16_t fall;
+        uint16_t rise;
+
+        if (f.flags & 0x80u)
+            f.flags &= (uint8_t)~0x80u;
+        else
+            continue;
+        if (f.flags & CAN_FRAME_RTR)
+            continue;   // RTR is ignored by the new parser
+        CHECK(can_frame_build(&f, VALID_FRAME, 0, bits,
+                              CAN2040_LITE_MAX_FRAME_BITS, &info) != 0u);
+        CHECK(crc_field_state(bits, &info, &crc_wire, &run, &last) == 0);
+        can_ack_wire(info.crc, run, last, &w);
+        if (w.r_tail == 0u)
+            continue;
+        snprintf(name, sizeof(name), "%s, inset ACK", pat_name[pidx]);
+        TEST_BEGIN(name);
+
+        can_rx_init(&rx, ticks);
+        slot = info.stuffed_bits + 1u;
+        drive_rx_pairs(&rx, bits, slot, t0, ticks);
+        fall = (uint16_t)(t0 - slot * ticks - ticks / 4u);
+        rise = (uint16_t)(t0 - slot * ticks - (5u * ticks) / 4u);
+        can_rx_pair_inline(&rx, ((uint32_t)fall << 16) | rise);
+
+        CHECK(can_rx_available(&rx));
+        if (can_rx_available(&rx)) {
+            CHECK(rx.ack_errors == 0u);
+            CHECK(rx.ack_rx == 1u);
+            can_rx_pop(&rx);
+        }
+        TEST_END();
+    }
+}
+
+/****************************************************************
+ * ACK wire prediction and last-rise anchor
+ ****************************************************************/
+
+static void test_can_ack_wire(void) {
+    printf("\n-- ACK wire prediction --\n");
+    TEST_BEGIN("predicted CRC wire matches every built frame");
+    {
+        int ext;
+        int dlc;
+        int pat;
+
+        for (ext = 0; ext < 2; ext++) {
+            for (dlc = 0; dlc <= 8; dlc++) {
+                for (pat = 0; pat < 4; pat++) {
+                    can_frame_t f;
+                    uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
+                    can_build_info_t info;
+                    uint32_t crc_wire;
+                    uint8_t run;
+                    uint8_t last;
+                    can_ack_wire_t w;
+                    uint32_t i;
+
+                    memset(&f, 0, sizeof(f));
+                    f.id = ext ? 0x18febb11u : 0x123u;
+                    f.dlc = (uint8_t)dlc;
+                    f.flags = ext ? CAN_FRAME_EXTENDED : 0u;
+                    for (i = 0; i < 8u; i++)
+                        f.data[i] = (uint8_t)(pat * 0x33u + i * 0x11u);
+                    CHECK(can_frame_build(&f, VALID_FRAME, 1, bits,
+                                          CAN2040_LITE_MAX_FRAME_BITS,
+                                          &info) != 0u);
+                    CHECK(crc_field_state(bits, &info, &crc_wire, &run,
+                                          &last) == 0);
+                    can_ack_wire(info.crc, run, last, &w);
+                    CHECK(w.slot_bit != 0u);
+                    CHECK((uint32_t)w.slot_bit ==
+                          info.stuffed_bits + 1u - crc_wire);
+                    for (i = 0; i < w.slot_bit; i++)
+                        CHECK(w.level[i] == bits_get(bits, crc_wire + i));
+                    CHECK(w.r_tail >= 1u && w.r_tail <= 5u);
+                    CHECK((uint32_t)w.last_rise + w.r_tail == w.slot_bit);
+                    CHECK(w.last_rise >= 11u && w.last_rise <= 19u);
+                }
+            }
+        }
+    }
+    TEST_END();
+
+    TEST_BEGIN("all CRC epochs: last rise is 11..19, tail is 1..5");
+    {
+        uint32_t crc;
+        uint8_t run;
+        uint8_t last;
+        uint32_t n = 0;
+
+        for (crc = 0; crc < 32768u; crc++) {
+            for (run = 1; run <= 4; run++) {
+                for (last = 0; last < 2; last++) {
+                    can_ack_wire_t w;
+
+                    can_ack_wire((uint16_t)crc, run, last, &w);
+                    CHECK(w.slot_bit >= 16u && w.slot_bit <= 20u);
+                    CHECK(w.r_tail >= 1u && w.r_tail <= 5u);
+                    CHECK(w.last_rise >= 11u && w.last_rise <= 19u);
+                    CHECK((uint32_t)w.last_rise + w.r_tail == w.slot_bit);
+                    CHECK(w.rises >= 2u);
+                    CHECK(w.level[w.last_rise - 1u] == 0u);
+                    CHECK(w.level[w.last_rise] == 1u);
+                    n++;
+                }
+            }
+        }
+        CHECK(n == 262144u);
+    }
+    TEST_END();
+}
+
+typedef struct {
+    uint32_t calls;
+    uint32_t abort;
+    uint32_t last_rise;
+    uint32_t r_tail;
+    uint32_t slot;
+} ack_rec_t;
+
+static ack_rec_t g_ack_rec;
+
+static void ack_rec_hook(can_rx_t *rx) {
+    g_ack_rec.calls++;
+    g_ack_rec.abort = rx->ack_abort;
+    g_ack_rec.last_rise = rx->ack_wire.last_rise;
+    g_ack_rec.r_tail = rx->ack_wire.r_tail;
+    g_ack_rec.slot = rx->ack_wire.slot_bit;
+}
+
+static void test_rx_ack_anchor(void) {
+    printf("\n-- RX ACK anchor --\n");
+    TEST_BEGIN("anchor fires at the last CRC rise and publishes");
+    {
+        can_frame_t f;
+        uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
+        can_build_info_t info;
+        can_rx_t rx;
+        uint32_t crc_wire;
+        uint8_t run;
+        uint8_t last;
+        can_ack_wire_t w;
+        uint32_t i;
+
+        memset(&f, 0, sizeof(f));
+        f.id = 0x123u;
+        f.dlc = 8u;
+        for (i = 0; i < 8u; i++)
+            f.data[i] = (uint8_t)(i * 0x11u);
+        CHECK(can_frame_build(&f, VALID_FRAME, 1, bits,
+                              CAN2040_LITE_MAX_FRAME_BITS, &info) != 0u);
+        CHECK(crc_field_state(bits, &info, &crc_wire, &run, &last) == 0);
+        can_ack_wire(info.crc, run, last, &w);
+
+        memset(&g_ack_rec, 0, sizeof(g_ack_rec));
+        can_rx_init(&rx, 64u);
+        rx.ack_hook = ack_rec_hook;
+        drive_rx_pairs(&rx, bits, info.total_bits, 0x8000u, 64u);
+
+        CHECK(g_ack_rec.calls == 1u);
+        CHECK(g_ack_rec.abort == 0u);
+        CHECK(g_ack_rec.last_rise == w.last_rise);
+        CHECK(g_ack_rec.r_tail == w.r_tail);
+        CHECK(g_ack_rec.slot == w.slot_bit);
+        CHECK(can_rx_available(&rx));
+        if (can_rx_available(&rx)) {
+            CHECK(rx.ack_rx == 1u);
+            CHECK(rx.ack_errors == 0u);
+            can_rx_pop(&rx);
+        }
+    }
+    TEST_END();
+
+    TEST_BEGIN("a mismatched CRC wire bit aborts the pulse");
+    {
+        can_rx_t rx;
+
+        can_rx_init(&rx, 64u);
+        rx.write = &rx.frames[0];
+        rx.pos = CAN_BIT_CRC_FIRST;
+        rx.ack_active = 1;
+        rx.ack_wire_pos = 0;
+        rx.ack_abort = 0;
+        rx.ack_wire.level[0] = 0u;
+        can_rx_advance(&rx, 1u);
+        CHECK(rx.ack_abort == 1u);
+    }
+    TEST_END();
+}
+
+
+static void test_rx_ack_anchor_sweep(void) {
+    int ext;
+    int dlc;
+    int pat;
+    uint32_t frames = 0;
+    uint32_t anchored = 0;
+
+    printf("\n-- RX ACK anchor sweep --\n");
+    TEST_BEGIN("at most one anchor per frame, no false abort");
+    for (ext = 0; ext < 2; ext++) {
+        for (dlc = 0; dlc <= 8; dlc++) {
+            for (pat = 0; pat < 8; pat++) {
+                can_frame_t f;
+                uint8_t bits[CAN2040_LITE_MAX_FRAME_BYTES];
+                can_build_info_t info;
+                can_rx_t rx;
+                uint32_t i;
+
+                memset(&f, 0, sizeof(f));
+                f.id = ext ? 0x18febb11u : (uint32_t)(0x100u + pat * 0x11u);
+                f.dlc = (uint8_t)dlc;
+                f.flags = ext ? CAN_FRAME_EXTENDED : 0u;
+                for (i = 0; i < 8u; i++)
+                    f.data[i] = (uint8_t)(pat * 0x1du + i * 0x07u);
+                CHECK(can_frame_build(&f, VALID_FRAME, 1, bits,
+                                      CAN2040_LITE_MAX_FRAME_BITS,
+                                      &info) != 0u);
+                memset(&g_ack_rec, 0, sizeof(g_ack_rec));
+                can_rx_init(&rx, 64u);
+                rx.ack_hook = ack_rec_hook;
+                drive_rx_pairs(&rx, bits, info.total_bits, 0x8000u, 64u);
+                CHECK(g_ack_rec.calls <= 1u);
+                CHECK(g_ack_rec.abort == 0u);
+                CHECK(can_rx_available(&rx));
+                if (can_rx_available(&rx))
+                    can_rx_pop(&rx);
+                frames++;
+                if (g_ack_rec.calls != 0u)
+                    anchored++;
+            }
+        }
+    }
+    CHECK(frames != 0u);
+    printf("    anchor fired on %u/%u frames\n", anchored, frames);
+    TEST_END();
+}
+
 int main(void) {
     printf("========================================\n");
     printf("CAN2040-Lite PC-based protocol tests\n");
@@ -3169,9 +3041,6 @@ int main(void) {
     test_edge_sm();
     test_recorded_fly_micro4();
     test_ack_plan();
-    test_ack_cycle_model();
-    test_ack_reloc();
-    test_ack_backend_model();
     test_edge_pair();
     test_rx_sm();
     test_rx_sm_errors();
@@ -3180,6 +3049,10 @@ int main(void) {
     test_recorded_fly_micro4_rx_sm();
     test_rx_sm_tail();
     test_rx_crc_guard();
+    test_can_ack_wire();
+    test_rx_ack_anchor();
+    test_rx_ack_inset();
+    test_rx_ack_anchor_sweep();
 
     printf("\n========================================\n");
     printf("TOTAL: %d passed, %d failed\n", g_passed, g_failed);

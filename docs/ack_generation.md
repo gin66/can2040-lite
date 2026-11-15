@@ -1,5 +1,11 @@
 # ACK generation: CPU sync-edge pulse
 
+> **Status: dormant/experimental.** Production defaults to receive-only
+> (`CAN_ACK_GENERATION_SUPPORT=0`). At high bus occupancy the anchor word can
+> be queued behind earlier words; the fixed wire deadline is then already
+> gone and the node correctly NACKs. The text below is a design record, not
+> the production path.
+
 | | |
 |---|---|
 | **Status** | Draft |

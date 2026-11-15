@@ -28,6 +28,15 @@
 #ifndef CAN_RX_BIT_PROBE_END
 #define CAN_RX_BIT_PROBE_END() ((void)0)
 #endif
+// Optional probe around the once-per-frame CRC/stuffing prediction.  It runs
+// at CRC entry, at least 11 bit times before the last-rise anchor, so its
+// width is the margin check for the ACK pulse path.
+#ifndef CAN_ACK_PREDICT_PROBE_BEGIN
+#define CAN_ACK_PREDICT_PROBE_BEGIN() ((void)0)
+#endif
+#ifndef CAN_ACK_PREDICT_PROBE_END
+#define CAN_ACK_PREDICT_PROBE_END() ((void)0)
+#endif
 
 #define CAN_RX_ACK_GUARD_BITS 9u
 
@@ -48,6 +57,15 @@ static __attribute__((noinline)) void can_rx_fail_rx(can_rx_t *rx,
                                             can_rx_event_t why) {
     rx->pos = CAN_BIT_WAIT_FRAME;
     rx->drop_next = 0;
+#if CAN_ACK_GENERATION_SUPPORT
+    rx->crc_latched = 0;
+    rx->ack_active = 0;
+    rx->ack_abort = 0;
+    rx->ack_anchored = 0;
+    rx->ack_pending = 0;
+    rx->tail_on = 0;
+    rx->tail_stuff = 0;
+#endif
     if (why == CAN_RX_CRC_ERROR)
         rx->crc_errors++;
     else if (why == CAN_RX_STUFF_ERROR)
@@ -68,6 +86,27 @@ static inline __attribute__((always_inline)) can_rx_event_t can_rx_publish(can_r
     rx->write = &rx->frames[next];
     return CAN_RX_FRAME;
 }
+
+#if CAN_ACK_GENERATION_SUPPORT
+// Compute the expected CRC wire from the now-complete CRC register and the
+// stuffer state at the first CRC data bit.  This runs once per frame at CRC
+// entry; the last-rise anchor is at least 11 bit times later, so the walk is
+// off the pulse path.  `can_ack_wire` is in SRAM on the Pico.
+static inline void can_rx_ack_predict(can_rx_t *rx) {
+    rx->ack_wire_pos = 0;
+    rx->ack_abort = 0;
+    rx->ack_anchored = 0;
+    rx->ack_active = 0;
+    if (rx->crc_run < 1u || rx->crc_run > 4u)
+        return;
+    CAN_ACK_PREDICT_PROBE_BEGIN();
+    can_ack_wire(rx->sm.crc_calc, rx->crc_run, rx->crc_last, &rx->ack_wire);
+    CAN_ACK_PREDICT_PROBE_END();
+    if (rx->ack_wire.slot_bit < 2u || rx->ack_wire.last_rise == 0u)
+        return;
+    rx->ack_active = 1;
+}
+#endif
 
 // One unstuffed wire bit.  `pos` is both the protocol state and the raw slot
 // bit index.  IDE/R1 jump it onto the shared control field (R0/DLC at 35..39)
@@ -90,12 +129,39 @@ static inline __attribute__((always_inline)) void can_rx_advance(can_rx_t *rx,
         rx->write->flags = 0;
         rx->sm.crc_calc = 0;
         rx->write = &rx->frames[rx->rx_idx];
+#if CAN_ACK_GENERATION_SUPPORT
+        // The first dominant bit is SOF; the run tracker restarts here.
+        rx->crc_run = 1;
+        rx->crc_last = (uint8_t)(bit & 1u);
+        rx->crc_latched = 0;
+        rx->ack_active = 0;
+        rx->ack_abort = 0;
+        rx->ack_anchored = 0;
+        rx->ack_pending = 0;
+        rx->tail_on = 0;
+        rx->tail_stuff = 0;
+#endif
         return;
     }
 
     f = rx->write;
     dest = &f->raw[p >> 3];
     *dest = (uint8_t)((*dest << 1) | bit);
+
+#if CAN_ACK_GENERATION_SUPPORT
+    // The expected wire is checked bit by bit, including the first CRC bit.
+    // A mismatch stops the ACK; the normal CRC compare still decides whether
+    // the frame is published.  Dropped stuff bits are counted by the run
+    // handler in can_rx_state().
+    if (rx->ack_active && !rx->ack_abort &&
+        (uint32_t)p >= (uint32_t)CAN_BIT_CRC_FIRST &&
+        (uint32_t)p < (uint32_t)CAN_BIT_CRC_FIRST + CAN_CRC_BITS) {
+        if (rx->ack_wire.level[rx->ack_wire_pos] != bit)
+            rx->ack_abort = 1;
+        else
+            rx->ack_wire_pos++;
+    }
+#endif
 
     // CRC covers SOF..data, which all live below the fixed CRC field.  DLC
     // jumps the store position so data ends at DATA_LAST and the CRC field is
@@ -137,7 +203,38 @@ static inline __attribute__((always_inline)) void can_rx_advance(can_rx_t *rx,
             return;
         }
         rx->drop_next = 0;
-    } else if (p == CAN_BIT_CRC_FIRST + 16u) {
+    }
+#if CAN_ACK_GENERATION_SUPPORT
+    else if (p == CAN_BIT_CRC_FIRST + 16u) {
+        // The slot is sampled at 7/8 T.  A dominant slot arms publish; the
+        // recessive ACK delimiter below is what actually commits the frame.
+        if (bit == 0u)
+            rx->ack_pending = 1;
+        else
+            rx->ack_errors++;
+        rx->drop_next = 0;
+        rx->pos = (uint8_t)(p + 1u);
+        return;
+    } else if (p == CAN_BIT_CRC_FIRST + 17u) {
+        // ACK delimiter must be recessive.
+        if (bit == 0u) {
+            can_rx_fail_rx(rx, CAN_RX_BIT_ERROR);
+            return;
+        }
+        if (rx->ack_pending) {
+            can_rx_publish(rx);
+            rx->ack_rx++;
+        }
+        rx->ack_pending = 0;
+        rx->drop_next = 0;
+        rx->tail_on = 0;
+        rx->crc_latched = 0;
+        rx->ack_active = 0;
+        rx->pos = CAN_BIT_WAIT_FRAME;
+        return;
+    }
+#else
+    else if (p == CAN_BIT_CRC_FIRST + 16u) {
         if (bit == 0u)
             can_rx_publish(rx);
         else
@@ -146,7 +243,126 @@ static inline __attribute__((always_inline)) void can_rx_advance(can_rx_t *rx,
         rx->pos = CAN_BIT_WAIT_FRAME;
         return;
     }
+#endif
     rx->pos = (uint8_t)(p + 1u);
+}
+
+#if CAN_ACK_GENERATION_SUPPORT
+static inline __attribute__((always_inline)) uint8_t can_rx_is_tail(const can_rx_t *rx) {
+    uint32_t base = (uint32_t)CAN_BIT_CRC_FIRST + 15u;
+
+    return (uint8_t)((uint32_t)rx->pos == base ||
+                     (uint32_t)rx->pos == base + 1u ||
+                     (uint32_t)rx->pos == base + 2u);
+}
+
+// A dominant trailing stuff bit is the last 0->1 rise of the expected wire,
+// but the tail walker owns it instead of the normal dominant-run path.
+static inline uint8_t can_rx_ack_anchor_is_stuff(const can_rx_t *rx) {
+    return (uint8_t)(rx->ack_active && !rx->ack_abort && !rx->ack_anchored &&
+                     rx->ack_wire.has_trailing_stuff &&
+                     rx->ack_wire.trailing_stuff_level == 0u &&
+                     rx->ack_wire.r_tail == 1u);
+}
+
+// Tail walker for the CRC delimiter, ACK slot, and ACK delimiter.  Every
+// edge is judged at the nominal 7/8-T sample point.  `level` is the level of
+// the run that just ended (the pre-edge level); the sample stored is the
+// post-edge level.  Publishing happens on a recessive ACK delimiter only.
+static inline __attribute__((always_inline))
+void can_rx_tail_edge(can_rx_t *rx, uint16_t time16, uint8_t level) {
+    uint16_t ticks = rx->ticks_per_bit;
+    uint16_t sample = (uint16_t)((ticks * 7u) / 8u);
+    uint8_t post = (uint8_t)(level ^ 1u);
+
+    while (rx->tail_on &&
+           (rx->tail_stuff || can_rx_is_tail(rx)) &&
+           (uint16_t)(rx->tail_mark - time16) >= ticks) {
+        if (rx->tail_stuff) {
+            // The rise that ends a dominant trailing stuff bit is the last
+            // 0->1 of the expected wire.  Arm the pulse before the bit is
+            // dropped; this is the R = 1 tight case.
+            if (post == 1u && can_rx_ack_anchor_is_stuff(rx)) {
+                rx->ack_anchored = 1;
+                can_rx_ack_anchor(rx);
+            }
+            // Drop the trailing stuff bit; the delimiter opens next.
+            rx->tail_stuff = 0;
+            rx->tail_mark = (uint16_t)(rx->tail_mark - ticks);
+            if (!(rx->tail_on && can_rx_is_tail(rx)))
+                break;
+            rx->tail_sample = level;
+            continue;
+        }
+        CAN_RX_BIT_PROBE_BEGIN();
+        can_rx_advance(rx, rx->tail_sample);
+        CAN_RX_BIT_PROBE_END();
+        rx->tail_mark = (uint16_t)(rx->tail_mark - ticks);
+        if (!(rx->tail_on && can_rx_is_tail(rx)))
+            break;
+        // Seed the newly opened bit with the pre-edge level.  Step 2 below
+        // may overwrite it when this edge is before the sample point.
+        rx->tail_sample = level;
+    }
+
+    if (rx->tail_on && can_rx_is_tail(rx) &&
+        (uint16_t)(rx->tail_mark - time16) <= sample)
+        rx->tail_sample = post;
+
+    // A 0->1 inside the open slot commits a recessive slot sample now.  The
+    // ACK rise in the delimiter commits the open delimiter in this call.
+    if (post == 1u && rx->tail_on) {
+        if (rx->pos == (uint8_t)(CAN_BIT_CRC_FIRST + 16u) &&
+            (uint16_t)(rx->tail_mark - time16) <= sample) {
+            CAN_RX_BIT_PROBE_BEGIN();
+            can_rx_advance(rx, rx->tail_sample);
+            CAN_RX_BIT_PROBE_END();
+            rx->tail_mark = (uint16_t)(rx->tail_mark - ticks);
+            if (rx->tail_on &&
+                rx->pos == (uint8_t)(CAN_BIT_CRC_FIRST + 17u)) {
+                CAN_RX_BIT_PROBE_BEGIN();
+                can_rx_advance(rx, rx->tail_sample);
+                CAN_RX_BIT_PROBE_END();
+            }
+        } else if (rx->pos == (uint8_t)(CAN_BIT_CRC_FIRST + 17u)) {
+            CAN_RX_BIT_PROBE_BEGIN();
+            can_rx_advance(rx, rx->tail_sample);
+            CAN_RX_BIT_PROBE_END();
+        }
+    }
+}
+#endif
+
+// Emit one data bit.  Under the ACK flag this latches the stuffer state just
+// before the first CRC data bit and tracks the live run for that latch.
+// Returns the position before the call.
+static inline __attribute__((always_inline)) uint8_t can_rx_emit_bit(can_rx_t *rx,
+                                                                     uint8_t level) {
+    uint8_t p = rx->pos;
+#if CAN_ACK_GENERATION_SUPPORT
+    uint8_t was_wait = (uint8_t)(p == CAN_BIT_WAIT_FRAME);
+    uint8_t latch_now = (uint8_t)(!rx->crc_latched &&
+                                  p == CAN_BIT_CRC_FIRST);
+
+    if (latch_now) {
+        rx->crc_latched = 1;
+        can_rx_ack_predict(rx);
+    }
+#endif
+    CAN_RX_BIT_PROBE_BEGIN();
+    can_rx_advance(rx, level);
+    CAN_RX_BIT_PROBE_END();
+#if CAN_ACK_GENERATION_SUPPORT
+    if (!was_wait && !latch_now) {
+        if (level == rx->crc_last) {
+            rx->crc_run++;
+        } else {
+            rx->crc_last = level;
+            rx->crc_run = 1;
+        }
+    }
+#endif
+    return p;
 }
 
 // One run of `level`.  The first dominant bit after idle starts a frame.
@@ -156,6 +372,13 @@ static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
     // A recessive run while idle is the inter-frame gap, not frame data.
     if (rx->pos == CAN_BIT_WAIT_FRAME && level == 1u)
         return;
+
+#if CAN_ACK_GENERATION_SUPPORT
+    if (rx->tail_on) {
+        can_rx_tail_edge(rx, rx->prev_time16, level);
+        return;
+    }
+#endif
 
     int tail = (rx->pos != CAN_BIT_WAIT_FRAME &&
                 (uint32_t)rx->pos > (uint32_t)CAN_BIT_CRC_FIRST + 14u);
@@ -178,6 +401,61 @@ static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
         n = 0;
 
     if (n == 0u) {
+#if CAN_ACK_GENERATION_SUPPORT
+        // No ACK: the tail has no edges, so the run reaching the next SOF is
+        // longer than any legal stuffed run.  Walk the recessive delimiter,
+        // slot, and ACK delimiter so ack_errors comes from the slot arm.
+        if (level == 1u && rx->pos != CAN_BIT_WAIT_FRAME &&
+            (uint32_t)rx->pos >= (uint32_t)CAN_BIT_CRC_FIRST + 11u &&
+            (uint32_t)delta > rx->ack_guard) {
+            rx->pos = (uint8_t)(CAN_BIT_CRC_FIRST + 15u);
+            while (rx->pos != CAN_BIT_WAIT_FRAME)
+                can_rx_advance(rx, 1u);
+            return;
+        }
+        // An unmatched delta that ends at or after the last stuffed bit is
+        // the inset fall: emit the remaining CRC bits at this run's level,
+        // hand the boundary to the walker, and do not call it a bit error.
+        if (rx->pos != CAN_BIT_WAIT_FRAME &&
+            (uint32_t)rx->pos <= (uint32_t)CAN_BIT_CRC_FIRST + 14u) {
+            uint32_t remaining = ((uint32_t)CAN_BIT_CRC_FIRST + 15u) -
+                                 (uint32_t)rx->pos;
+            uint32_t lead = rx->drop_next ? 1u : 0u;
+            uint32_t need = remaining + lead;
+            uint32_t ticks = rx->ticks_per_bit;
+
+            if (remaining <= 5u && (uint32_t)delta >= need * ticks) {
+                uint32_t r;
+
+                if (rx->drop_next) {
+                    rx->drop_next = 0;
+                    if (!rx->crc_latched) {
+                        rx->crc_last = level;
+                        rx->crc_run = 1;
+                    }
+                }
+                for (r = 0; r < remaining; r++) {
+                    (void)can_rx_emit_bit(rx, level);
+                    if (rx->pos == CAN_BIT_WAIT_FRAME)
+                        break;
+                }
+                if (rx->pos == CAN_BIT_WAIT_FRAME)
+                    return;
+                rx->tail_on = 1;
+                rx->tail_stuff = 0;
+                rx->tail_sample = level;
+                rx->tail_mark = (uint16_t)(rx->prev_time16 +
+                    (uint16_t)((uint32_t)delta - need * ticks));
+                can_rx_tail_edge(rx, rx->prev_time16, level);
+                return;
+            }
+        }
+        if ((uint32_t)delta > rx->run_hi[5])
+            can_rx_fail_rx(rx, CAN_RX_STUFF_ERROR);
+        else
+            can_rx_fail_rx(rx, CAN_RX_BIT_ERROR);
+        return;
+#else
         // No ACK: the tail has no edges, so the run reaching the next SOF is
         // longer than any legal stuffed run.  Drop the frame as a NACK and
         // resync at the SOF.
@@ -193,27 +471,96 @@ static inline __attribute__((always_inline)) void can_rx_state(can_rx_t *rx,
         else
             can_rx_fail_rx(rx, CAN_RX_BIT_ERROR);
         return;
+#endif
     }
 
     // Stuffing stops at the CRC.  The one bit still owed is the trailing
     // stuff bit after a 5-run CRC; the delimiter/ACK are unstuffed.
+    uint8_t drop = 0;
     if (!tail) {
-        uint8_t drop = rx->drop_next;
-
+        drop = rx->drop_next;
         rx->drop_next = (uint8_t)(n == 5u);
         if (drop)
             n--;
     } else if (rx->drop_next) {
         rx->drop_next = 0;
         n--;
+        drop = 1;
     }
 
-    while (n-- > 0) {
-        CAN_RX_BIT_PROBE_BEGIN();
-        can_rx_advance(rx, level);
-        CAN_RX_BIT_PROBE_END();
+#if CAN_ACK_GENERATION_SUPPORT
+    if (drop && !rx->crc_latched) {
+        // The stuff bit continues this run at the same level.
+        rx->crc_last = level;
+        rx->crc_run = 1;
+    }
+
+    // A dropped stuff bit inside the CRC field is one more expected wire
+    // bit.  The one before the first CRC data bit belongs to the data field
+    // and is not part of the prediction.
+    if (rx->ack_active && !rx->ack_abort && drop &&
+        (uint32_t)rx->pos > (uint32_t)CAN_BIT_CRC_FIRST) {
+        if (rx->ack_wire.level[rx->ack_wire_pos] != level)
+            rx->ack_abort = 1;
+        else
+            rx->ack_wire_pos++;
+    }
+
+    // The last 0->1 rise of the expected CRC wire is the phase anchor.  This
+    // run ends at that rise; call the hook before parsing the run so the
+    // R = 1 case still has the full 1.25 bit budget.  The run's bits are
+    // checked against the expected wire afterwards by the normal emit path.
+    if (rx->ack_active && !rx->ack_abort && !rx->ack_anchored &&
+        level == 0u &&
+        (uint32_t)rx->pos > (uint32_t)CAN_BIT_CRC_FIRST &&
+        (uint16_t)(rx->ack_wire_pos + n) == rx->ack_wire.last_rise) {
+        uint8_t ok = 1;
+        uint8_t k;
+
+        for (k = 0; k < n; k++) {
+            if (rx->ack_wire.level[rx->ack_wire_pos + k] != 0u) {
+                ok = 0;
+                break;
+            }
+        }
+        if (ok) {
+            rx->ack_anchored = 1;
+            can_rx_ack_anchor(rx);
+        } else {
+            rx->ack_abort = 1;
+        }
+    }
+#endif
+
+    uint8_t count = n;
+    for (uint8_t k = 0; k < count; k++) {
+#if CAN_ACK_GENERATION_SUPPORT
+        uint8_t p = can_rx_emit_bit(rx, level);
+#else
+        (void)can_rx_emit_bit(rx, level);
+        uint8_t p = 0;
+#endif
+
         if (rx->pos == CAN_BIT_WAIT_FRAME)
             break;
+#if CAN_ACK_GENERATION_SUPPORT
+        if ((uint32_t)p == (uint32_t)CAN_BIT_CRC_FIRST + 14u) {
+            // Last CRC data bit.  Bits after it in this run are tail bits;
+            // a 5-run that ends here still owes one trailing stuff bit.
+            uint8_t after = (uint8_t)(count - 1u - k);
+            uint8_t wire_len = (uint8_t)(count + (drop ? 1u : 0u));
+
+            rx->tail_on = 1;
+            rx->tail_sample = level;
+            rx->tail_mark = (uint16_t)(rx->prev_time16 +
+                (uint16_t)((uint32_t)after * rx->ticks_per_bit));
+            rx->tail_stuff = (uint8_t)(after == 0u && wire_len == 5u);
+            can_rx_tail_edge(rx, rx->prev_time16, level);
+            return;
+        }
+#else
+        (void)p;
+#endif
     }
 }
 

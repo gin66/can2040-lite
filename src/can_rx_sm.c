@@ -36,7 +36,30 @@ void can_rx_reset(can_rx_t *rx) {
     rx->rx_idx = 0;
     rx->tx_idx = 0;
     rx->write = &rx->frames[0];
+#if CAN_ACK_GENERATION_SUPPORT
+    rx->crc_run = 1;
+    rx->crc_last = 1;
+    rx->crc_latched = 0;
+    rx->ack_active = 0;
+    rx->ack_abort = 0;
+    rx->ack_wire_pos = 0;
+    rx->ack_anchored = 0;
+    rx->ack_pending = 0;
+    rx->tail_on = 0;
+    rx->tail_stuff = 0;
+    rx->tail_sample = 1;
+    rx->tail_mark = 0;
+#endif
 }
+
+#if CAN_ACK_GENERATION_SUPPORT
+// Host tests install a per-test recorder; the Pico backend replaces this weak
+// body with one that drives the pad and ignores the pointer.
+__attribute__((weak)) void can_rx_ack_anchor(can_rx_t *rx) {
+    if (rx->ack_hook)
+        rx->ack_hook(rx);
+}
+#endif
 
 void can_rx_init(can_rx_t *rx, uint32_t ticks_per_bit) {
     memset(rx, 0, sizeof(*rx));
